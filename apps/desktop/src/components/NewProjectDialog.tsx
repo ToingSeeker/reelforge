@@ -26,12 +26,18 @@ export function NewProjectDialog({
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
 
+  // Select the default name once, on open. (Tied to onCancel, which the parent recreates on every render,
+  // this re-ran on every 2 s project poll and selected the text being typed, so the next key replaced it.)
   useEffect(() => {
     nameRef.current?.select();
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onCancel();
+  }, []);
+  const cancel = useRef(onCancel);
+  cancel.current = onCancel;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && cancel.current();
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onCancel]);
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
