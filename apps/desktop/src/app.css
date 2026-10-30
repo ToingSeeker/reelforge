@@ -765,11 +765,12 @@ button:disabled {
   left: 0;
   z-index: 3;
   flex: none;
-  width: 150px;
+  width: 176px; /* HEADER_W in Timeline.tsx */
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 8px 0 16px;
+  gap: 4px;
+  padding: 0 6px 0 14px;
   border-bottom: 1px solid var(--rf-border);
   border-right: 1px solid var(--rf-border);
   background: var(--rf-panel);
@@ -786,8 +787,18 @@ button:disabled {
   color: var(--rf-text-3);
   letter-spacing: 0.04em;
 }
+.rf-track-title {
+  min-width: 0;
+  overflow: hidden;
+}
+.rf-track-kind {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .rf-track-controls {
   display: flex;
+  flex: none;
 }
 .rf-track-controls .rf-icon-btn[aria-pressed="true"] {
   color: var(--rf-warning);

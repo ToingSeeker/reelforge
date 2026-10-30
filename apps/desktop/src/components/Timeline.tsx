@@ -7,7 +7,7 @@ import type { Client } from "../api.ts";
 import { useThumbnail } from "../editor.ts";
 import { Icon, type IconName } from "../icons.tsx";
 
-const HEADER_W = 150;
+const HEADER_W = 176; // keep in step with .rf-track-head width in app.css
 const SNAP_PX = 8;
 const EDGE_PX = 7;
 const MIN_PX_PER_FRAME = 0.02;
@@ -429,17 +429,8 @@ function TrackHeader({ track, label, onToggle }: { track: Track; label: string; 
         {track.kind !== "caption" && <div className="rf-track-kind">{track.name.toUpperCase()}</div>}
       </div>
       <div className="rf-track-controls">
-        {audio ? (
-          <button
-            className="rf-icon-btn"
-            aria-pressed={track.muted}
-            onClick={() => onToggle({ muted: !track.muted }, track.muted ? "Unmute track" : "Mute track")}
-            aria-label={`${track.muted ? "Unmute" : "Mute"} ${label}`}
-            title={track.muted ? "Unmute" : "Mute"}
-          >
-            <Icon name={track.muted ? "volumeOff" : "volume"} size={15} />
-          </button>
-        ) : (
+        {/* Picture tracks: eye = picture, speaker = their videos' own sound. Audio tracks: speaker only. */}
+        {track.kind !== "audio" && (
           <button
             className="rf-icon-btn"
             aria-pressed={track.hidden}
@@ -448,6 +439,17 @@ function TrackHeader({ track, label, onToggle }: { track: Track; label: string; 
             title={track.hidden ? "Show" : "Hide"}
           >
             <Icon name={track.hidden ? "eyeOff" : "eye"} size={15} />
+          </button>
+        )}
+        {track.kind !== "caption" && (
+          <button
+            className="rf-icon-btn"
+            aria-pressed={track.muted}
+            onClick={() => onToggle({ muted: !track.muted }, track.muted ? "Unmute track" : "Mute track")}
+            aria-label={`${track.muted ? "Unmute" : "Mute"} ${label}`}
+            title={track.muted ? "Unmute" : audio ? "Mute" : "Mute this track's video sound"}
+          >
+            <Icon name={track.muted ? "volumeOff" : "volume"} size={15} />
           </button>
         )}
         <button

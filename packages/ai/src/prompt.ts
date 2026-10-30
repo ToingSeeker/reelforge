@@ -3,7 +3,7 @@ import type { ProjectContext } from "@reelforge/core";
 /** How the timeline and its operations work: shared by the AI Director prompt and the MCP tool descriptions. */
 export const OPERATIONS_GUIDE = `How the timeline works
 - All times are integer frames at the project frame rate (project.fps = num/den frames per second). Convert seconds to frames with round(seconds × num / den).
-- Tracks are listed top to bottom. Picture tracks (V2 overlays above V1 video) show images and video; audio tracks (A1, A2…) play sound; picture tracks never play their clips' sound. Captions live on the caption track.
+- Tracks are listed top to bottom. Picture tracks (V2 overlays above V1 video) show images and video; audio tracks (A1, A2…) play sound, and a video on a picture track plays its own sound too unless that track is muted (hidden hides only the picture). Never copy a video onto an audio track to make it heard: that plays its sound twice. Captions live on the caption track.
 - A clip shows asset frames [sourceIn, sourceIn + duration) starting at timeline frame start. sourceIn + duration must not exceed the asset's durationFrames (still images have no limit).
 - Clips on one track may touch but never overlap. Locked tracks cannot be changed. Video and images go on video/overlay tracks; audio files (or videos that have audio) on audio tracks.
 

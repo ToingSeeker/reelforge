@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Videos play their own sound**, like in other editors: a clip on V1/V2 is heard without copying it to an audio
+  track. Picture tracks get a speaker toggle (the eye still hides only the picture), video clips get a Gain control,
+  and the Inspector warns when the same media plays twice (e.g. a copy made earlier on A2)
+- AI Director: "make captions" requests transcribe the speech locally and propose word-timed captions
+
 Security fixes from the first full audit (MCP clients are treated as possibly prompt-injected):
 
 - MCP `timeline_undo` now asks the user (elicitation) instead of undoing silently; applying a proposal warns when it

@@ -175,7 +175,7 @@ export const ClipPropsSchema = z
     fadeOut: z.number().int().min(0).max(MAX_FRAME),
     /** Frames of dissolve (picture) / crossfade (audio) from the clip that ends where this one starts. */
     transitionIn: z.number().int().min(0).max(MAX_FRAME),
-    /** Audio gain in dB (audio tracks). */
+    /** Audio gain in dB (audio clips, and video clips that have sound). */
     gainDb: z.number().min(-60).max(12),
   })
   .strict();

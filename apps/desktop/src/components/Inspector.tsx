@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Clip, ClipProps, ClipPropsPatch, Timeline } from "@reelforge/core/schema";
-import { DEFAULT_CLIP_PROPS, resolveClipProps } from "@reelforge/core/schema";
+import { DEFAULT_CLIP_PROPS, resolveClipProps, trackLabels } from "@reelforge/core/schema";
 import { buildRenderPlan } from "@reelforge/core/render-plan";
 import { Icon } from "../icons.tsx";
 
@@ -30,6 +30,24 @@ export function Inspector({ timeline, clip, onDraft, onCommit }: Props) {
   const asset = timeline.assets.find((a) => a.id === clip.assetId);
   const fps = timeline.project.settings.fps.num / timeline.project.settings.fps.den;
   const audio = track.kind === "audio";
+  // A video with sound is heard on its own track too, so it gets the gain control (fades apply to both).
+  const heard = audio || !!asset?.hasAudio;
+  // The same media sounding at the same moment on another unmuted track (e.g. a video's sound copied onto A2
+  // back when videos were silent) plays twice.
+  const labels = trackLabels(timeline.tracks);
+  const twinClip = heard
+    ? timeline.clips.find(
+        (c) =>
+          c.id !== clip.id &&
+          c.assetId === clip.assetId &&
+          c.trackId !== clip.trackId &&
+          c.start < clip.start + clip.duration &&
+          clip.start < c.start + c.duration &&
+          !timeline.tracks.find((t) => t.id === c.trackId)?.muted &&
+          !track.muted,
+      )
+    : undefined;
+  const twin = twinClip ? labels.get(twinClip.trackId) ?? "another track" : null;
   const committed = resolveClipProps(clip.props);
   const [draft, setDraft] = useState<ClipPropsPatch>({});
   useEffect(() => {
@@ -163,10 +181,16 @@ export function Inspector({ timeline, clip, onDraft, onCommit }: Props) {
         </section>
       )}
 
-      {audio && (
+      {heard && (
         <section className="rf-inspector-group">
           <h3>Audio</h3>
           {field(same("gainDb", "Gain", -60, 12, 0.5, "dB"))}
+          {!audio && track.muted && <p className="rf-inspector-note">This track is muted, so the clip is silent. Unmute it with the speaker on the track.</p>}
+          {twin && (
+            <p className="rf-inspector-note">
+              Heard twice: the same media also plays on {twin} at the same time (videos play their own sound now). Delete the copy or mute one of the tracks.
+            </p>
+          )}
         </section>
       )}
 

@@ -107,7 +107,7 @@ test("layout wraps inside maxWidth and centres lines; states split at word start
   assert.deepEqual(captionStates({ start: 0, duration: 30, words: [] }, true), [{ from: 0, to: 30, active: -1 }]);
 });
 
-test("speech captions: a talking-head video's sound goes onto the voice track, then word-timed captions", (t) => {
+test("speech captions: a talking-head video on V2 is heard as is, so its speech is captioned directly", (t) => {
   const s = setup(t);
   const dir = tempDir(t);
   const m = fakeMedia(dir, "talk.mp4", { kind: "video", hasAudio: true, durationUs: 20_000_000 });
@@ -128,15 +128,14 @@ test("speech captions: a talking-head video's sound goes onto the voice track, t
   const plan = planSpeechCaptions(s.db, s.p.id, { style: "bold" });
   assert.equal(plan.status, "ready");
   if (plan.status !== "ready") return;
-  assert.deepEqual(plan.operations.map((o) => o.type), ["clip.add", "captions.replace", "track.update"]);
-  const add = plan.operations[0] as { trackId: string; start: number; duration: number };
-  assert.deepEqual([add.trackId, add.start, add.duration], [s.voice, 30, 150], "the sound lines up with the picture");
-  const caps = (plan.operations[1] as { captions: { start: number; text: string }[] }).captions;
+  assert.deepEqual(plan.operations.map((o) => o.type), ["captions.replace", "track.update"], "no copy of the sound onto an audio track");
+  const caps = (plan.operations[0] as { captions: { start: number; text: string }[] }).captions;
   assert.equal(caps[0]!.start, 30, "first word at the clip's position");
   assert.match(caps.map((c) => c.text).join(" "), /Every cup tells a story/);
-  assert.match(plan.warnings.join(" "), /also puts it on Voice/);
-  // It is a valid edit of this timeline.
-  assert.doesNotThrow(() => s.timeline.preview(s.p.id, plan.operations));
+
+  // Muting V2 silences it, so there is nothing heard to caption.
+  s.apply([{ type: "track.update", trackId: overlay, muted: true }]);
+  assert.throws(() => planSpeechCaptions(s.db, s.p.id), /nothing on the timeline has sound/);
 });
 
 test("speech captions: audio on an audio track is used as is; no sound at all is an error", (t) => {

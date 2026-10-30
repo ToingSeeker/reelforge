@@ -6,7 +6,7 @@ import type { Caption, Timeline, TranscriptResult } from "./schema.ts";
 import { microsToFrames, type Rational } from "./timebase.ts";
 
 export interface CaptionGenOptions {
-  /** Audio tracks whose clips are captioned (default: every unmuted audio track). */
+  /** Tracks whose clips' sound is captioned (default: every unmuted track with sound: audio, and video/overlay). */
   sourceTrackIds?: string[];
   /** Words per caption (reels read best with 2–4). */
   maxWords?: number;
@@ -34,6 +34,11 @@ interface TimedWord {
  * trim are dropped, then words are grouped into short captions, breaking at
  * sentence punctuation, long pauses and the word/character limits.
  */
+/** Tracks whose clips are heard: unmuted audio tracks and unmuted video/overlay tracks (videos play their own sound). */
+export function soundTracks(timeline: Pick<Timeline, "tracks">) {
+  return timeline.tracks.filter((t) => t.kind !== "caption" && !t.muted);
+}
+
 export function generateCaptions(
   timeline: Timeline,
   transcripts: ReadonlyMap<string, TranscriptResult>,
@@ -43,7 +48,7 @@ export function generateCaptions(
   const maxWords = opts.maxWords ?? 3;
   const maxChars = opts.maxChars ?? 18;
   const pause = microsToFrames((opts.breakOnPauseMs ?? 450) * 1000, fps, "nearest");
-  const sources = new Set(opts.sourceTrackIds ?? timeline.tracks.filter((t) => t.kind === "audio" && !t.muted).map((t) => t.id));
+  const sources = new Set(opts.sourceTrackIds ?? soundTracks(timeline).map((t) => t.id));
 
   const words: TimedWord[] = [];
   for (const clip of timeline.clips) {

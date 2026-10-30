@@ -37,7 +37,9 @@ export function CaptionsPanel(p: Props) {
   const tl = p.timeline;
   const fps = tl.project.settings.fps;
   const captionTracks = tl.tracks.filter((t) => t.kind === "caption");
-  const audioTracks = tl.tracks.filter((t) => t.kind === "audio");
+  // Anything heard can be captioned: audio tracks, and picture tracks holding videos with sound.
+  const voiced = new Set(tl.assets.filter((a) => a.hasAudio).map((a) => a.id));
+  const audioTracks = tl.tracks.filter((t) => t.kind === "audio" || (t.kind !== "caption" && tl.clips.some((c) => c.trackId === t.id && voiced.has(c.assetId))));
   const labels = trackLabels(tl.tracks);
   const track = captionTracks[0];
   const [sources, setSources] = useState<string[]>(() => audioTracks.filter((t) => t.name === "Voice").map((t) => t.id));
@@ -47,15 +49,15 @@ export function CaptionsPanel(p: Props) {
   const style: CaptionStyle = resolveCaptionStyle(track?.captionStyle);
   const captions = tl.captions.filter((c) => c.trackId === track?.id);
 
-  // Default source: the Voice track if it has clips, else every audio track with clips.
+  // Default source: the Voice track if it has clips, else every track with something heard on it.
   useEffect(() => {
     if (sources.length) return;
-    const withClips = audioTracks.filter((t) => tl.clips.some((c) => c.trackId === t.id)).map((t) => t.id);
+    const withClips = audioTracks.filter((t) => tl.clips.some((c) => c.trackId === t.id && voiced.has(c.assetId))).map((t) => t.id);
     if (withClips.length) setSources(withClips);
   }, [tl.clips.length]);
 
   // Transcripts this generation is waiting for.
-  const sourceAssets = [...new Set(tl.clips.filter((c) => sources.includes(c.trackId)).map((c) => c.assetId))];
+  const sourceAssets = [...new Set(tl.clips.filter((c) => sources.includes(c.trackId) && voiced.has(c.assetId)).map((c) => c.assetId))];
   const transcripts = sourceAssets.map((id) => analysisOf(p.analyses, id, "transcript"));
   const running = transcripts.filter((a) => a && (a.state === "queued" || a.state === "running"));
   const progress = running.length ? running.reduce((s, a) => s + (a!.progress ?? 0), 0) / running.length : 0;

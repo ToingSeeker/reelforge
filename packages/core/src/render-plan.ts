@@ -145,9 +145,10 @@ export function activeLayers(plan: RenderPlan, frame: number): PlanSegment[] {
 }
 
 /**
- * Picture comes only from visible video/overlay tracks and sound only from
- * unmuted audio tracks, so camera audio never sneaks into a mix: to use a
- * video's sound, place it on an audio track.
+ * Picture comes from visible video/overlay tracks. Sound comes from unmuted
+ * audio tracks and, like in other editors, from the video clips themselves:
+ * a video on V1/V2 plays its own sound unless its track is muted (hiding a
+ * track hides the picture only; the speaker toggle silences it).
  */
 export function buildRenderPlan(t: Timeline): RenderPlan {
   if (t.durationFrames <= 0) throw new ReelForgeError("VALIDATION_ERROR", "the timeline is empty: add clips before rendering");
@@ -200,7 +201,9 @@ export function buildRenderPlan(t: Timeline): RenderPlan {
     .filter((tr) => (tr.kind === "video" || tr.kind === "overlay") && !tr.hidden)
     .map((tr) => segmentsFor(tr.id))
     .filter((segs) => segs.length > 0);
-  const audio = tracks.filter((tr) => tr.kind === "audio" && !tr.muted).flatMap((tr) => segmentsFor(tr.id));
+  const audio = tracks
+    .filter((tr) => tr.kind !== "caption" && !tr.muted)
+    .flatMap((tr) => segmentsFor(tr.id).filter((seg) => tr.kind === "audio" || !!assets.get(seg.assetId)?.hasAudio));
 
   const offline = [...used].map((id) => assets.get(id)).filter((a) => !a || a.status === "missing");
   if (offline.length) {

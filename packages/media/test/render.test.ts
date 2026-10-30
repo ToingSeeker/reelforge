@@ -90,19 +90,23 @@ test("frame-exact cuts, overlay timing, audio placement, hidden/muted tracks", a
   assert.deepEqual([0, 29, 30, 44, 45, 59].map((f) => colour(out, f)), ["red", "red", "blue", "blue", "green", "green"]);
   const v = probeJson(out).streams.find((x: any) => x.codec_type === "video");
   assert.equal(Number(v.nb_frames), 60);
-  // Tone only between 0.5s and 1.5s; the red clip's own audio is on a picture track and must not leak in.
-  assert.ok(meanVolume(out, 0, 0.45) < -60, "silent before the music clip");
-  assert.ok(meanVolume(out, 0.55, 0.9) > -30, "tone while the music clip plays");
-  assert.ok(meanVolume(out, 1.55, 0.4) < -60, "silent after the music clip");
+  // The red video plays its own sound (0–1 s), like in any editor; the music clip adds a tone at 0.5–1.5 s;
+  // the blue video has no audio, so after 1.5 s it is silent.
+  assert.ok(meanVolume(out, 0, 0.45) > -30, "the red video's own sound is heard");
+  assert.ok(meanVolume(out, 0.55, 0.9) > -30, "sound while the music clip plays");
+  assert.ok(meanVolume(out, 1.55, 0.4) < -60, "silent after the music clip (blue has no audio)");
 
-  // Hide the overlay, mute the music: they must vanish from the next render.
+  // Hide the overlay, mute the music and the video track's sound: they must vanish from the next render.
   s.edit([
     { type: "track.update", trackId: s.track("Overlays"), hidden: true },
     { type: "track.update", trackId: s.track("Music"), muted: true },
+    { type: "track.update", trackId: s.track("Video"), muted: true },
   ]);
   const out2 = join(s.home, "hidden.mp4");
   await render(s.db, s.runner, s.projectId, "export", out2);
   assert.equal(colour(out2, 50), "blue");
+  assert.equal(colour(out2, 10), "red", "muting a video track keeps its picture");
+  assert.ok(meanVolume(out2, 0, 0.45) < -60, "muted video track: no sound");
   assert.ok(meanVolume(out2, 0.55, 0.9) < -60);
 });
 

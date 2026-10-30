@@ -12,7 +12,7 @@ export { parse } from "./validate.ts";
 export { JobStore } from "./jobs.ts";
 export * from "./render-plan.ts";
 export { AnalysisStore } from "./analyses.ts";
-export { generateCaptions, captionsToSrt, type CaptionGenOptions, type GeneratedCaption, type CaptionPlan } from "./captions.ts";
+export { generateCaptions, soundTracks, captionsToSrt, type CaptionGenOptions, type GeneratedCaption, type CaptionPlan } from "./captions.ts";
 export { planCaptions, planSpeechCaptions, type SpeechCaptionPlan } from "./captions-service.ts";
 export { evenWords } from "./timeline-ops.ts";
 export * from "./caption-layout.ts";

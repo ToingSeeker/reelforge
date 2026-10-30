@@ -259,7 +259,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
     "captions_generate",
     {
       title: "Generate captions",
-      description: "Caption speech from audio tracks (default: every unmuted audio track; pass labels like [\"A2\"]). If transcripts are missing it starts them and returns their job ids; call again when done. The result is a proposal for the user to approve.",
+      description: "Caption the speech on the timeline (default: every unmuted track with sound, including videos' own sound; pass labels like [\"A2\"] or [\"V1\"]). If transcripts are missing it starts them and returns their job ids; call again when done. The result is a proposal for the user to approve.",
       inputSchema: { projectId: Id, sourceTracks: z.array(z.string()).optional(), maxWords: z.number().int().min(1).max(12).optional(), language: z.string().optional() },
       annotations: WRITE,
     },

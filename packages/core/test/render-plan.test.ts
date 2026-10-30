@@ -136,3 +136,21 @@ test("clip.update rejects out-of-range and unknown fields", (t) => {
   assert.throws(() => s.apply([{ type: "clip.update", clipId: id, props: { shader: "x" } as never }]), /invalid input/);
   void applyOperations;
 });
+
+test("a video plays its own sound; muting its track silences it, hiding only hides the picture", (t) => {
+  const s = project(t, 300);
+  const dir = tempDir(t);
+  const mute = fakeMedia(dir, "silent.mp4", { hasAudio: false, durationUs: 10_000_000 });
+  const silent = new AssetStore(s.db).add(s.p.id, mute.file, mute.probe, "cli").asset;
+  s.apply([
+    { type: "clip.add", trackId: s.video, assetId: s.a.id, start: 0, duration: 60 },
+    { type: "clip.add", trackId: s.video, assetId: silent.id, start: 60, duration: 60 },
+  ]);
+  const audioOf = () => buildRenderPlan(s.timeline.get(s.p.id)).audio.map((x) => x.assetId);
+  assert.deepEqual(audioOf(), [s.a.id], "the clip with sound is heard; the silent one adds nothing");
+  s.apply([{ type: "track.update", trackId: s.video, hidden: true }]);
+  assert.deepEqual(audioOf(), [s.a.id], "hidden picture, sound still on");
+  s.apply([{ type: "track.update", trackId: s.video, muted: true }]);
+  assert.deepEqual(audioOf(), []);
+});
+
