@@ -80,10 +80,38 @@ export function parseWorkflow(input: unknown): WorkflowSpec {
 
 const stepKind = (s: WorkflowStep) => Object.keys(s)[0]!;
 
+/**
+ * Text from an untrusted author (an AI client) made safe to show inside an approval prompt: no control
+ * characters or line breaks (which could fake prompt lines), whitespace collapsed, length capped.
+ */
+export function quoteUntrusted(text: unknown, max = 80): string {
+  const flat = String(text ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069]+/g, " ").replace(/\s+/g, " ").trim();
+  return `“${flat.length > max ? `${flat.slice(0, max - 1)}…` : flat}”`;
+}
+
+/** What a timeline-changing step will do, in words a person can check before approving. */
+export function describeTimelineStep(step: WorkflowStep): string {
+  if ("append" in step) {
+    const a = step.append;
+    return `add ${quoteUntrusted(a.asset, 60)} at the end of track ${quoteUntrusted(a.track, 12)}${a.duration !== undefined ? `, duration ${quoteUntrusted(a.duration, 12)}` : ""}${a.props ? `, with ${quoteUntrusted(Object.keys(a.props).join(", "), 60)}` : ""}`;
+  }
+  if ("edit" in step) {
+    const ops = step.edit.operations;
+    const counts = new Map<string, number>();
+    for (const o of ops) counts.set(String(o.type), (counts.get(String(o.type)) ?? 0) + 1);
+    const deletes = ops.filter((o) => o.type === "clip.delete" || o.type === "caption.delete" || o.type === "captions.replace").length;
+    return `${ops.length} operation${ops.length === 1 ? "" : "s"}: ${[...counts].map(([k, n]) => `${n}× ${quoteUntrusted(k, 24)}`).join(", ")}${deletes ? ` (includes ${deletes} that remove or replace content)` : ""}`;
+  }
+  if ("captions" in step) {
+    return `transcribe if needed and REPLACE all captions${step.captions.source ? ` from tracks ${quoteUntrusted(step.captions.source.join(", "), 40)}` : ""}${step.captions.style ? `, set the caption style` : ""}`;
+  }
+  return Object.keys(step)[0]!;
+}
+
 /** Steps that change the timeline directly (director steps make proposals and are gated separately). */
 export const TIMELINE_STEPS = new Set(["append", "edit", "captions"]);
-export function timelineSteps(spec: WorkflowSpec): { index: number; kind: string }[] {
-  return spec.steps.map((s, index) => ({ index, kind: stepKind(s) })).filter((x) => TIMELINE_STEPS.has(x.kind));
+export function timelineSteps(spec: WorkflowSpec): { index: number; kind: string; description: string }[] {
+  return spec.steps.flatMap((s, index) => (TIMELINE_STEPS.has(stepKind(s)) ? [{ index, kind: stepKind(s), description: describeTimelineStep(s) }] : []));
 }
 
 export interface RunOptions {

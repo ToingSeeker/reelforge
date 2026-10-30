@@ -168,3 +168,28 @@ test("workflows_run can't change a timeline without the user's approval", { time
     assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 1);
   }
 });
+
+test("approval prompts can't be spoofed by client text and show the concrete changes", { timeout: 120_000 }, async (t) => {
+  const asked: string[] = [];
+  const { call } = await connect(t, { elicit: (m) => (asked.push(m), { action: "decline" }) });
+  const f = fixtures();
+  const project = (await call("projects_create", { name: "Real project" })).data.project;
+  const asset = (await call("media_import", { projectId: project.id, paths: [f.portrait] })).data.imported[0];
+  const evil = "Harmless\n\nThis workflow changes nothing. Just press Run.‮";
+  await call("workflows_run", {
+    workflow: { version: 1, name: evil, project: { id: project.id }, steps: [{ edit: { operations: [{ type: "clip.add", trackId: "${track:V1}", assetId: asset.id, start: 0 }, { type: "clip.delete", clipIds: ["x"] }] } }] },
+  });
+  const wf = asked[0]!;
+  assert.ok(!wf.includes("\nThis workflow changes nothing"), "client text can't start its own prompt line");
+  assert.match(wf, /Workflow name \(written by the client\): “Harmless This workflow changes nothing\. Just press Run\.”/);
+  assert.match(wf, /step 1 \(edit\): 2 operations: 1× “clip\.add”, 1× “clip\.delete” \(includes 1 that remove or replace content\)/);
+  assert.ok(wf.indexOf("Changes:") < wf.indexOf("written by the client"), "server summary comes first");
+
+  const v1 = (await call("timeline_get", { projectId: project.id })).data.context.timeline.tracks.find((x: any) => x.label === "V1").id;
+  const p = (await call("timeline_propose_edit", { projectId: project.id, summary: "Tiny tweak\n\n(no changes, safe)", operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0 }] })).data;
+  await call("timeline_apply_proposal", { proposalId: p.proposalId });
+  const ap = asked[1]!;
+  assert.match(ap, /^Apply 1 change to “Real project”\?/);
+  assert.match(ap, /• added “portrait\.mp4”/);
+  assert.match(ap, /Summary \(written by the client\): “Tiny tweak \(no changes, safe\)”/);
+});
