@@ -354,3 +354,24 @@ test("a dropped folder imports the media files inside it, only when the desktop 
   assert.match(((await none.json()) as any).error.message, /no media files there \(1 other item skipped\)/);
 });
 
+test("captions/propose: transcribes first (202), refuses a timeline with no sound", async (t) => {
+  const srv = await boot(t);
+  const f = fixtures();
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Talk" } })).json()) as any;
+  const empty = await call(srv, "POST", `/v1/projects/${project.id}/captions/propose`, { body: { instruction: "Buat caption" } });
+  assert.equal(empty.status, 400);
+
+  const imp = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [f.landscape] } })).json()) as any;
+  const asset = imp.imported[0];
+  assert.equal(asset.hasAudio, true, "fixture has sound");
+  const tl = (await (await call(srv, "GET", `/v1/projects/${project.id}/timeline`)).json()) as any;
+  const overlay = tl.timeline.tracks.find((x: any) => x.kind === "overlay").id;
+  await call(srv, "POST", `/v1/projects/${project.id}/operations`, { body: { baseRevision: tl.timeline.project.revision, operations: [{ type: "clip.add", trackId: overlay, assetId: asset.id, start: 0 }] } });
+  const res = await call(srv, "POST", `/v1/projects/${project.id}/captions/propose`, { body: { instruction: "Buat caption", style: "bold" } });
+  assert.equal(res.status, 202);
+  const r = (await res.json()) as any;
+  assert.equal(r.status, "transcribing");
+  assert.equal(r.missing[0].assetId, asset.id);
+  assert.equal(r.analyses.length, 1);
+});
+

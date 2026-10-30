@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import {
+  AnalysisStore,
   AssetStore,
+  planSpeechCaptions,
   captionStates,
   captionsToSrt,
   generateCaptions,
@@ -104,3 +106,51 @@ test("layout wraps inside maxWidth and centres lines; states split at word start
   assert.deepEqual(states, [{ from: 100, to: 110, active: 0 }, { from: 110, to: 130, active: 1 }]);
   assert.deepEqual(captionStates({ start: 0, duration: 30, words: [] }, true), [{ from: 0, to: 30, active: -1 }]);
 });
+
+test("speech captions: a talking-head video's sound goes onto the voice track, then word-timed captions", (t) => {
+  const s = setup(t);
+  const dir = tempDir(t);
+  const m = fakeMedia(dir, "talk.mp4", { kind: "video", hasAudio: true, durationUs: 20_000_000 });
+  const talk = new AssetStore(s.db).add(s.p.id, m.file, m.probe, "cli").asset;
+  // On the overlay track (V2), as people often put a talking head.
+  const overlay = s.timeline.get(s.p.id).tracks.find((x) => x.kind === "overlay")!.id;
+  s.apply([{ type: "clip.add", trackId: overlay, assetId: talk.id, start: 30, sourceIn: 0, duration: 150 }]);
+
+  const first = planSpeechCaptions(s.db, s.p.id, { style: "bold" });
+  assert.equal(first.status, "needs_transcripts");
+  assert.deepEqual(first.status === "needs_transcripts" && first.missing.map((x) => x.filename), ["talk.mp4"]);
+
+  const store = new AnalysisStore(s.db);
+  const [a] = store.enqueue(s.p.id, talk.id, ["transcript"]);
+  store.claim(a!.id);
+  store.complete(a!.id, "test", transcript);
+
+  const plan = planSpeechCaptions(s.db, s.p.id, { style: "bold" });
+  assert.equal(plan.status, "ready");
+  if (plan.status !== "ready") return;
+  assert.deepEqual(plan.operations.map((o) => o.type), ["clip.add", "captions.replace", "track.update"]);
+  const add = plan.operations[0] as { trackId: string; start: number; duration: number };
+  assert.deepEqual([add.trackId, add.start, add.duration], [s.voice, 30, 150], "the sound lines up with the picture");
+  const caps = (plan.operations[1] as { captions: { start: number; text: string }[] }).captions;
+  assert.equal(caps[0]!.start, 30, "first word at the clip's position");
+  assert.match(caps.map((c) => c.text).join(" "), /Every cup tells a story/);
+  assert.match(plan.warnings.join(" "), /also puts it on Voice/);
+  // It is a valid edit of this timeline.
+  assert.doesNotThrow(() => s.timeline.preview(s.p.id, plan.operations));
+});
+
+test("speech captions: audio on an audio track is used as is; no sound at all is an error", (t) => {
+  const s = setup(t);
+  s.apply([{ type: "clip.add", trackId: s.voice, assetId: s.asset.id, start: 0, duration: 150 }]);
+  const store = new AnalysisStore(s.db);
+  const [a] = store.enqueue(s.p.id, s.asset.id, ["transcript"]);
+  store.claim(a!.id);
+  store.complete(a!.id, "test", transcript);
+  const plan = planSpeechCaptions(s.db, s.p.id);
+  assert.equal(plan.status, "ready");
+  assert.deepEqual(plan.status === "ready" && plan.operations.map((o) => o.type), ["captions.replace"]);
+
+  const empty = setup(t);
+  assert.throws(() => planSpeechCaptions(empty.db, empty.p.id), /nothing on the timeline has sound/);
+});
+

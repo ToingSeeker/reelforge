@@ -16,6 +16,7 @@ import {
   ProposalStore,
   WorkflowRunStore,
   planCaptions,
+  planSpeechCaptions,
   type AnalysisKind,
   ProjectStore,
   ReelForgeError,
@@ -316,6 +317,33 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         const tl = timeline.get(id!);
         const next = timeline.apply(id!, { baseRevision: b.baseRevision ?? tl.project.revision, operations: [{ type: "captions.replace", trackId: plan.trackId, captions: plan.captions }] }, actor);
         return send(res, 200, { status: "applied", count: plan.captions.length, timeline: next });
+      },
+    },
+    {
+      // AI Director "caption the speech": transcribe what's missing (202, poll the analyses, ask again),
+      // then a proposal planned by the engine from word timings. Applying it is still the user's Apply.
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/captions/propose`),
+      handle: async ({ req, res, params: [id] }) => {
+        const b = (await readJson(req)) as { instruction?: unknown; style?: unknown; language?: unknown; maxWords?: unknown };
+        const style = b.style === "bold" || b.style === "clean" || b.style === "boxed" ? b.style : undefined;
+        const language = typeof b.language === "string" ? b.language : undefined;
+        const plan = planSpeechCaptions(opts.db, id!, { ...(style ? { style } : {}), ...(typeof b.maxWords === "number" ? { maxWords: Math.max(1, Math.min(12, Math.round(b.maxWords))) } : {}) });
+        if (plan.status === "needs_transcripts") {
+          const started = plan.missing.flatMap((m) => (m.state === "queued" || m.state === "running" ? [] : analyze(id!, m.assetId, ["transcript"], language ? { language } : {})));
+          return send(res, 202, { status: "transcribing", missing: plan.missing, analyses: started.map((a) => a.id) });
+        }
+        const proposal = proposals.create(id!, {
+          instruction: typeof b.instruction === "string" ? b.instruction.slice(0, 4000) : "Caption the speech",
+          selection: [],
+          provider: "reelforge",
+          model: "speech captions",
+          summary: plan.summary,
+          operations: plan.operations,
+          explanations: plan.explanations,
+          warnings: plan.warnings,
+        });
+        return send(res, 201, { proposal });
       },
     },
     {

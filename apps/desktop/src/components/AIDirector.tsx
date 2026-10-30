@@ -5,6 +5,7 @@ import { ApiError, type AIProviderInfo, type Client } from "../api.ts";
 import type { Notify } from "../editor.ts";
 import { Icon } from "../icons.tsx";
 import { ProposalCard } from "./ProposalCard.tsx";
+import { captionRequest } from "../caption-intent.ts";
 
 interface Props {
   client: Client | null;
@@ -39,7 +40,7 @@ export function AIDirector(p: Props) {
   const [choice, setChoice] = useState<{ provider: string; model: string } | null>(readModel);
   const [thread, setThread] = useState<AIProposal[]>([]);
   const [text, setText] = useState("");
-  const [pending, setPending] = useState<{ instruction: string; started: number; abort: AbortController } | null>(null);
+  const [pending, setPending] = useState<{ instruction: string; started: number; abort: AbortController; stage?: string } | null>(null);
   const [, setTick] = useState(0);
   const [consent, setConsent] = useState<{ instruction: string; context: ProjectContext | null } | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
@@ -83,11 +84,14 @@ export function AIDirector(p: Props) {
   const provider = providers.find((x) => x.id === choice?.provider);
 
   const send = async (instruction: string) => {
-    if (!p.client || !projectId || !choice || pending) return;
+    const captions = captionRequest(instruction); // needs no model: whisper.cpp + the engine
+    if (!p.client || !projectId || (!choice && !captions) || pending) return;
     const abort = new AbortController();
-    setPending({ instruction, started: Date.now(), abort });
+    setPending({ instruction, started: Date.now(), abort, ...(captions ? { stage: "Finding the speech on the timeline…" } : {}) });
     try {
-      const proposal = await p.client.propose(projectId, { instruction, provider: choice.provider, model: choice.model, selection: p.selection }, abort.signal);
+      const proposal = captions
+        ? await captionProposal(projectId, instruction, captions.style, abort.signal, (stage) => setPending((x) => (x ? { ...x, stage } : x)))
+        : await p.client.propose(projectId, { instruction, provider: choice!.provider, model: choice!.model, selection: p.selection }, abort.signal);
       setThread((t) => [...t, proposal]);
       setText("");
     } catch (e) {
@@ -99,6 +103,31 @@ export function AIDirector(p: Props) {
     } finally {
       setPending(null);
     }
+  };
+
+  // Captions need what the model can't do: hear the audio. Transcribe locally (whisper.cpp) where it's
+  // missing, then let the engine time a caption to each word. The result is a normal proposal.
+  const captionProposal = async (projectId: string, instruction: string, style: string | undefined, signal: AbortSignal, stage: (s: string) => void) => {
+    const client = p.client!;
+    for (let round = 0; round < 3; round++) {
+      const r = await client.proposeCaptions(projectId, { instruction, ...(style ? { style } : {}) });
+      if ("proposal" in r) return r.proposal;
+      const names = r.missing.map((m) => m.filename).join(", ");
+      for (;;) {
+        if (signal.aborted) throw new DOMException("cancelled", "AbortError");
+        const all = Object.values(await client.analyses(projectId)).flat();
+        const mine = all.filter((a) => a.kind === "transcript" && r.missing.some((m) => m.assetId === a.assetId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const latest = r.missing.map((m) => mine.find((a) => a.assetId === m.assetId));
+        const failed = latest.find((a) => a?.state === "failed");
+        if (failed) throw new Error(`Transcription failed: ${failed.error ?? "unknown error"}`);
+        if (latest.every((a) => a?.state === "completed")) break;
+        const progress = latest.reduce((n, a) => n + (a?.progress ?? 0), 0) / latest.length;
+        stage(`Transcribing speech locally (${names}) · ${Math.round(progress * 100)}%`);
+        await new Promise((ok) => setTimeout(ok, 1000));
+      }
+      stage("Timing captions to each word…");
+    }
+    throw new Error("The transcripts finished but the captions still couldn't be planned. Try again.");
   };
 
   const decide = async (proposal: AIProposal, action: "apply" | "reject") => {
@@ -212,7 +241,7 @@ export function AIDirector(p: Props) {
           <>
             <div className="rf-msg rf-msg-user">{pending.instruction}</div>
             <div className="rf-msg rf-msg-ai is-loading" role="status">
-              <span className="rf-spinner" aria-hidden="true" /> Planning with {choice?.model} · {Math.round((Date.now() - pending.started) / 1000)}s
+              <span className="rf-spinner" aria-hidden="true" /> {pending.stage ?? `Planning with ${choice?.model}`} · {Math.round((Date.now() - pending.started) / 1000)}s
               <button className="rf-link-btn" onClick={() => pending.abort.abort()}>
                 Cancel
               </button>

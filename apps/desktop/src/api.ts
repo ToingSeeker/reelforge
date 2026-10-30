@@ -68,6 +68,13 @@ export function createClient(info: ApiInfo) {
     fontUrl: (file: string) => `${info.url}/v1/fonts/${encodeURIComponent(file)}?${q}`,
     analyze: (id: string, assetId: string, kinds: AnalysisKind[], language?: string) =>
       request<{ analyses: Analysis[] }>("POST", `/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/analyze`, { kinds, ...(language ? { language } : {}) }).then((r) => r.analyses),
+    /** "Caption the speech": 202 while transcripts are missing (poll them, ask again), then an engine-planned proposal. */
+    proposeCaptions: (id: string, body: { instruction: string; style?: string }) =>
+      request<{ status: "transcribing"; analyses: string[]; missing: { assetId: string; filename: string }[] } | { proposal: AIProposal }>(
+        "POST",
+        `/v1/projects/${encodeURIComponent(id)}/captions/propose`,
+        body,
+      ),
     analyses: (id: string) => request<{ analyses: Record<string, Analysis[]> }>("GET", `/v1/projects/${encodeURIComponent(id)}/analyses`).then((r) => r.analyses),
     generateCaptions: (id: string, body: { trackId?: string; sourceTrackIds?: string[]; maxWords?: number; language?: string; baseRevision?: number }) =>
       request<{ status: "applied" | "transcribing"; count?: number; missing?: { assetId: string; filename: string; state: string | null }[]; timeline?: Timeline }>(
