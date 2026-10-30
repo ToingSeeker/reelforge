@@ -219,7 +219,9 @@ export function CaptionsPanel(p: Props) {
 
 function CaptionRow(p: { caption: Caption; time: string; selected: boolean; onFocus: () => void; onText: (t: string) => void; onDelete: () => void }) {
   const [text, setText] = useState(p.caption.text);
-  useEffect(() => setText(p.caption.text), [p.caption.text]);
+  useEffect(() => {
+    setText(p.caption.text);
+  }, [p.caption.text]);
   const commit = () => {
     const t = text.trim();
     if (t && t !== p.caption.text) p.onText(t);
@@ -255,7 +257,9 @@ function CaptionRow(p: { caption: Caption; time: string; selected: boolean; onFo
 
 function StyleSlider(p: { label: string; value: number; min: number; max: number; step: number; unit: string; onDraft: (v: number) => void; onCommit: (v: number) => void }) {
   const [v, setV] = useState(p.value);
-  useEffect(() => setV(p.value), [p.value]);
+  useEffect(() => {
+    setV(p.value);
+  }, [p.value]);
   return (
     <label className="rf-field-row rf-cap-row">
       <span>{p.label}</span>

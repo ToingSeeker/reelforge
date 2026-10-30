@@ -133,6 +133,36 @@ Known gaps carried forward:
 - Voice ducking and audio loudness analysis are not built yet.
 - No Indonesian system voice on this Mac, so the automated ASR test speaks English; Indonesian works the same way in whisper.
 
-## M4–M6
+## M4 — AI Director ✅ (exit criterion met)
 
-AI Director → MCP & Automation → Alpha Release. See the PRD.
+**Exit criterion:** AI can propose, apply and undo changes on the timeline. Verified in the desktop UI with a local
+model (qwen2.5:14b via Ollama): instruction in Indonesian → proposal with a before/after diff → Preview plan (live
+preview shows the result, revision unchanged) → Apply (one revision, approval recorded) → ⌘Z reverts it.
+
+- [x] `@reelforge/ai`: provider adapters for **Claude** (official SDK, `claude-opus-5-5`, structured output with the
+      proposal schema, adaptive thinking at `high` effort, server-side `fallbacks: "default"`) and **local Ollama**
+      (`/api/chat` with the schema as `format`); typed error mapping (missing/rejected key, rate limit, offline, refusal)
+- [x] Structured proposals: summary, operations with a "why" each, warnings, estimated duration, the base revision,
+      approval requirement; placeholders (`new-1`) for clips a plan creates (PRD §9)
+- [x] Validation (FR-021): schema, then a dry run against the real timeline; one repair round with the engine's errors;
+      invalid twice → nothing stored, timeline untouched. Engine warnings for what the model can't see (dissolves
+      without handles), and a flag when a plan touches clips outside the selection (Workflow B)
+- [x] Approval only by a person: desktop Apply (`desktop:apply`) or `ai apply --yes` (`cli:--yes`); the model's text
+      can't approve (tested with a reply claiming `"approved": true`). Applied proposals are one undoable revision
+      linked by `proposalId` (FR-023/024); stale proposals refused (FR-016)
+- [x] Consent per project for external providers; the dialog shows the exact JSON (no media, no local paths)
+- [x] Keys in the macOS Keychain via the desktop shell (`keyring`), delivered to the engine over stdin, never returned or
+      logged (FR-025). Verified end to end in the native app through Accessibility
+- [x] Desktop: model picker, conversation of proposal cards with a diff viewer, Preview plan, Apply/Regenerate/Reject,
+      cancel a running request, Settings for keys and consent. CLI: `ai providers|propose|proposals|show|apply|reject|consent`
+- [x] 104 tests (fake providers for determinism, a fake Ollama HTTP server for the full REST/CLI path)
+
+Known gaps carried forward:
+- Claude was not exercised against the live API here (no key on this Mac); the adapter is covered by type checks,
+  error-path tests and the shared planner tests. Add a key in Settings to use it.
+- Local models are slow on this Mac (qwen2.5:14b ≈ 4 min, qwen3.5:27b ≈ 2.7 min for the demo project).
+- Conversational revisions ("make it faster") and multi-turn memory are P1; each instruction is a fresh proposal.
+
+## M5–M6
+
+MCP & Automation → Alpha Release. See the PRD.

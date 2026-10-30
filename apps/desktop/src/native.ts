@@ -49,3 +49,21 @@ export async function pickSrtPath(suggestedName: string): Promise<string | null>
   if (!path) return null;
   return path.toLowerCase().endsWith(".srt") ? path : `${path}.srt`;
 }
+
+/** API keys go to the macOS Keychain through the desktop shell; the webview never stores them. */
+export const keychain = {
+  supported: () => isTauri(),
+  async has(provider: string): Promise<boolean> {
+    if (!isTauri()) return false;
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<boolean>("has_api_key", { provider });
+  },
+  async save(provider: string, key: string): Promise<void> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("save_api_key", { provider, key });
+  },
+  async remove(provider: string): Promise<void> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("delete_api_key", { provider });
+  },
+};

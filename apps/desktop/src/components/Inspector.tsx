@@ -32,7 +32,9 @@ export function Inspector({ timeline, clip, onDraft, onCommit }: Props) {
   const audio = track.kind === "audio";
   const committed = resolveClipProps(clip.props);
   const [draft, setDraft] = useState<ClipPropsPatch>({});
-  useEffect(() => setDraft({}), [clip.id, clip.props]);
+  useEffect(() => {
+    setDraft({});
+  }, [clip.id, clip.props]);
   const value = { ...committed, ...draft };
 
   const prev = timeline.clips.find((c) => c.trackId === clip.trackId && c.start + c.duration === clip.start);

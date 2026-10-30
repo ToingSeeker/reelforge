@@ -118,6 +118,34 @@ PNG and hard-links it for every frame, then FFmpeg overlays that image sequence 
 because common FFmpeg builds (Homebrew's included) ship without libass/drawtext. The live preview draws the same
 layout with the same fonts on its canvas.
 
+## AI Director
+
+```
+instruction + selection ──▶ propose() ── buildProjectContext ──▶ provider (Claude | Ollama)
+                                                    ◀── JSON (MODEL_OUTPUT_SCHEMA)
+          parse → TimelineOpSchema → dry run (TimelineStore.preview) ──✗──▶ one repair round
+                                              │ ✓
+                         ai_proposals (pending, diff, engine warnings)
+                                              │  a person presses Apply / types --yes
+                         ProposalStore.apply ── one undoable revision (payload.proposalId)
+```
+
+- Providers live in `@reelforge/ai`. Claude uses the official SDK (structured output with the same schema,
+  adaptive thinking at `high` effort, server-side `fallbacks: "default"`); Ollama uses its local `/api/chat` with
+  the schema as `format`. Both get the same system prompt and project context.
+- The model can only return timeline operations: there is no shell, no file access, no asset deletion in the
+  schema. Placeholder ids (`new-1`) let a plan add a clip and refer to it later.
+- **Approval** is never inferred from model output. It happens only through `POST /v1/proposals/:id/apply` (desktop
+  Apply button, recorded as `desktop:apply`) or `reelforge ai apply --yes` (`cli:--yes`). If the timeline changed
+  since the proposal, it is marked `stale` instead of being merged over newer edits.
+- **Consent** (PRD §19): external providers need per-project consent before any context is sent; the dialog shows
+  the exact JSON. Media files are never sent. Local providers need none.
+- **Keys** (FR-025): stored in the macOS Keychain by the desktop shell (`keyring` crate, Security framework), passed
+  to the engine as a JSON line on its stdin, held in memory only, never returned by any endpoint. The CLI uses
+  `ANTHROPIC_API_KEY` or an `ant auth login` profile.
+- **Engine warnings** add what the model can't see, e.g. a dissolve that won't play because the clips have no
+  spare frames around the cut.
+
 ## REST API (v1)
 
 | Method | Path | |
@@ -142,6 +170,10 @@ layout with the same fonts on its canvas.
 | GET · POST | `/v1/projects/:id/captions.srt` · `/captions/export-srt` | SubRip text · write it to a chosen path |
 | GET | `/v1/projects/:id/context` | structured project context for planners |
 | GET | `/v1/fonts/:file` | bundled caption fonts (media route) |
+| GET | `/v1/ai/providers` | providers, models, where each key comes from (never the key) |
+| GET · POST | `/v1/projects/:id/ai-consent` | read / grant or revoke `{granted}` |
+| POST · GET | `/v1/projects/:id/proposals` | ask for a proposal `{instruction, provider, model, selection}` · list |
+| GET · POST | `/v1/proposals/:id` · `/apply` · `/reject` | read · approve and apply · reject |
 | GET | `/v1/projects/:id/assets/:assetId/media` | what the live preview plays: video proxy, still proxy or original audio (`Range`) |
 
 Media GET routes (`media`, `thumbnail`, job `output`) also accept `?token=` because media elements cannot send headers.
@@ -164,6 +196,7 @@ Set `REELFORGE_DEBUG=1` to log engine requests (method, path, status, origin, ne
 | `VALIDATION_ERROR` | 400 | 2 |
 | `UNAUTHORIZED` | 401/403 | 5 |
 | `NOT_FOUND` | 404 | 3 |
-| `UNAVAILABLE` (FFmpeg missing) | 503 | 6 |
+| `UNAVAILABLE` (FFmpeg / model / key missing) | 503 | 6 |
+| `CONSENT_REQUIRED` | 403 | 7 |
 | `REVISION_CONFLICT` | 409 | 4 |
 | `INTERNAL` | 500 | 1 |

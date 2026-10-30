@@ -4,9 +4,9 @@
 //! token, and stops it on exit.
 
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tauri::{Manager, RunEvent};
@@ -29,6 +29,55 @@ enum EngineState {
 struct Engine {
     state: Arc<(Mutex<EngineState>, Condvar)>,
     child: Mutex<Option<Child>>,
+    /// The engine's stdin: closing it stops the engine; JSON lines on it deliver API keys.
+    stdin: Mutex<Option<ChildStdin>>,
+}
+
+/// AI provider keys live in the macOS Keychain (Security framework, never in argv or files).
+const KEYCHAIN_SERVICE: &str = "io.reelforge.studio";
+const PROVIDERS: &[&str] = &["anthropic"];
+
+fn keychain(provider: &str) -> Result<keyring::Entry, String> {
+    if !PROVIDERS.contains(&provider) {
+        return Err(format!("unknown provider {provider}"));
+    }
+    keyring::Entry::new(KEYCHAIN_SERVICE, provider).map_err(|e| e.to_string())
+}
+
+/// Hand a key to the engine (memory only there). `None` clears it.
+fn push_credential(engine: &Engine, provider: &str, key: Option<&str>) -> Result<(), String> {
+    let line = serde_json::json!({ "type": "credential", "provider": provider, "apiKey": key }).to_string();
+    let mut guard = engine.stdin.lock().map_err(|e| e.to_string())?;
+    let stdin = guard.as_mut().ok_or("engine is not running")?;
+    stdin.write_all(format!("{line}\n").as_bytes()).and_then(|_| stdin.flush()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_api_key(engine: tauri::State<'_, Engine>, provider: String, key: String) -> Result<(), String> {
+    let key = key.trim();
+    if key.is_empty() || key.len() > 512 {
+        return Err("that doesn't look like an API key".into());
+    }
+    keychain(&provider)?.set_password(key).map_err(|e| e.to_string())?;
+    push_credential(&engine, &provider, Some(key))
+}
+
+#[tauri::command]
+fn delete_api_key(engine: tauri::State<'_, Engine>, provider: String) -> Result<(), String> {
+    match keychain(&provider)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    push_credential(&engine, &provider, None)
+}
+
+#[tauri::command]
+fn has_api_key(provider: String) -> Result<bool, String> {
+    match keychain(&provider)?.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -63,7 +112,7 @@ fn engine_command() -> (String, PathBuf) {
     (node, cli)
 }
 
-fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<Child, String> {
+fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Option<ChildStdin>), String> {
     let token = random_token()?;
     let (node, cli) = engine_command();
     let mut cmd = Command::new(&node);
@@ -81,6 +130,7 @@ fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<Child, Stri
         .map_err(|e| format!("could not start the ReelForge engine with `{node} {}`: {e}", cli.display()))?;
 
     let stdout = child.stdout.take().ok_or("engine stdout unavailable")?;
+    let stdin = child.stdin.take();
     std::thread::spawn(move || {
         let mut line = String::new();
         let outcome = match BufReader::new(stdout).read_line(&mut line) {
@@ -100,29 +150,39 @@ fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<Child, Stri
         }
         cvar.notify_all();
     });
-    Ok(child)
+    Ok((child, stdin))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new((Mutex::new(EngineState::Starting), Condvar::new()));
-    let child = match start_engine(state.clone()) {
-        Ok(c) => Some(c),
+    let (child, stdin) = match start_engine(state.clone()) {
+        Ok((c, i)) => (Some(c), i),
         Err(msg) => {
             eprintln!("[reelforge] {msg}");
             *state.0.lock().expect("engine state poisoned") = EngineState::Failed(msg);
-            None
+            (None, None)
         }
     };
+    let engine = Engine { state, child: Mutex::new(child), stdin: Mutex::new(stdin) };
+    // Keys saved earlier go to the engine at startup (stdin is buffered until it reads it).
+    for provider in PROVIDERS {
+        if let Ok(key) = keychain(provider).and_then(|e| e.get_password().map_err(|e| e.to_string())) {
+            let _ = push_credential(&engine, provider, Some(&key));
+        }
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Engine { state, child: Mutex::new(child) })
-        .invoke_handler(tauri::generate_handler![api_info])
+        .manage(engine)
+        .invoke_handler(tauri::generate_handler![api_info, save_api_key, delete_api_key, has_api_key])
         .build(tauri::generate_context!())
         .expect("error while building the ReelForge desktop app")
         .run(|app, event| {
             if let RunEvent::Exit = event {
+                if let Ok(mut stdin) = app.state::<Engine>().stdin.lock() {
+                    stdin.take(); // closing stdin also tells the engine to exit
+                }
                 if let Some(mut child) = app.state::<Engine>().child.lock().ok().and_then(|mut c| c.take()) {
                     let _ = child.kill();
                     let _ = child.wait();

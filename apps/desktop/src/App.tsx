@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Asset, CaptionStylePatch, ClipPropsPatch, Project, Timeline as TimelineData, TimelineOp } from "@reelforge/core/schema";
-import { canPlace, clipEnd } from "@reelforge/core/timeline-ops";
+import type { AIProposal, Asset, CaptionStylePatch, ClipPropsPatch, Project, Timeline as TimelineData, TimelineOp } from "@reelforge/core/schema";
+import { applyOperations, canPlace, clipEnd } from "@reelforge/core/timeline-ops";
+import { SettingsDialog } from "./components/SettingsDialog.tsx";
 import { formatClock } from "@reelforge/core/timebase";
 import { createClient, resolveApiInfo, type Client } from "./api.ts";
 import { useEditor } from "./editor.ts";
@@ -64,6 +65,8 @@ export function App() {
   const [draft, setDraft] = useState<{ clipId: string; props: ClipPropsPatch } | null>(null);
   const [styleDraft, setStyleDraft] = useState<{ trackId: string; style: CaptionStylePatch } | null>(null);
   const [selectedCaption, setSelectedCaption] = useState<string | null>(null);
+  const [previewProposal, setPreviewProposal] = useState<AIProposal | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [snapToBeats, setSnapToBeats] = useState(() => readPref("rf.snapBeats") !== "0");
   const [importing, setImporting] = useState(false);
   const [fileHover, setFileHover] = useState(false);
@@ -133,15 +136,49 @@ export function App() {
 
   const preview = usePreview(client, tl, previewMode === "rendered");
   const selectedClip = selection.size === 1 && tl ? (tl.clips.find((c) => selection.has(c.id)) ?? null) : null;
+  // "Preview plan": run the proposal's operations locally (same reducer as the engine, nothing saved).
+  const proposed = useMemo<TimelineData | null>(() => {
+    if (!tl || !previewProposal || previewProposal.baseRevision !== tl.project.revision) return null;
+    try {
+      const next = applyOperations(
+        {
+          fps: tl.project.settings.fps,
+          tracks: new Map(tl.tracks.map((t) => [t.id, t])),
+          clips: new Map(tl.clips.map((c) => [c.id, c])),
+          captions: new Map(tl.captions.map((c) => [c.id, c])),
+          assets: new Map(tl.assets.map((a) => [a.id, a])),
+        },
+        previewProposal.operations,
+      );
+      const clips = [...next.clips.values()];
+      const captions = [...next.captions.values()];
+      return {
+        ...tl,
+        tracks: [...next.tracks.values()].sort((a, b) => a.position - b.position),
+        clips,
+        captions,
+        durationFrames: Math.max(0, ...clips.map((c) => c.start + c.duration), ...captions.map((c) => c.start + c.duration)),
+      };
+    } catch {
+      return null;
+    }
+  }, [tl, previewProposal]);
+  useEffect(() => {
+    // The timeline moved on: the preview no longer describes what Apply would do.
+    if (previewProposal && tl && previewProposal.baseRevision !== tl.project.revision) setPreviewProposal(null);
+  }, [tl?.project.revision]);
+
   // The live preview shows inspector / caption-style drags before they are committed.
   const viewTimeline = useMemo<TimelineData | null>(() => {
-    if (!tl || (!draft && !styleDraft)) return tl;
+    const base = proposed ?? tl;
+    if (!base || (!draft && !styleDraft)) return base;
+    const tl2 = base;
     return {
-      ...tl,
-      clips: draft ? tl.clips.map((c) => (c.id === draft.clipId ? { ...c, props: { ...c.props, ...draft.props } } : c)) : tl.clips,
-      tracks: styleDraft ? tl.tracks.map((t) => (t.id === styleDraft.trackId ? { ...t, captionStyle: { ...t.captionStyle, ...styleDraft.style } } : t)) : tl.tracks,
+      ...tl2,
+      clips: draft ? tl2.clips.map((c) => (c.id === draft.clipId ? { ...c, props: { ...c.props, ...draft.props } } : c)) : tl2.clips,
+      tracks: styleDraft ? tl2.tracks.map((t) => (t.id === styleDraft.trackId ? { ...t, captionStyle: { ...t.captionStyle, ...styleDraft.style } } : t)) : tl2.tracks,
     };
-  }, [tl, draft, styleDraft]);
+  }, [tl, proposed, draft, styleDraft]);
   const analyses = useAnalyses(client, current?.id ?? null, notify);
   // Beat and scene-cut positions on the timeline, per clip (markers + snapping).
   const markers = useMemo(() => {
@@ -369,7 +406,7 @@ export function App() {
         <Placeholder workspace={workspace} />
       ) : (
         <div className="rf-studio">
-          <LeftRail active={rail} onChange={setRail} />
+          <LeftRail active={rail} onChange={setRail} onSettings={() => setSettingsOpen(true)} />
           {rail === "media" ? (
             <MediaLibrary
               client={client}
@@ -427,11 +464,24 @@ export function App() {
             onPlayhead={(f) => (playing ? setPlayhead(f) : seek(f))}
             playing={playing}
             onPlaying={setPlaying}
+            badge={proposed ? "Previewing AI plan (not applied)" : null}
           />
           <aside className="rf-panel rf-right" aria-label={rightTab === "inspector" ? "Inspector" : "AI Director"}>
             <RightPanelTabs tab={rightTab} onTab={setRightTab} hasClip={!!selectedClip} />
             {rightTab === "director" ? (
-              <AIDirector />
+              <AIDirector
+                client={client}
+                timeline={tl}
+                selection={Array.from(selection)}
+                notify={notify}
+                previewing={proposed ? previewProposal!.id : null}
+                onPreview={(proposal) => {
+                  setPreviewProposal(proposal);
+                  if (proposal) setPreviewMode("live");
+                }}
+                onApplied={() => void editor.reload()}
+                onOpenSettings={() => setSettingsOpen(true)}
+              />
             ) : selectedClip && tl ? (
               <Inspector
                 timeline={tl}
@@ -499,6 +549,7 @@ export function App() {
           {assetDrag.asset.filename}
         </div>
       )}
+      {settingsOpen && <SettingsDialog client={client} projectId={current?.id ?? null} notify={notify} onClose={() => setSettingsOpen(false)} />}
       {dialogOpen && <NewProjectDialog onCancel={() => setDialogOpen(false)} onCreate={createProject} />}
       {toast && (
         <div key={toast.id} className={`rf-toast rf-toast-${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>

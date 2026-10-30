@@ -5,6 +5,8 @@ export type ErrorCode =
   | "UNAUTHORIZED"
   /** A required local dependency (e.g. FFmpeg) is missing or failed. */
   | "UNAVAILABLE"
+  /** The user hasn't allowed sending this project's context to an external AI provider. */
+  | "CONSENT_REQUIRED"
   | "INTERNAL";
 
 /** Every failure that crosses a boundary (CLI, REST, MCP) is one of these. */

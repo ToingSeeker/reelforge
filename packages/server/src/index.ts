@@ -13,6 +13,7 @@ import {
   isReelForgeError,
   JobStore,
   OPERATION_TYPES,
+  ProposalStore,
   planCaptions,
   type AnalysisKind,
   ProjectStore,
@@ -22,6 +23,7 @@ import {
   type Database,
   type ErrorCode,
 } from "@reelforge/core";
+import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, propose, providerFor } from "@reelforge/ai";
 import { AnalysisRunner, createRenderJob, ensureProxy, ensureThumbnail, fontsDir, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { join } from "node:path";
 
@@ -54,6 +56,7 @@ const STATUS: Record<ErrorCode, number> = {
   VALIDATION_ERROR: 400,
   UNAUTHORIZED: 401,
   UNAVAILABLE: 503,
+  CONSENT_REQUIRED: 403,
   NOT_FOUND: 404,
   REVISION_CONFLICT: 409,
   INTERNAL: 500,
@@ -169,6 +172,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     return queued;
   };
   const fontFiles = new Set<string>(Object.values(CAPTION_FONTS));
+  const proposals = new ProposalStore(opts.db);
   const body = (req: IncomingMessage) => readJson(req) as Promise<never>;
   const pathsOf = (b: unknown): string[] => {
     const paths = (b as { paths?: unknown })?.paths;
@@ -320,6 +324,64 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       },
     },
     {
+      method: "GET",
+      pattern: re("/v1/ai/providers"),
+      handle: async ({ res }) => {
+        const ollama = await listOllamaModels();
+        return send(res, 200, {
+          providers: [
+            { id: "anthropic", label: "Claude", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL, models: [ANTHROPIC_DEFAULT_MODEL, "claude-sonnet-5-5"] },
+            { id: "ollama", label: "Local (Ollama)", external: false, available: ollama.available, defaultModel: ollama.models[0] ?? null, models: ollama.models },
+          ],
+        });
+      },
+    },
+    {
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/ai-consent`),
+      handle: ({ res, params: [id] }) => send(res, 200, { consent: proposals.consent(id!) }),
+    },
+    {
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/ai-consent`),
+      handle: async ({ req, res, params: [id], actor }) => {
+        const b = (await readJson(req)) as { granted?: unknown };
+        if (typeof b.granted !== "boolean") throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"granted": true|false}');
+        return send(res, 200, { consent: proposals.setConsent(id!, b.granted, actor) });
+      },
+    },
+    {
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/proposals`),
+      handle: async ({ req, res, params: [id] }) => {
+        const b = (await readJson(req)) as { instruction?: unknown; provider?: unknown; model?: unknown; selection?: unknown };
+        if (typeof b.instruction !== "string") throw new ReelForgeError("VALIDATION_ERROR", "instruction is required");
+        const provider = providerFor(typeof b.provider === "string" ? b.provider : "anthropic");
+        const model = typeof b.model === "string" && b.model ? b.model : provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : ((await listOllamaModels()).models[0] ?? "");
+        if (!model) throw new ReelForgeError("UNAVAILABLE", "no local model available in Ollama");
+        // If the client goes away (cancel), stop the model request too.
+        const abort = new AbortController();
+        res.on("close", () => !res.writableEnded && abort.abort());
+        const proposal = await propose(
+          opts.db,
+          id!,
+          provider,
+          { instruction: b.instruction, model, selection: Array.isArray(b.selection) ? b.selection.filter((x): x is string => typeof x === "string") : [] },
+          { signal: abort.signal },
+        );
+        return send(res, 201, { proposal });
+      },
+    },
+    { method: "GET", pattern: re(`/v1/projects/${ID}/proposals`), handle: ({ res, params: [id] }) => send(res, 200, { proposals: proposals.list(id!) }) },
+    { method: "GET", pattern: re(`/v1/proposals/${ID}`), handle: ({ res, params: [id] }) => send(res, 200, { proposal: proposals.get(id!) }) },
+    {
+      // The approval: a person pressed "Apply" in a client. The model's output can never reach this.
+      method: "POST",
+      pattern: re(`/v1/proposals/${ID}/apply`),
+      handle: ({ res, params: [id], actor }) => send(res, 200, proposals.apply(id!, { by: actor, channel: `${actor}:apply` })),
+    },
+    { method: "POST", pattern: re(`/v1/proposals/${ID}/reject`), handle: ({ res, params: [id], actor }) => send(res, 200, { proposal: proposals.reject(id!, actor) }) },
+    {
       // Desktop "Export SRT…": the webview can't write files, so the engine writes where the user chose.
       method: "POST",
       pattern: re(`/v1/projects/${ID}/captions/export-srt`),
@@ -454,6 +516,8 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     }
   });
 
+  // AI proposals from local models can take minutes; Node's default 5-minute request timeout would cut them off.
+  server.requestTimeout = 30 * 60_000;
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(opts.port ?? 0, "127.0.0.1", () => {

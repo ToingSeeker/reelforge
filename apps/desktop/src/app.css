@@ -1758,3 +1758,188 @@ button:disabled {
   overflow-y: auto;
   user-select: text;
 }
+
+/* M4: AI Director */
+.rf-model-select {
+  width: auto;
+  max-width: 170px;
+  margin-left: auto;
+}
+.rf-director-head > div {
+  min-width: 0;
+}
+.rf-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.rf-chip-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--rf-border-strong);
+  border-radius: 999px;
+  background: var(--rf-bg);
+  color: var(--rf-text-2);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.rf-chip-btn:hover {
+  border-color: var(--rf-primary);
+  color: var(--rf-text);
+}
+.rf-msg {
+  position: relative;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: var(--rf-radius-lg);
+  font-size: 13px;
+  line-height: 1.45;
+  user-select: text;
+}
+.rf-msg-user {
+  margin-left: 36px;
+  background: var(--rf-selection-soft);
+  border: 1px solid rgba(24, 108, 230, 0.4);
+}
+.rf-msg-ai {
+  margin-right: 4px;
+  background: var(--rf-surface);
+  border: 1px solid var(--rf-border);
+}
+.rf-msg-ai.is-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--rf-text-2);
+}
+.rf-msg-ai.is-loading .rf-link-btn {
+  margin-left: auto;
+}
+.rf-msg-time {
+  float: right;
+  margin-left: 8px;
+  color: var(--rf-text-3);
+  font-size: 11px;
+}
+.rf-proposal-head {
+  margin-bottom: 4px;
+}
+.rf-proposal p {
+  margin: 4px 0;
+  color: var(--rf-text-2);
+}
+.rf-proposal.is-rejected,
+.rf-proposal.is-stale {
+  opacity: 0.6;
+}
+.rf-proposal-warnings {
+  margin: 6px 0;
+  padding: 0;
+  list-style: none;
+  color: var(--rf-warning);
+  font-size: 12px;
+}
+.rf-proposal-toggle {
+  margin: 4px 0;
+}
+.rf-diff {
+  margin: 6px 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+}
+.rf-diff li {
+  padding: 5px 0;
+  border-top: 1px solid var(--rf-border);
+}
+.rf-diff-kind {
+  display: inline-block;
+  min-width: 52px;
+  color: var(--rf-text-3);
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.rf-diff-before,
+.rf-diff-after {
+  padding-left: 56px;
+  font-family: var(--rf-font-mono);
+  overflow-wrap: anywhere;
+}
+.rf-diff-before {
+  color: #ff8f9b;
+}
+.rf-diff-after {
+  color: #7be3a8;
+}
+.rf-diff-why {
+  color: var(--rf-text-2);
+}
+.rf-proposal-actions {
+  margin-top: 8px;
+}
+.rf-proposal-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.rf-proposal-row .rf-btn {
+  justify-content: center;
+  padding: 0 6px;
+  font-size: 12px;
+}
+.rf-proposal-row .rf-btn[aria-pressed="true"] {
+  border-color: var(--rf-primary);
+  color: var(--rf-primary);
+}
+.rf-proposal-status {
+  font-size: 12px;
+}
+.rf-sel-chip {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--rf-selection-soft);
+  color: var(--rf-primary);
+  font-size: 11px;
+}
+.rf-frame-badge {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  z-index: 2;
+  transform: translateX(-50%);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--rf-primary);
+  color: var(--rf-primary-ink);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.rf-consent-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--rf-text-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.rf-consent-json {
+  max-height: 220px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: var(--rf-radius);
+  background: var(--rf-bg);
+  font-size: 10px;
+  user-select: text;
+}
+.rf-settings-group h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+.rf-key-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}

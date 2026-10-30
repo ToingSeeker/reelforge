@@ -12,7 +12,7 @@ const ITEMS: { id: RailItem; label: string; icon: IconName }[] = [
   { id: "color", label: "Color", icon: "color" },
 ];
 
-export function LeftRail({ active, onChange }: { active: RailItem; onChange: (r: RailItem) => void }) {
+export function LeftRail({ active, onChange, onSettings }: { active: RailItem; onChange: (r: RailItem) => void; onSettings: () => void }) {
   return (
     <nav className="rf-rail" aria-label="Tools">
       {ITEMS.map((i) => (
@@ -26,7 +26,7 @@ export function LeftRail({ active, onChange }: { active: RailItem; onChange: (r:
           <span>{i.label}</span>
         </button>
       ))}
-      <button className="rf-rail-item rf-rail-settings" disabled title="Settings — AI providers and keys arrive in M4">
+      <button className="rf-rail-item rf-rail-settings" onClick={onSettings} title="Settings: AI providers and keys">
         <Icon name="settings" size={18} />
         <span>Settings</span>
       </button>

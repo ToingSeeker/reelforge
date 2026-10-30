@@ -149,7 +149,33 @@ export class TimelineStore {
     };
   }
 
-  apply(projectId: string, input: ApplyOperationsInput, actor: Actor): Timeline {
+  /**
+   * Run operations against the current state without writing anything: the
+   * validator for AI proposals (FR-021) and the source of their diff (FR-022).
+   */
+  preview(projectId: string, operations: unknown) {
+    const pid = parse(ProjectIdSchema, projectId);
+    const ops = parse(ApplyOperationsInputSchema.shape.operations, operations);
+    const loaded = this.#load(pid, true);
+    const next = applyOperations(loaded.state, ops);
+    const end = (m: ReadonlyMap<string, { start: number; duration: number }>) => [...m.values()].reduce((x, c) => Math.max(x, c.start + c.duration), 0);
+    const before = this.#view(loaded.project.id, loaded.project, loaded.tracks, loaded.clips, loaded.captions, loaded.assets);
+    return {
+      before,
+      after: {
+        ...before,
+        tracks: [...next.tracks.values()].sort((a, b) => a.position - b.position),
+        clips: [...next.clips.values()].sort((a, b) => a.start - b.start),
+        captions: [...next.captions.values()].sort((a, b) => a.start - b.start),
+        durationFrames: Math.max(end(next.clips), end(next.captions)),
+      } satisfies Timeline,
+      operations: ops,
+      diff: diffStates(loaded.state, next),
+      durationAfter: Math.max(end(next.clips), end(next.captions)),
+    };
+  }
+
+  apply(projectId: string, input: ApplyOperationsInput, actor: Actor, meta: Record<string, unknown> = {}): Timeline {
     const pid = parse(ProjectIdSchema, projectId);
     const { baseRevision, operations } = parse(ApplyOperationsInputSchema, input);
     transaction(this.#db, () => {
@@ -163,7 +189,7 @@ export class TimelineStore {
         projectId: pid,
         baseRevision,
         kind: "timeline.edit",
-        payload: { operations },
+        payload: { operations, ...meta },
         actor,
         now: this.#now(),
         undoable: true,

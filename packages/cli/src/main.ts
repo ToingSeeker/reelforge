@@ -12,6 +12,7 @@ import {
   JobStore,
   OPERATION_TYPES,
   planCaptions,
+  ProposalStore,
   type AnalysisKind,
   openDatabase,
   parseFps,
@@ -27,6 +28,7 @@ import {
   type ErrorCode,
   type TimelineOp,
 } from "@reelforge/core";
+import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, propose, providerFor, setCredential } from "@reelforge/ai";
 import { AnalysisRunner, createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 
@@ -42,6 +44,7 @@ const EXIT: Record<ErrorCode, number> = {
   REVISION_CONFLICT: 4,
   UNAUTHORIZED: 5,
   UNAVAILABLE: 6,
+  CONSENT_REQUIRED: 7,
 };
 
 const USAGE = `reelforge ${VERSION} — AI-native video editing engine
@@ -73,6 +76,13 @@ Usage:
   reelforge captions generate <project> [--track C1] [--source A1,A2] [--max-words 3] [--language auto]
   reelforge captions srt <project> [--track C1] [--out file.srt]
   reelforge project context <project>          (structured view for AI planners)
+
+  reelforge ai providers
+  reelforge ai propose <project> "<instruction>" [--provider ollama|anthropic] [--model <id>] [--selection <clip>,…]
+  reelforge ai proposals <project> | ai show <proposal>
+  reelforge ai apply <proposal> --yes          (your approval; never automatic)
+  reelforge ai reject <proposal>
+  reelforge ai consent <project> --grant|--revoke   (allow sending this project's context to an external provider)
 
   reelforge render <project> --out <file.mp4>      (H.264/AAC at project size; never overwrites)
   reelforge preview <project>                      (low-res render of the same graph, from proxies)
@@ -139,6 +149,12 @@ const OPTIONS = {
   language: { type: "string" },
   source: { type: "string" },
   "max-words": { type: "string" },
+  provider: { type: "string" },
+  model: { type: "string" },
+  selection: { type: "string" },
+  yes: { type: "boolean" },
+  grant: { type: "boolean" },
+  revoke: { type: "boolean" },
   wait: { type: "boolean" },
 } as const;
 
@@ -196,6 +212,15 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
         const job = await runJob(db, env, io, (sub ? [sub, ...rest] : rest)[0], cmd === "render" ? "export" : "preview", values.out);
         print({ job });
         return job.state === "completed" ? 0 : job.error?.code === "MEDIA_OFFLINE" || job.state === "cancelled" ? EXIT.VALIDATION_ERROR : EXIT.INTERNAL;
+      } finally {
+        db.close();
+      }
+    }
+    if (cmd === "ai" && (sub === "propose" || sub === "providers")) {
+      const db = openDatabase(resolveDbPath(env));
+      try {
+        print(sub === "providers" ? await providersInfo() : await proposeInline(db, rest, values));
+        return 0;
       } finally {
         db.close();
       }
@@ -393,6 +418,18 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
     }
     return { srt };
   },
+  "ai proposals": ({ db, args }) => ({ proposals: new ProposalStore(db).list(need(args[0], "<project>")) }),
+  "ai show": ({ db, args }) => ({ proposal: new ProposalStore(db).get(need(args[0], "<proposal>")) }),
+  "ai apply": ({ db, args, values }) => {
+    // The approval is the person typing --yes; nothing an AI writes can stand in for it.
+    if (!values.yes) invalid("applying a proposal needs your approval: re-run with --yes after reviewing `reelforge ai show`");
+    return new ProposalStore(db).apply(need(args[0], "<proposal>"), { by: "cli", channel: "cli:--yes" });
+  },
+  "ai reject": ({ db, args }) => ({ proposal: new ProposalStore(db).reject(need(args[0], "<proposal>"), "cli") }),
+  "ai consent": ({ db, args, values }) => {
+    if (values.grant === values.revoke) invalid("use exactly one of --grant or --revoke");
+    return { consent: new ProposalStore(db).setConsent(need(args[0], "<project>"), !!values.grant, "cli") };
+  },
   "jobs list": ({ db, args }) => ({ jobs: new JobStore(db).list(need(args[0], "<project>")) }),
   "jobs get": ({ db, args }) => ({ job: new JobStore(db).get(need(args[0], "<job>")) }),
   "jobs cancel": ({ db, args }) => ({ job: new JobStore(db).cancel(need(args[0], "<job>")) }),
@@ -403,6 +440,27 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
     return edit(ctx, need(p, "<project>"), [{ type: "clip.delete", clipIds, ...(ctx.values.ripple ? { ripple: true } : {}) }]);
   },
 };
+
+async function providersInfo() {
+  const ollama = await listOllamaModels();
+  return {
+    providers: [
+      { id: "anthropic", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL },
+      { id: "ollama", external: false, available: ollama.available, models: ollama.models },
+    ],
+  };
+}
+
+async function proposeInline(db: Database, args: string[], values: Values) {
+  const [projectId, ...words] = args;
+  const instruction = words.join(" ");
+  if (!instruction) invalid('missing "<instruction>"');
+  const provider = providerFor(values.provider ?? "anthropic");
+  const model = values.model ?? (provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : (await listOllamaModels()).models[0]);
+  if (!model) throw new ReelForgeError("UNAVAILABLE", "no local model available in Ollama");
+  const proposal = await propose(db, need(projectId, "<project>"), provider, { instruction, model, selection: values.selection?.split(",").map((x) => x.trim()).filter(Boolean) ?? [] });
+  return { proposal, next: proposal.operations.length ? `review it, then: reelforge ai apply ${proposal.id} --yes` : "nothing to apply" };
+}
 
 async function runAnalyses(db: Database, env: NodeJS.ProcessEnv, io: Io, ids: string[]) {
   const runner = new AnalysisRunner(db, { cacheDir: resolveCacheDir(env) });
@@ -525,6 +583,23 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     process.once("SIGTERM", stop);
     // When the parent (desktop app) dies, stdin closes: exit instead of lingering.
     process.stdin.once("end", stop);
+    // The desktop shell sends API keys from the OS keychain as JSON lines; they stay in memory only.
+    let buf = "";
+    process.stdin.on("data", (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line) as { type?: string; provider?: string; apiKey?: string | null };
+          if (msg.type === "credential" && typeof msg.provider === "string") setCredential(msg.provider, msg.apiKey ?? null);
+        } catch {
+          io.err("[reelforge-server] ignored a malformed control line on stdin\n");
+        }
+      }
+    });
     process.stdin.resume();
   });
   // stdin was only a liveness signal; release it or it keeps the event loop alive.

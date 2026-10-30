@@ -1,4 +1,5 @@
-import type { Analysis, AnalysisKind, Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
+import type { AIConsent, AIProposal, Analysis, AnalysisKind, Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
+import type { ProjectContext } from "@reelforge/core/context";
 
 // The desktop UI never touches SQLite: it talks to the same core through the
 // local REST sidecar that the Rust shell starts (or, in a plain browser during
@@ -39,9 +40,10 @@ export async function resolveApiInfo(): Promise<ApiInfo> {
 }
 
 export function createClient(info: ApiInfo) {
-  async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async function request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     const res = await fetch(info.url + path, {
       method,
+      ...(signal ? { signal } : {}),
       headers: {
         authorization: `Bearer ${info.token}`,
         "x-reelforge-actor": "desktop",
@@ -73,6 +75,18 @@ export function createClient(info: ApiInfo) {
         `/v1/projects/${encodeURIComponent(id)}/captions/generate`,
         body,
       ),
+    aiProviders: () =>
+      request<{ providers: AIProviderInfo[] }>("GET", "/v1/ai/providers").then((r) => r.providers),
+    propose: (id: string, body: { instruction: string; provider: string; model: string; selection: string[] }, signal?: AbortSignal) =>
+      request<{ proposal: AIProposal }>("POST", `/v1/projects/${encodeURIComponent(id)}/proposals`, body, signal).then((r) => r.proposal),
+    proposals: (id: string) => request<{ proposals: AIProposal[] }>("GET", `/v1/projects/${encodeURIComponent(id)}/proposals`).then((r) => r.proposals),
+    applyProposal: (proposalId: string) =>
+      request<{ proposal: AIProposal; timeline: Timeline }>("POST", `/v1/proposals/${encodeURIComponent(proposalId)}/apply`),
+    rejectProposal: (proposalId: string) => request<{ proposal: AIProposal }>("POST", `/v1/proposals/${encodeURIComponent(proposalId)}/reject`).then((r) => r.proposal),
+    consent: (id: string) => request<{ consent: AIConsent | null }>("GET", `/v1/projects/${encodeURIComponent(id)}/ai-consent`).then((r) => r.consent),
+    setConsent: (id: string, granted: boolean) =>
+      request<{ consent: AIConsent | null }>("POST", `/v1/projects/${encodeURIComponent(id)}/ai-consent`, { granted }).then((r) => r.consent),
+    context: (id: string) => request<{ context: ProjectContext }>("GET", `/v1/projects/${encodeURIComponent(id)}/context`).then((r) => r.context),
     exportSrt: (id: string, outputPath: string, trackId?: string) =>
       request<{ path: string }>("POST", `/v1/projects/${encodeURIComponent(id)}/captions/export-srt`, { outputPath, ...(trackId ? { trackId } : {}) }),
     listProjects: () => request<{ projects: Project[] }>("GET", "/v1/projects").then((r) => r.projects),
@@ -108,3 +122,13 @@ export function createClient(info: ApiInfo) {
 }
 
 export type Client = ReturnType<typeof createClient>;
+
+export interface AIProviderInfo {
+  id: "anthropic" | "ollama";
+  label: string;
+  external: boolean;
+  credential?: "keychain" | "environment" | "none";
+  available?: boolean;
+  defaultModel: string | null;
+  models: string[];
+}

@@ -235,3 +235,71 @@ test("M3 from the CLI: beats, auto-transcribed captions, SRT, project context", 
   assert.ok(ctx.timeline.captions.length >= 2);
   assert.ok(ctx.operations.includes("captions.replace"));
 });
+
+test("serve takes API keys over stdin into memory, and never reports them", async (t) => {
+  const { spawn } = await import("node:child_process");
+  const { once } = await import("node:events");
+  const home = mkdtempSync(join(tmpdir(), "reelforge-cred-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const env: NodeJS.ProcessEnv = { ...process.env, REELFORGE_HOME: home };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  delete env.ANTHROPIC_PROFILE;
+  const child = spawn(process.execPath, [new URL("../bin/reelforge.js", import.meta.url).pathname, "serve"], { env, stdio: ["pipe", "pipe", "inherit"] });
+  t.after(() => child.kill());
+  const [chunk] = (await once(child.stdout!, "data")) as [Buffer];
+  const ready = JSON.parse(chunk.toString().split("\n")[0]!);
+  const get = async () => (await (await fetch(`${ready.url}/v1/ai/providers`, { headers: { authorization: `Bearer ${ready.token}` } })).text());
+  assert.match(await get(), /"credential":"none"/);
+  child.stdin!.write(JSON.stringify({ type: "credential", provider: "anthropic", apiKey: "sk-ant-test-123456" }) + "\n");
+  await new Promise((r) => setTimeout(r, 150));
+  const after = await get();
+  assert.match(after, /"credential":"keychain"/);
+  assert.equal(after.includes("sk-ant-test"), false, "the key itself never leaves the engine");
+});
+
+test("ai from the CLI: propose (local), apply needs --yes, consent flags", async (t) => {
+  const { createServer } = await import("node:http");
+  let clipId = "";
+  const fake = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/api/tags") return res.end(JSON.stringify({ models: [{ name: "fake:1b" }] }));
+      const content = JSON.stringify({ summary: "Fade in", warnings: [], operations: [{ type: "clip.update", why: "softer start", clipId, props: { fadeIn: 10 } }] });
+      res.end(JSON.stringify({ model: "fake:1b", message: { content } }));
+    });
+  });
+  await new Promise<void>((r) => fake.listen(0, "127.0.0.1", () => r()));
+  const prev = process.env.REELFORGE_OLLAMA_URL;
+  process.env.REELFORGE_OLLAMA_URL = `http://127.0.0.1:${(fake.address() as any).port}`;
+  t.after(() => {
+    fake.close();
+    if (prev === undefined) delete process.env.REELFORGE_OLLAMA_URL;
+    else process.env.REELFORGE_OLLAMA_URL = prev;
+  });
+
+  const run = harness(t);
+  const { fixtures } = await import("../../media/test/fixtures.ts");
+  const id = (await run("project", "create", "--name", "AI CLI")).json.project.id;
+  const asset = (await run("media", "import", id, fixtures().portrait)).json.imported[0];
+  clipId = (await run("clip", "add", id, "--track", "V1", "--asset", asset.id, "--start", "0")).json.timeline.clips[0].id;
+
+  const p = await run("ai", "propose", id, "fade", "in", "the", "clip", "--provider", "ollama");
+  assert.equal(p.code, 0, JSON.stringify(p.error));
+  assert.equal(p.json.proposal.status, "pending");
+  assert.match(p.json.next, /--yes/);
+  const noYes = await run("ai", "apply", p.json.proposal.id);
+  assert.equal(noYes.code, 2);
+  assert.match(noYes.error.message, /approval/);
+  const yes = await run("ai", "apply", p.json.proposal.id, "--yes");
+  assert.equal(yes.code, 0);
+  assert.deepEqual(yes.json.timeline.clips[0].props, { fadeIn: 10 });
+  assert.equal(yes.json.proposal.approval.channel, "cli:--yes");
+
+  const blocked = await run("ai", "propose", id, "anything", "--provider", "anthropic");
+  assert.equal(blocked.code, 7, "CONSENT_REQUIRED");
+  assert.equal((await run("ai", "consent", id)).code, 2, "needs --grant or --revoke");
+  assert.ok((await run("ai", "consent", id, "--grant")).json.consent.grantedAt);
+});

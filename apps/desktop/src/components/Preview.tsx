@@ -21,10 +21,12 @@ interface Props {
   onPlayhead: (frame: number) => void;
   playing: boolean;
   onPlaying: (playing: boolean) => void;
+  /** A notice over the picture (e.g. an AI plan being previewed). */
+  badge?: string | null;
 }
 
 export function Preview(props: Props) {
-  const { client, timeline, preview, playhead, onPlayhead, playing, onPlaying, mode, onMode } = props;
+  const { client, timeline, preview, playhead, onPlayhead, playing, onPlaying, mode, onMode, badge } = props;
   const s = timeline?.project.settings ?? { width: 1080, height: 1920, fps: { num: 30, den: 1 } };
   const fpsNum = s.fps.num / s.fps.den;
   const duration = timeline?.durationFrames ?? 0;
@@ -177,6 +179,7 @@ export function Preview(props: Props) {
             <img className="rf-frame-poster" src={poster} alt="" />
           ) : null}
           <div className="rf-safe-area" aria-hidden="true" />
+          {badge && <span className="rf-frame-badge" role="status">{badge}</span>}
           {!live && !preview.url && !top && (
             <div className="rf-frame-empty">
               <Icon name="play" size={28} />

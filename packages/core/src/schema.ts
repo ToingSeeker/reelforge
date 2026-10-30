@@ -546,3 +546,48 @@ export const ApplyOperationsInputSchema = z.object({
   operations: z.array(TimelineOpSchema).min(1).max(500),
 });
 export type ApplyOperationsInput = z.input<typeof ApplyOperationsInputSchema>;
+
+// ---------------------------------------------------------------------------
+// AI Director (M4)
+// ---------------------------------------------------------------------------
+
+export type ProposalStatus = "pending" | "applied" | "rejected" | "stale";
+
+/** One human-readable line of what a proposal changes (the diff viewer, FR-022). */
+export interface ProposalChange {
+  kind: "added" | "removed" | "changed";
+  target: "clip" | "caption" | "track";
+  id: string;
+  label: string;
+  /** Before / after summaries, e.g. "V1 · 3.00s–6.00s" → "V1 · 4.50s–7.50s". */
+  before: string | null;
+  after: string | null;
+}
+
+export interface AIProposal {
+  id: string;
+  projectId: string;
+  baseRevision: number;
+  instruction: string;
+  selection: string[];
+  provider: string;
+  model: string;
+  status: ProposalStatus;
+  summary: string;
+  operations: TimelineOp[];
+  /** Why, per operation (same order). */
+  explanations: string[];
+  warnings: string[];
+  changes: ProposalChange[];
+  durationBefore: number;
+  durationAfter: number;
+  usage: Record<string, unknown> | null;
+  approval: { by: string; channel: string; at: string } | null;
+  appliedRevision: number | null;
+  createdAt: string;
+}
+
+export interface AIConsent {
+  grantedAt: string;
+  grantedBy: string;
+}

@@ -257,3 +257,69 @@ test("M3 over REST: analyze → poll, context, captions generate asks for transc
   assert.ok([401, 404].includes((await call(srv, "GET", `/v1/fonts/..%2F..%2Fetc%2Fpasswd.ttf?token=${TOKEN}`, { auth: false })).status));
   assert.equal((await call(srv, "GET", `/v1/fonts/Other.ttf?token=${TOKEN}`, { auth: false })).status, 404);
 });
+
+test("M4 over REST: providers, consent gate, proposal → apply → undo (via a fake local Ollama)", async (t) => {
+  const { createServer } = await import("node:http");
+  let lastChat: any = null;
+  let reply: object = {};
+  const fake = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/api/tags") return res.end(JSON.stringify({ models: [{ name: "fake:1b" }] }));
+      lastChat = JSON.parse(body);
+      res.end(JSON.stringify({ model: lastChat.model, message: { content: JSON.stringify(reply) }, prompt_eval_count: 10, eval_count: 5 }));
+    });
+  });
+  await new Promise<void>((r) => fake.listen(0, "127.0.0.1", () => r()));
+  const prev = process.env.REELFORGE_OLLAMA_URL;
+  process.env.REELFORGE_OLLAMA_URL = `http://127.0.0.1:${(fake.address() as any).port}`;
+  t.after(() => {
+    fake.close();
+    if (prev === undefined) delete process.env.REELFORGE_OLLAMA_URL;
+    else process.env.REELFORGE_OLLAMA_URL = prev;
+  });
+
+  const srv = await boot(t);
+  const f = fixtures();
+  const providers = ((await (await call(srv, "GET", "/v1/ai/providers")).json()) as any).providers;
+  assert.deepEqual(providers.find((p: any) => p.id === "ollama").models, ["fake:1b"]);
+  assert.equal(JSON.stringify(providers).includes("sk-"), false);
+
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "AI" } })).json()) as any;
+  const imp = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [f.portrait] } })).json()) as any;
+  let tl = ((await (await call(srv, "GET", `/v1/projects/${project.id}/timeline`)).json()) as any).timeline;
+  const v1 = tl.tracks.find((x: any) => x.kind === "video");
+  tl = ((await (await call(srv, "POST", `/v1/projects/${project.id}/operations`, {
+    body: { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: v1.id, assetId: imp.imported[0].id, start: 0 }] },
+  })).json()) as any).timeline;
+  const clip = tl.clips[0];
+
+  // Claude is external: without consent the request is refused before anything is sent.
+  const blocked = await call(srv, "POST", `/v1/projects/${project.id}/proposals`, { body: { instruction: "zoom in", provider: "anthropic" } });
+  assert.equal(blocked.status, 403);
+  assert.equal(((await blocked.json()) as any).error.code, "CONSENT_REQUIRED");
+
+  reply = { summary: "Zoom in", warnings: [], operations: [{ type: "clip.update", why: "punch in", clipId: clip.id, props: { scale: 1.25 } }] };
+  const made = await call(srv, "POST", `/v1/projects/${project.id}/proposals`, { body: { instruction: "zoom in", provider: "ollama" } });
+  assert.equal(made.status, 201);
+  const proposal = ((await made.json()) as any).proposal;
+  assert.equal(proposal.model, "fake:1b");
+  assert.equal(lastChat.format.type, "object", "the output schema is sent as Ollama's format");
+  assert.match(lastChat.messages[1].content, /<instruction>\nzoom in/);
+
+  const applied = await call(srv, "POST", `/v1/proposals/${proposal.id}/apply`, { headers: { "x-reelforge-actor": "desktop" } });
+  assert.equal(applied.status, 200);
+  const a = (await applied.json()) as any;
+  assert.deepEqual(a.timeline.clips[0].props, { scale: 1.25 });
+  assert.equal(a.proposal.approval.channel, "desktop:apply");
+  const undone = ((await (await call(srv, "POST", `/v1/projects/${project.id}/undo`, { body: { baseRevision: a.timeline.project.revision } })).json()) as any).timeline;
+  assert.deepEqual(undone.clips[0].props, {});
+  assert.equal((await call(srv, "POST", `/v1/proposals/${proposal.id}/apply`)).status, 400, "can't apply twice");
+
+  const list = ((await (await call(srv, "GET", `/v1/projects/${project.id}/proposals`)).json()) as any).proposals;
+  assert.equal(list[0].status, "applied");
+  const consent = await call(srv, "POST", `/v1/projects/${project.id}/ai-consent`, { body: { granted: true }, headers: { "x-reelforge-actor": "desktop" } });
+  assert.equal(((await consent.json()) as any).consent.grantedBy, "desktop");
+});

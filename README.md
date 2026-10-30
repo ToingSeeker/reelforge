@@ -5,10 +5,10 @@
 
 ---
 
-> **Status: pre-alpha, milestone M3.** Media import, a multi-track timeline
-> with undo/redo, transforms/fades/dissolves, a live preview, frame-exact MP4
-> export, plus local scene/beat detection, speech transcription and animated
-> burned-in captions work from the desktop and the CLI. The AI Director (M4) is next. Transcription/captions
+> **Status: pre-alpha, milestone M4.** Multi-track editing with undo/redo, a
+> live preview, frame-exact MP4 export, local scene/beat/speech analysis,
+> animated captions, and an **AI Director** (Claude or a local Ollama model) that
+> proposes timeline edits you preview and approve. MCP & automation (M5) are next. Transcription/captions
 > (M3) and the AI Director (M4) are not built yet. See [docs/milestones.md](docs/milestones.md).
 
 ReelForge turns raw footage into editable, reviewable vertical video. You can drive it
@@ -58,6 +58,12 @@ pnpm cli media analyze <project> <asset> --kinds scenes,beats,transcript
 pnpm cli captions generate <project> --source A2 --max-words 3 --language id
 pnpm cli captions srt <project> --out captions.srt
 pnpm cli project context <project>        # what an AI planner reads
+
+# AI Director: proposals you review and approve (local model, or Claude with consent)
+pnpm cli ai propose <project> "Fade in the first clip and cut the B-roll on the beat" --provider ollama
+pnpm cli ai show <proposal>
+pnpm cli ai apply <proposal> --yes
+pnpm cli ai consent <project> --grant     # before using Claude (ANTHROPIC_API_KEY or `ant auth login`)
 
 # Desktop studio (starts the engine as a sidecar)
 pnpm desktop

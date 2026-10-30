@@ -227,5 +227,42 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE tracks ADD COLUMN props TEXT NOT NULL DEFAULT '{}';
     `,
   },
+  {
+    version: 6,
+    name: "ai_proposals_and_consent",
+    sql: `
+      -- AI Director proposals (PRD §9). The model only ever produces operations; applying one needs
+      -- an explicit approval recorded here (who, when, through what), never the model's say-so.
+      CREATE TABLE ai_proposals (
+        id               TEXT PRIMARY KEY,
+        project_id       TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+        base_revision    INTEGER NOT NULL,
+        instruction      TEXT NOT NULL,
+        selection        TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(selection)),
+        provider         TEXT NOT NULL,
+        model            TEXT NOT NULL,
+        status           TEXT NOT NULL CHECK (status IN ('pending', 'applied', 'rejected', 'stale')),
+        summary          TEXT NOT NULL,
+        operations       TEXT NOT NULL CHECK (json_valid(operations)),
+        explanations     TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(explanations)),
+        warnings         TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(warnings)),
+        changes          TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(changes)),
+        duration_before  INTEGER NOT NULL,
+        duration_after   INTEGER NOT NULL,
+        usage            TEXT,
+        approved_by      TEXT,
+        approval_channel TEXT,
+        decided_at       TEXT,
+        applied_revision INTEGER,
+        created_at       TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX ai_proposals_project ON ai_proposals (project_id, created_at DESC);
+
+      -- Per-project consent to send its context (names, timeline, transcripts; never media) to an
+      -- external provider. NULL = not granted.
+      ALTER TABLE projects ADD COLUMN ai_consent TEXT;
+    `,
+  },
 ];
 
