@@ -135,3 +135,45 @@ test("M1 over REST: import, edit, conflict, undo/redo, thumbnail", async (t) => 
   const foreignAsset = await call(srv, "GET", `/v1/projects/${project.id}/assets/00000000-0000-4000-8000-000000000000/thumbnail`);
   assert.equal(foreignAsset.status, 404);
 });
+
+test("M2 over REST: preview job (deduped per revision), Range output, export validation, cancel/retry rules", async (t) => {
+  const srv = await boot(t);
+  const f = fixtures();
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Jobs", settings: { width: 320, height: 568 } } })).json()) as any;
+  const imp = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [f.portrait] } })).json()) as any;
+  let tl = ((await (await call(srv, "GET", `/v1/projects/${project.id}/timeline`)).json()) as any).timeline;
+  const video = tl.tracks.find((x: any) => x.kind === "video");
+  await call(srv, "POST", `/v1/projects/${project.id}/operations`, {
+    body: { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: video.id, assetId: imp.imported[0].id, start: 0, duration: 30 }] },
+  });
+
+  const first = await call(srv, "POST", `/v1/projects/${project.id}/preview-jobs`);
+  assert.equal(first.status, 202);
+  const job = ((await first.json()) as any).job;
+  const again = ((await (await call(srv, "POST", `/v1/projects/${project.id}/preview-jobs`)).json()) as any).job;
+  assert.equal(again.id, job.id, "same revision → same preview job");
+
+  let state = job.state;
+  for (let i = 0; i < 200 && !["completed", "failed"].includes(state); i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    state = ((await (await call(srv, "GET", `/v1/jobs/${job.id}`)).json()) as any).job.state;
+  }
+  assert.equal(state, "completed");
+
+  const full = await call(srv, "GET", `/v1/jobs/${job.id}/output`);
+  assert.equal(full.headers.get("content-type"), "video/mp4");
+  const size = (await full.arrayBuffer()).byteLength;
+  const part = await call(srv, "GET", `/v1/jobs/${job.id}/output`, { headers: { range: "bytes=0-99" } });
+  assert.equal(part.status, 206);
+  assert.equal(part.headers.get("content-range"), `bytes 0-99/${size}`);
+  assert.equal((await part.arrayBuffer()).byteLength, 100);
+
+  const badPath = await call(srv, "POST", `/v1/projects/${project.id}/render-jobs`, { body: { outputPath: "relative.mp4" } });
+  assert.equal(badPath.status, 400);
+  const overwriteSource = await call(srv, "POST", `/v1/projects/${project.id}/render-jobs`, { body: { outputPath: f.portrait } });
+  assert.equal(overwriteSource.status, 400);
+  assert.equal((await call(srv, "POST", `/v1/jobs/${job.id}/cancel`)).status, 400, "completed jobs can't be cancelled");
+  assert.equal((await call(srv, "POST", `/v1/jobs/${job.id}/retry`)).status, 400, "completed jobs can't be retried");
+  const list = ((await (await call(srv, "GET", `/v1/projects/${project.id}/jobs?kind=preview`)).json()) as any).jobs;
+  assert.equal(list.length, 1);
+});

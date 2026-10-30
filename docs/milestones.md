@@ -49,10 +49,31 @@ Known gaps carried forward:
 - Not verified through UI automation: the native file dialog and Finder drag-and-drop (no screen access in CI or this environment).
 - Panels are still not resizable.
 
-## M2 — Preview & Render (next)
+## M2 — Preview & Render ✅ (exit criterion met)
 
-Proxy engine, canonical render graph shared by preview and export, playback transport, FFmpeg render jobs
-(queued → rendering → muxing → completed, with cancel/retry and atomic output). Exit: a 30-second project renders to MP4 H.264/AAC.
+**Exit criterion:** a 30-second project renders to MP4 to spec. Verified by test (`render.test.ts`) and by a desktop export:
+H.264 High / yuv420p, 1080×1920, 30/1 fps, exactly `durationFrames` frames, AAC 48 kHz stereo, `+faststart`.
+
+- [x] Canonical render plan in core (`render-plan.ts`): picture from visible video/overlay tracks, sound from unmuted
+      audio tracks, offline media refused. Preview and export compile the **same** plan (FR-017)
+- [x] FFmpeg compiler: cover-fit scaling, project-rate conform, offsets in exact frames (1/fps timebase) and samples,
+      sum mix with a -1 dBFS limiter (clipping protection), `-frames:v` for an exact length
+- [x] Render jobs: queued → analyzing → rendering → muxing → completed | failed | cancelled, with progress, cancel
+      (also from another process), retry, recovery of jobs whose process died (INTERRUPTED)
+- [x] Atomic output: temp file in the target folder, verified with ffprobe (frames, size), hard-linked into place;
+      exports never overwrite and never target source media
+- [x] Proxy engine (≤960 px, short GOP) for previews; previews ≤960 px tall, one per revision, newest two kept
+- [x] REST (`render-jobs`, `preview-jobs`, `jobs`, cancel/retry, output with Range) and CLI (`render`, `preview`, `jobs`)
+- [x] Desktop: auto preview after edits with progress badge, play/pause (Space) synced to the playhead, frame-exact
+      scrubbing, Export via save dialog with progress/cancel, Review & Export render queue
+- [x] Tests: frame-exact cuts on odd frames at 30 and 29.97 fps, overlay timing, audio placement, hidden/muted tracks,
+      preview = export colours, cancel leaves no files, offline media, path rules
+
+Known gaps carried forward:
+- Transitions, gain/fades, transforms (PRD §8/§12) still to do; clips always cover-fit.
+- Preview is a rendered file, not real-time compositing: after an edit there is a short re-render (seconds for 30 s).
+- Preview output is fetched whole as a blob (fine for short reels; long timelines should stream via Range with a URL token).
+- Not verified by UI automation: the native save dialog (browser dev mode uses a prompt).
 
 ## M3–M6
 

@@ -1,4 +1,4 @@
-import type { Asset, CreateProjectInput, EditOperation, Project, Timeline, TimelineOp } from "@reelforge/core/schema";
+import type { Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
 
 // The desktop UI never touches SQLite: it talks to the same core through the
 // local REST sidecar that the Rust shell starts (or, in a plain browser during
@@ -80,6 +80,19 @@ export function createClient(info: ApiInfo) {
       ),
     relink: (id: string, assetId: string, path: string) =>
       request<{ asset: Asset }>("POST", `/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/relink`, { path }).then((r) => r.asset),
+    previewJob: (id: string) => request<{ job: RenderJob }>("POST", `/v1/projects/${encodeURIComponent(id)}/preview-jobs`).then((r) => r.job),
+    exportJob: (id: string, outputPath: string) =>
+      request<{ job: RenderJob }>("POST", `/v1/projects/${encodeURIComponent(id)}/render-jobs`, { outputPath }).then((r) => r.job),
+    job: (jobId: string) => request<{ job: RenderJob }>("GET", `/v1/jobs/${encodeURIComponent(jobId)}`).then((r) => r.job),
+    jobs: (id: string) => request<{ jobs: RenderJob[] }>("GET", `/v1/projects/${encodeURIComponent(id)}/jobs`).then((r) => r.jobs),
+    cancelJob: (jobId: string) => request<{ job: RenderJob }>("POST", `/v1/jobs/${encodeURIComponent(jobId)}/cancel`).then((r) => r.job),
+    retryJob: (jobId: string) => request<{ job: RenderJob }>("POST", `/v1/jobs/${encodeURIComponent(jobId)}/retry`).then((r) => r.job),
+    /** The preview file, as a blob (a <video src> can't carry the bearer token). */
+    jobOutput: async (jobId: string): Promise<Blob> => {
+      const res = await fetch(`${info.url}/v1/jobs/${encodeURIComponent(jobId)}/output`, { headers: { authorization: `Bearer ${info.token}` } });
+      if (!res.ok) throw new ApiError(res.status, "OUTPUT", `render output unavailable (${res.status})`);
+      return res.blob();
+    },
     /** Thumbnails need the bearer token, so they're fetched and handed to <img> as blob URLs. */
     thumbnail: async (id: string, assetId: string): Promise<Blob> => {
       const res = await fetch(`${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/thumbnail`, {

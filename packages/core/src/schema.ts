@@ -258,3 +258,53 @@ export function trackLabels(tracks: readonly Track[]): Map<string, string> {
   byPos.filter((t) => t.kind === "caption").forEach((t, i) => labels.set(t.id, `C${i + 1}`));
   return labels;
 }
+
+// ---------------------------------------------------------------------------
+// Render jobs (M2)
+// ---------------------------------------------------------------------------
+
+export const JOB_STATES = ["queued", "analyzing", "rendering", "muxing", "completed", "failed", "cancelled"] as const;
+export type JobState = (typeof JOB_STATES)[number];
+export const ACTIVE_JOB_STATES: readonly JobState[] = ["queued", "analyzing", "rendering", "muxing"];
+export type JobKind = "export" | "preview";
+
+export interface RenderSettings {
+  width: number;
+  height: number;
+  /** Use low-resolution proxies instead of the originals (previews). */
+  useProxies: boolean;
+  crf: number;
+  preset: "ultrafast" | "veryfast" | "fast" | "medium" | "slow";
+  audioBitrateK: number;
+}
+
+export interface RenderJob {
+  id: string;
+  projectId: string;
+  kind: JobKind;
+  state: JobState;
+  /** 0..1 */
+  progress: number;
+  revision: number;
+  settings: RenderSettings;
+  outputPath: string | null;
+  error: { code: string; message: string } | null;
+  retryOf: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface Artifact {
+  id: string;
+  projectId: string;
+  jobId: string;
+  path: string;
+  sizeBytes: number;
+  frames: number;
+  width: number;
+  height: number;
+  videoCodec: string;
+  audioCodec: string | null;
+  createdAt: string;
+}

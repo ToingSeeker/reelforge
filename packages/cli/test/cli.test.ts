@@ -140,3 +140,35 @@ test("M1 workflow from the CLI alone: import → add → split → trim → ripp
   const locked = await run("clip", "move", id, first.id, "--start", "300");
   assert.match(locked.error.message, /locked/);
 });
+
+test("render and preview from the CLI, JSON job result, path rules", async (t) => {
+  const run = harness(t);
+  const { fixtures } = await import("../../media/test/fixtures.ts");
+  const f = fixtures();
+  const id = (await run("project", "create", "--name", "Render", "--width", "320", "--height", "568")).json.project.id;
+  const asset = (await run("media", "import", id, f.portrait)).json.imported[0];
+  await run("clip", "add", id, "--track", "V1", "--asset", asset.id, "--start", "0", "--duration", "1s");
+
+  const { mkdtempSync, existsSync, realpathSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const outDir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-cli-out-")));
+  t.after(() => rmSync(outDir, { recursive: true, force: true }));
+  const out = join(outDir, "reel.mp4");
+
+  const r = await run("render", id, "--out", out);
+  assert.equal(r.code, 0, JSON.stringify(r.error ?? r.json));
+  assert.equal(r.json.job.state, "completed");
+  assert.equal(existsSync(out), true);
+
+  const again = await run("render", id, "--out", out);
+  assert.equal(again.code, 2, "never overwrites an existing file");
+  assert.equal((await run("render", id)).code, 2, "--out is required");
+
+  const p = await run("preview", id);
+  assert.equal(p.json.job.kind, "preview");
+  assert.equal(p.json.job.settings.useProxies, true);
+
+  const jobs = await run("jobs", "list", id);
+  assert.equal(jobs.json.jobs.length, 2);
+  assert.equal((await run("jobs", "cancel", r.json.job.id)).code, 2);
+});

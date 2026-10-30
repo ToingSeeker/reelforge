@@ -9,3 +9,5 @@ export { AssetStore } from "./assets.ts";
 export { TimelineStore } from "./timeline.ts";
 export { applyOperations, canPlace, clipEnd, diffStates, type EditState, type TimelineDiff } from "./timeline-ops.ts";
 export { parse } from "./validate.ts";
+export { JobStore } from "./jobs.ts";
+export { buildRenderPlan, type RenderPlan, type PlanSource, type PlanVideoSegment, type PlanAudioSegment } from "./render-plan.ts";

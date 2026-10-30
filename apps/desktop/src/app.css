@@ -1242,3 +1242,158 @@ button:disabled {
 .rf-toast-error {
   border-color: rgba(255, 92, 108, 0.5);
 }
+
+/* M2: playback, export, render queue */
+.rf-frame video {
+  background: #000;
+}
+.rf-frame-note.is-error {
+  background: rgba(255, 92, 108, 0.85);
+  color: #2a0509;
+}
+.rf-spinner {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 3px;
+  border: 2px solid var(--rf-text-3);
+  border-top-color: var(--rf-primary);
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: rf-spin 0.8s linear infinite;
+}
+@keyframes rf-spin {
+  to { transform: rotate(360deg); }
+}
+.rf-play:not(:disabled) {
+  color: var(--rf-text);
+}
+.rf-export-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 4px 0 12px;
+  border: 1px solid rgba(0, 213, 237, 0.4);
+  border-radius: var(--rf-radius);
+  background: var(--rf-primary-soft);
+  color: var(--rf-primary);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.rf-export-bar,
+.rf-job-progress {
+  width: 90px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--rf-surface-3);
+}
+.rf-export-bar div,
+.rf-job-progress div {
+  height: 100%;
+  background: var(--rf-primary);
+  transition: width 0.3s;
+}
+.rf-queue {
+  overflow: auto;
+  padding: 32px max(24px, calc((100vw - 1100px) / 2));
+}
+.rf-queue-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.rf-queue-head > div {
+  margin-right: auto;
+}
+.rf-queue-head h1 {
+  font-size: 22px;
+  margin-bottom: 4px;
+}
+.rf-queue-head p,
+.rf-queue-empty {
+  color: var(--rf-text-2);
+}
+.rf-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--rf-text-2);
+  font-size: 12px;
+}
+.rf-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rf-job {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px 110px auto;
+  grid-template-areas: "main progress state actions" "error error error error";
+  align-items: center;
+  gap: 4px 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--rf-border);
+  border-radius: var(--rf-radius-lg);
+  background: var(--rf-surface);
+}
+.rf-job-main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.rf-job-kind {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--rf-text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.rf-job-path {
+  overflow: hidden;
+  font-family: var(--rf-font-mono);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  user-select: text;
+}
+.rf-job-meta {
+  color: var(--rf-text-3);
+  font-size: 11px;
+}
+.rf-job-progress {
+  grid-area: progress;
+  width: 100%;
+}
+.rf-job-state {
+  grid-area: state;
+  font-size: 12px;
+  text-transform: capitalize;
+}
+.rf-job-completed .rf-job-state {
+  color: var(--rf-success);
+}
+.rf-job-failed .rf-job-state {
+  color: var(--rf-danger);
+}
+.rf-job-cancelled .rf-job-state {
+  color: var(--rf-text-3);
+}
+.rf-job-actions {
+  grid-area: actions;
+  display: flex;
+  gap: 6px;
+}
+.rf-job-error {
+  grid-area: error;
+  color: var(--rf-danger);
+  font-size: 12px;
+  user-select: text;
+}

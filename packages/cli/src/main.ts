@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import {
   AssetStore,
   isReelForgeError,
+  JobStore,
   openDatabase,
   parseFps,
   parseTime,
@@ -19,7 +20,7 @@ import {
   type ErrorCode,
   type TimelineOp,
 } from "@reelforge/core";
-import { importMedia, relinkMedia } from "@reelforge/media";
+import { createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 
 // Every command prints exactly one JSON document to stdout (errors go to
@@ -58,6 +59,10 @@ Usage:
   reelforge clip split <project> <clip> --at <t>
   reelforge clip delete <project> <clip>... [--ripple]
 
+  reelforge render <project> --out <file.mp4>      (H.264/AAC at project size; never overwrites)
+  reelforge preview <project>                      (low-res render of the same graph, from proxies)
+  reelforge jobs list <project> | get <job> | cancel <job> | retry <job> [--wait]
+
   reelforge serve [--port 0] [--allow-origin <origin>]...
 
 Times <t>: frames (90), seconds (2.5s), timecode (00:00:03:00) or MM:SS.FF (00:03.10).
@@ -79,6 +84,8 @@ interface Io {
   env: NodeJS.ProcessEnv;
   cwd?: string;
   stdin?: () => string;
+  /** Human progress lines on stderr. Only for terminals: scripts and agents get a clean single JSON error stream. */
+  progress?: boolean;
 }
 
 const defaultIo: Io = {
@@ -87,6 +94,7 @@ const defaultIo: Io = {
   isTTY: Boolean(process.stdout.isTTY),
   env: process.env,
   stdin: () => readFileSync(0, "utf8"),
+  progress: Boolean(process.stderr.isTTY),
 };
 
 const OPTIONS = {
@@ -110,6 +118,8 @@ const OPTIONS = {
   at: { type: "string" },
   edge: { type: "string" },
   ripple: { type: "boolean" },
+  out: { type: "string" },
+  wait: { type: "boolean" },
 } as const;
 
 type Values = ReturnType<typeof parseArgs<{ options: typeof OPTIONS; allowPositionals: true }>>["values"];
@@ -159,6 +169,28 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
       return 0;
     }
     if (cmd === "serve") return await serve(env, values, io);
+
+    if (cmd === "render" || cmd === "preview") {
+      const db = openDatabase(resolveDbPath(env));
+      try {
+        const job = await runJob(db, env, io, (sub ? [sub, ...rest] : rest)[0], cmd === "render" ? "export" : "preview", values.out);
+        print({ job });
+        return job.state === "completed" ? 0 : job.error?.code === "MEDIA_OFFLINE" || job.state === "cancelled" ? EXIT.VALIDATION_ERROR : EXIT.INTERNAL;
+      } finally {
+        db.close();
+      }
+    }
+    if (cmd === "jobs" && sub === "retry" && values.wait) {
+      const db = openDatabase(resolveDbPath(env));
+      try {
+        const job = retryRenderJob(db, need(rest[0], "<job>"));
+        const done = await runQueued(db, env, io, job.id);
+        print({ job: done });
+        return done.state === "completed" ? 0 : EXIT.INTERNAL;
+      } finally {
+        db.close();
+      }
+    }
 
     const handler = COMMANDS[`${cmd} ${sub ?? ""}`];
     if (!handler) invalid(`unknown command "${[cmd, sub].filter(Boolean).join(" ")}" (see --help)`);
@@ -305,12 +337,46 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
     const p = need(ctx.args[0], "<project>");
     return edit(ctx, p, [{ type: "clip.split", clipId: need(ctx.args[1], "<clip>"), frame: need(time(ctx, p, ctx.values.at), "--at") }]);
   },
+  "jobs list": ({ db, args }) => ({ jobs: new JobStore(db).list(need(args[0], "<project>")) }),
+  "jobs get": ({ db, args }) => ({ job: new JobStore(db).get(need(args[0], "<job>")) }),
+  "jobs cancel": ({ db, args }) => ({ job: new JobStore(db).cancel(need(args[0], "<job>")) }),
+  "jobs retry": ({ db, args }) => ({ job: retryRenderJob(db, need(args[0], "<job>")), note: "queued; a running engine (reelforge serve / desktop) picks it up, or use --wait to render here" }),
   "clip delete": (ctx) => {
     const [p, ...clipIds] = ctx.args;
     if (!clipIds.length) invalid("missing <clip>...");
     return edit(ctx, need(p, "<project>"), [{ type: "clip.delete", clipIds, ...(ctx.values.ripple ? { ripple: true } : {}) }]);
   },
 };
+
+/** Render in this process, reporting progress on stderr. Ctrl+C cancels the job. */
+async function runJob(db: Database, env: NodeJS.ProcessEnv, io: Io, projectId: string | undefined, kind: "export" | "preview", out: string | undefined) {
+  if (kind === "export" && !out) invalid("missing --out <file.mp4>");
+  const cwd = io.cwd ?? process.cwd();
+  const job = createRenderJob(db, need(projectId, "<project>"), kind, out ? resolve(cwd, out) : undefined);
+  return runQueued(db, env, io, job.id);
+}
+
+async function runQueued(db: Database, env: NodeJS.ProcessEnv, io: Io, jobId: string) {
+  const runner = new RenderRunner(db, { cacheDir: resolveCacheDir(env) });
+  const jobs = new JobStore(db);
+  const onSigint = () => runner.cancel(jobId);
+  process.once("SIGINT", onSigint);
+  let last = "";
+  const timer = setInterval(() => {
+    if (!io.progress) return;
+    const j = jobs.get(jobId);
+    const line = `${j.state} ${Math.round(j.progress * 100)}%`;
+    if (line !== last) io.err(`[reelforge] ${line}\n`);
+    last = line;
+  }, 500);
+  try {
+    runner.enqueue(jobId);
+    return await runner.wait(jobId);
+  } finally {
+    clearInterval(timer);
+    process.removeListener("SIGINT", onSigint);
+  }
+}
 
 function history(ctx: Ctx, dir: "undo" | "redo") {
   const projectId = need(ctx.args[0], "<project>");

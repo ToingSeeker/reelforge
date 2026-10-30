@@ -1,23 +1,30 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { Timeline } from "@reelforge/core/schema";
 import { aspectRatioLabel } from "@reelforge/core/schema";
 import { formatClock } from "@reelforge/core/timebase";
 import type { Client } from "../api.ts";
 import { useThumbnail } from "../editor.ts";
+import type { PreviewState } from "../render.ts";
 import { Icon } from "../icons.tsx";
 
 interface Props {
   client: Client | null;
   timeline: Timeline | null;
+  preview: PreviewState;
   playhead: number;
   onPlayhead: (frame: number) => void;
+  playing: boolean;
+  onPlaying: (playing: boolean) => void;
 }
 
-export function Preview({ client, timeline, playhead, onPlayhead }: Props) {
+export function Preview({ client, timeline, preview, playhead, onPlayhead, playing, onPlaying }: Props) {
   const s = timeline?.project.settings ?? { width: 1080, height: 1920, fps: { num: 30, den: 1 } };
+  const fpsNum = s.fps.num / s.fps.den;
   const duration = timeline?.durationFrames ?? 0;
+  const video = useRef<HTMLVideoElement>(null);
+  const stale = preview.url !== null && preview.revision !== timeline?.project.revision;
 
-  // Topmost visible picture clip under the playhead (tracks are ordered top → bottom).
+  // Poster fallback until the first preview is ready: topmost visible picture clip under the playhead.
   const top = useMemo(() => {
     if (!timeline) return null;
     for (const t of timeline.tracks) {
@@ -27,29 +34,89 @@ export function Preview({ client, timeline, playhead, onPlayhead }: Props) {
     }
     return null;
   }, [timeline, playhead]);
-  const poster = useThumbnail(client, timeline?.project.id ?? "", top ?? undefined);
+  const poster = useThumbnail(client, timeline?.project.id ?? "", preview.url ? undefined : (top ?? undefined));
 
-  const jump = (f: number) => onPlayhead(Math.max(0, Math.min(duration, f)));
-  const fpsNum = s.fps.num / s.fps.den;
+  // Play / pause, and drive the playhead from the video clock while playing.
+  useEffect(() => {
+    const v = video.current;
+    if (!v || !preview.url) return;
+    if (!playing) {
+      v.pause();
+      return;
+    }
+    if (playhead >= duration) onPlayhead(0);
+    v.currentTime = (playhead >= duration ? 0 : playhead) / fpsNum;
+    void v.play().catch(() => onPlaying(false));
+    let raf = 0;
+    const tick = () => {
+      onPlayhead(Math.min(duration, Math.floor(v.currentTime * fpsNum + 1e-3)));
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    const ended = () => onPlaying(false);
+    v.addEventListener("ended", ended);
+    return () => {
+      cancelAnimationFrame(raf);
+      v.removeEventListener("ended", ended);
+    };
+  }, [playing, preview.url]);
+
+  // Scrubbing while paused: show the exact frame (seek to the middle of it).
+  useEffect(() => {
+    const v = video.current;
+    if (!v || playing || !preview.url) return;
+    const target = (Math.min(playhead, Math.max(0, duration - 1)) + 0.5) / fpsNum;
+    if (Math.abs(v.currentTime - target) > 0.25 / fpsNum) v.currentTime = target;
+  }, [playhead, playing, preview.url, duration, fpsNum]);
+
+  const jump = (f: number) => {
+    onPlaying(false);
+    onPlayhead(Math.max(0, Math.min(duration, f)));
+  };
+
+  const status = preview.pending
+    ? `${preview.url ? "Updating" : "Rendering"} preview · ${Math.round(preview.pending.progress * 100)}%`
+    : preview.error
+      ? "Preview failed"
+      : stale
+        ? "Updating preview…"
+        : null;
 
   return (
     <section className="rf-panel rf-preview" aria-label="Preview">
       <div className="rf-panel-head">
         <h2>Preview</h2>
         <span className="rf-pill">{aspectRatioLabel(s)}</span>
-        <span className="rf-pill">Full Quality</span>
+        <span className="rf-pill" title="Previews are rendered through the same graph as the export, at reduced size from proxies">
+          Preview quality
+        </span>
       </div>
       <div className="rf-monitor">
         <div className="rf-frame" style={{ aspectRatio: `${s.width} / ${s.height}` }}>
-          {poster ? <img className="rf-frame-poster" src={poster} alt="" /> : null}
+          {preview.url ? (
+            <video
+              ref={video}
+              className="rf-frame-poster"
+              src={preview.url}
+              playsInline
+              preload="auto"
+              onLoadedMetadata={(e) => (e.currentTarget.currentTime = (playhead + 0.5) / fpsNum)}
+            />
+          ) : poster ? (
+            <img className="rf-frame-poster" src={poster} alt="" />
+          ) : null}
           <div className="rf-safe-area" aria-hidden="true" />
-          {!top && (
+          {!preview.url && !top && (
             <div className="rf-frame-empty">
               <Icon name="play" size={28} />
               <span>{timeline?.clips.length ? "No picture at the playhead" : "Timeline is empty"}</span>
             </div>
           )}
-          {top && <span className="rf-frame-note">Poster frame · live playback in M2</span>}
+          {status && (
+            <span className={`rf-frame-note${preview.error && !preview.pending ? " is-error" : ""}`} title={preview.error ?? undefined} role="status">
+              {preview.pending && <span className="rf-spinner" aria-hidden="true" />} {status}
+            </span>
+          )}
         </div>
       </div>
       <div
@@ -78,18 +145,26 @@ export function Preview({ client, timeline, playhead, onPlayhead }: Props) {
           <button className="rf-icon-btn" aria-label="Back one second" title="Back 1 second (⇧←)" onClick={() => jump(playhead - Math.round(fpsNum))}>
             <Icon name="stepBack" size={17} />
           </button>
-          <button className="rf-icon-btn" disabled aria-label="Play" title="Playback arrives with the preview engine (M2)">
-            <Icon name="play" size={20} />
+          <button
+            className="rf-icon-btn rf-play"
+            disabled={!preview.url}
+            aria-label={playing ? "Pause" : "Play"}
+            title={preview.url ? `${playing ? "Pause" : "Play"} (Space)` : "Waiting for the first preview render"}
+            onClick={() => onPlaying(!playing)}
+          >
+            <Icon name={playing ? "pause" : "play"} size={20} />
           </button>
           <button className="rf-icon-btn" aria-label="Go to end" title="Go to end (End)" onClick={() => jump(duration)}>
             <Icon name="skipForward" size={17} />
           </button>
         </div>
         <div className="rf-transport-right">
-          <button className="rf-icon-btn" disabled aria-label="Volume">
-            <Icon name="volume" size={17} />
-          </button>
-          <button className="rf-icon-btn" disabled aria-label="Fullscreen">
+          <button
+            className="rf-icon-btn"
+            aria-label="Fullscreen"
+            disabled={!preview.url}
+            onClick={() => void video.current?.requestFullscreen?.()}
+          >
             <Icon name="maximize" size={17} />
           </button>
         </div>

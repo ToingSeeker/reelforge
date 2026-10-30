@@ -29,3 +29,13 @@ export async function onFileDrop(handler: (paths: string[]) => void, hover?: (ov
     if (e.payload.type === "drop") handler(e.payload.paths);
   });
 }
+
+/** Native save dialog for exports. Returns null if the user cancelled. */
+export async function pickExportPath(suggestedName: string): Promise<string | null> {
+  const name = `${suggestedName.replace(/[\\/:*?"<>|]+/g, "-").trim() || "ReelForge export"}.mp4`;
+  if (!isTauri()) return window.prompt("Absolute export path (.mp4), browser dev mode:", `/tmp/${name}`) || null;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const path = await save({ title: "Export video", defaultPath: name, filters: [{ name: "MP4 video (H.264 / AAC)", extensions: ["mp4"] }] });
+  if (!path) return null;
+  return path.toLowerCase().endsWith(".mp4") ? path : `${path}.mp4`;
+}

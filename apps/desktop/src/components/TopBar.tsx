@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Project } from "@reelforge/core/schema";
+import type { Project, RenderJob } from "@reelforge/core/schema";
 import { aspectRatioLabel } from "@reelforge/core/schema";
 import { Icon, LogoMark } from "../icons.tsx";
 
@@ -21,6 +21,9 @@ interface Props {
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
+  exporting: RenderJob | null;
+  onExport: () => void;
+  onCancelExport: () => void;
   workspace: Workspace;
   onWorkspace: (w: Workspace) => void;
   onSelectProject: (id: string) => void;
@@ -64,9 +67,23 @@ export function TopBar(p: Props) {
             <Icon name="redo" />
           </button>
         </div>
-        <button className="rf-btn rf-btn-primary" disabled title="Export — arrives with the render engine (M2)">
-          <Icon name="export" size={16} /> Export
-        </button>
+        {p.exporting ? (
+          <div className="rf-export-progress" role="status" title={p.exporting.outputPath ?? undefined}>
+            <span>
+              Exporting {p.exporting.state === "queued" ? "(queued)" : `${Math.round(p.exporting.progress * 100)}%`}
+            </span>
+            <div className="rf-export-bar">
+              <div style={{ width: `${Math.round(p.exporting.progress * 100)}%` }} />
+            </div>
+            <button className="rf-icon-btn" onClick={p.onCancelExport} aria-label="Cancel export" title="Cancel export">
+              <Icon name="x" size={14} />
+            </button>
+          </div>
+        ) : (
+          <button className="rf-btn rf-btn-primary" onClick={p.onExport} disabled={!p.current} title="Export MP4 (H.264 / AAC)">
+            <Icon name="export" size={16} /> Export
+          </button>
+        )}
       </div>
     </header>
   );

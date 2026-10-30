@@ -17,6 +17,7 @@ const PATHS = {
   redo: "M15 14l5-5-5-5M20 9H9a5 5 0 0 0 0 10h3",
   export: "M12 15V3M7 8l5-5 5 5M5 14v6h14v-6",
   play: "M7 4l13 8-13 8z",
+  pause: "M7 4h3v16H7zM14 4h3v16h-3z",
   skipBack: "M19 20L9 12l10-8zM5 19V5",
   skipForward: "M5 4l10 8-10 8zM19 5v14",
   stepBack: "M17 18L7 12l10-6z",

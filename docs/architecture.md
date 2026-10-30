@@ -61,6 +61,25 @@ Batches are the unit AI proposals will use in M4: one proposal is one atomic, un
 - Thumbnails and waveforms are created on first request in `$REELFORGE_HOME/cache/thumbs`, at most two FFmpegs at a time,
   written to a temp file and renamed atomically.
 
+## Rendering
+
+```
+Timeline ──buildRenderPlan──▶ RenderPlan (frames, layers bottom→top, audio segments, source paths)
+                                 │                       │
+                       previewSettings (≤960px,   exportSettings (project size,
+                        proxies, veryfast)          originals, crf 18 medium)
+                                 └──────── compileRender ────────┘
+                                          one FFmpeg filter_complex
+```
+
+- The plan is stored in the job row when the job is created, so a render is reproducible even if editing continues.
+- Video offsets are integers in a 1/fps timebase (`settb` + `setpts=…+frames`), audio offsets are sample counts
+  (`adelay=…S`). Seconds would be rounded by FFmpeg and land cuts a frame early.
+- Jobs live in SQLite; the runner (concurrency 1) re-reads the state on every progress tick, so a cancel from any
+  process stops FFmpeg. On start, jobs whose runner PID is gone are failed as `INTERRUPTED`.
+- Output: `.<name>.partial-<job>.mp4` in the target folder → ffprobe verification → `link()` to the final name (fails
+  rather than overwrites) → unlink the temp file.
+
 ## REST API (v1)
 
 | Method | Path | |
@@ -74,6 +93,11 @@ Batches are the unit AI proposals will use in M4: one proposal is one atomic, un
 | GET/POST | `/v1/projects/:id/assets` | list / import `{paths}` |
 | POST | `/v1/projects/:id/assets/:assetId/relink` | `{path}` |
 | GET | `/v1/projects/:id/assets/:assetId/thumbnail` | JPEG (picture) or PNG waveform (audio) |
+| POST | `/v1/projects/:id/render-jobs` | export `{outputPath}` → 202 job |
+| POST | `/v1/projects/:id/preview-jobs` | preview of the current revision (reused if one exists) |
+| GET | `/v1/projects/:id/jobs?kind=` · `/artifacts` | job list · finished exports |
+| GET | `/v1/jobs/:id` · POST `/cancel` · `/retry` | job status and control |
+| GET | `/v1/jobs/:id/output` | rendered MP4, supports `Range` |
 
 ## Sidecar lifecycle
 

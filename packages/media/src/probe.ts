@@ -31,11 +31,11 @@ const DEMUXERS: Record<string, string> = {
 };
 
 /** Input arguments for any FFmpeg tool reading a source: forced demuxer, local files only. */
-export function sourceInputArgs(path: string): string[] {
+export function sourceInputArgs(path: string, inputOptions: string[] = []): string[] {
   const demuxer = DEMUXERS[extname(path).toLowerCase()];
   if (!demuxer) throw new ReelForgeError("VALIDATION_ERROR", "unsupported file type");
   // "file:" stops FFmpeg from reading protocol prefixes (concat:, http:…) out of a file name.
-  return ["-protocol_whitelist", "file", "-f", demuxer, "-i", `file:${path}`];
+  return ["-protocol_whitelist", "file", "-f", demuxer, ...inputOptions, "-i", `file:${path}`];
 }
 
 /**

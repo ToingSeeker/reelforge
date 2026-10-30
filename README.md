@@ -5,10 +5,10 @@
 
 ---
 
-> **Status: pre-alpha, milestone M1 (Editing Core).** Projects, media import,
-> a multi-track timeline (move, trim, split, ripple delete, undo/redo) and the
-> desktop studio work. Playback/rendering (M2) and the AI Director (M4) are not
-> built yet. See [docs/milestones.md](docs/milestones.md).
+> **Status: pre-alpha, milestone M2 (Preview & Render).** Media import, a
+> multi-track timeline with undo/redo, preview playback and frame-exact MP4
+> export (H.264/AAC) work from the desktop and the CLI. Transcription/captions
+> (M3) and the AI Director (M4) are not built yet. See [docs/milestones.md](docs/milestones.md).
 
 ReelForge turns raw footage into editable, reviewable vertical video. You can drive it
 from a desktop studio, a built-in AI Director, any MCP client (Claude, ChatGPT, Gemini CLI),
@@ -44,6 +44,11 @@ pnpm cli clip split <project> <clip> --at 2s
 pnpm cli clip delete <project> <clip> --ripple
 pnpm cli timeline undo <project>
 pnpm cli timeline get <project>
+
+# Render (same graph for preview and export; exports never overwrite)
+pnpm cli preview <project>
+pnpm cli render <project> --out ~/Movies/reel.mp4
+pnpm cli jobs list <project>
 
 # Desktop studio (starts the engine as a sidecar)
 pnpm desktop

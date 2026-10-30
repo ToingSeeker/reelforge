@@ -1,11 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, statSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import {
   ActorSchema,
   AssetStore,
   isReelForgeError,
+  JobStore,
   ProjectStore,
   ReelForgeError,
   TimelineStore,
@@ -13,7 +14,7 @@ import {
   type Database,
   type ErrorCode,
 } from "@reelforge/core";
-import { ensureThumbnail, importMedia, relinkMedia } from "@reelforge/media";
+import { createRenderJob, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 
 // Local REST API (PRD §15). Loopback only, bearer token always required,
 // Host/Origin checked so a web page can't reach it via DNS rebinding.
@@ -115,6 +116,9 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
   const projects = new ProjectStore(opts.db);
   const assets = new AssetStore(opts.db);
   const timeline = new TimelineStore(opts.db);
+  const jobs = new JobStore(opts.db);
+  const runner = new RenderRunner(opts.db, { cacheDir: opts.cacheDir });
+  runner.start();
   const body = (req: IncomingMessage) => readJson(req) as Promise<never>;
   const pathsOf = (b: unknown): string[] => {
     const paths = (b as { paths?: unknown })?.paths;
@@ -170,6 +174,78 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       },
     },
     {
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/render-jobs`),
+      handle: async ({ req, res, params: [id] }) => {
+        const b = (await readJson(req)) as { outputPath?: unknown };
+        if (typeof b?.outputPath !== "string") throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"outputPath": "/absolute/file.mp4"}');
+        const job = createRenderJob(opts.db, id!, "export", b.outputPath);
+        runner.enqueue(job.id);
+        return send(res, 202, { job });
+      },
+    },
+    {
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/preview-jobs`),
+      handle: ({ res, params: [id] }) => {
+        // One preview per revision: reuse a running or finished one instead of rendering twice.
+        const revision = projects.get(id!).revision;
+        const existing = jobs.list(id!, { kind: "preview", limit: 10 }).find((j) => j.revision === revision && !["failed", "cancelled"].includes(j.state));
+        if (existing) return send(res, 200, { job: existing });
+        const job = createRenderJob(opts.db, id!, "preview");
+        runner.enqueue(job.id);
+        return send(res, 202, { job });
+      },
+    },
+    {
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/jobs`),
+      handle: ({ req, res, params: [id] }) => {
+        const kind = new URL(req.url ?? "", "http://x").searchParams.get("kind");
+        return send(res, 200, { jobs: jobs.list(id!, kind === "export" || kind === "preview" ? { kind } : {}) });
+      },
+    },
+    { method: "GET", pattern: re(`/v1/projects/${ID}/artifacts`), handle: ({ res, params: [id] }) => send(res, 200, { artifacts: jobs.artifacts(id!) }) },
+    { method: "GET", pattern: re(`/v1/jobs/${ID}`), handle: ({ res, params: [id] }) => send(res, 200, { job: jobs.get(id!) }) },
+    { method: "POST", pattern: re(`/v1/jobs/${ID}/cancel`), handle: ({ res, params: [id] }) => send(res, 200, { job: runner.cancel(id!) }) },
+    {
+      method: "POST",
+      pattern: re(`/v1/jobs/${ID}/retry`),
+      handle: ({ res, params: [id] }) => {
+        const job = retryRenderJob(opts.db, id!);
+        runner.enqueue(job.id);
+        return send(res, 202, { job });
+      },
+    },
+    {
+      method: "GET",
+      pattern: re(`/v1/jobs/${ID}/output`),
+      handle: ({ req, res, params: [id] }) => {
+        const job = jobs.get(id!);
+        if (job.state !== "completed" || !job.outputPath) throw new ReelForgeError("NOT_FOUND", `job is ${job.state}; no output yet`, { jobId: job.id });
+        let size: number;
+        try {
+          size = statSync(job.outputPath).size;
+        } catch {
+          throw new ReelForgeError("NOT_FOUND", "the rendered file is no longer on disk", { jobId: job.id });
+        }
+        const headers = { "content-type": "video/mp4", "accept-ranges": "bytes", "cache-control": "private, max-age=3600", "x-content-type-options": "nosniff" };
+        const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
+        if (range && (range[1] || range[2])) {
+          const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
+          const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+          if (start > end || start >= size) {
+            res.writeHead(416, { "content-range": `bytes */${size}` });
+            return res.end();
+          }
+          res.writeHead(206, { ...headers, "content-range": `bytes ${start}-${end}/${size}`, "content-length": String(end - start + 1) });
+          return createReadStream(job.outputPath, { start, end }).pipe(res);
+        }
+        res.writeHead(200, { ...headers, "content-length": String(size) });
+        createReadStream(job.outputPath).pipe(res);
+      },
+    },
+    {
       method: "GET",
       pattern: re(`/v1/projects/${ID}/assets/${ID}/thumbnail`),
       handle: async ({ res, params: [id, assetId] }) => {
@@ -202,7 +278,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       if (req.method === "OPTIONS") {
         res.writeHead(204, {
           "access-control-allow-methods": "GET, POST, PATCH, OPTIONS",
-          "access-control-allow-headers": "authorization, content-type, x-reelforge-actor",
+          "access-control-allow-headers": "authorization, content-type, x-reelforge-actor, range",
           "access-control-max-age": "600",
         });
         return res.end();
@@ -244,6 +320,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         server,
         close: () =>
           new Promise((r, j) => {
+            runner.stop();
             server.close((err) => (err ? j(err) : r()));
             // close() already drops idle sockets; also end in-flight ones so shutdown can't hang.
             server.closeAllConnections();

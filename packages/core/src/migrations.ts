@@ -126,5 +126,59 @@ export const MIGRATIONS: readonly Migration[] = [
       for (const p of projects) insertDefaultTracks(db, p.id);
     },
   },
+  {
+    version: 3,
+    name: "render_jobs_artifacts_proxies",
+    sql: `
+      -- Jobs are not edits: they never bump the project revision. Each job keeps
+      -- the plan it was created from, so a render is reproducible even if the
+      -- timeline changes while it runs.
+      CREATE TABLE render_jobs (
+        id            TEXT PRIMARY KEY,
+        project_id    TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+        kind          TEXT NOT NULL CHECK (kind IN ('export', 'preview')),
+        state         TEXT NOT NULL CHECK (state IN ('queued', 'analyzing', 'rendering', 'muxing', 'completed', 'failed', 'cancelled')),
+        progress      REAL NOT NULL DEFAULT 0,
+        revision      INTEGER NOT NULL,
+        plan          TEXT NOT NULL CHECK (json_valid(plan)),
+        settings      TEXT NOT NULL CHECK (json_valid(settings)),
+        output_path   TEXT,
+        error_code    TEXT,
+        error_message TEXT,
+        runner_pid    INTEGER,
+        retry_of      TEXT REFERENCES render_jobs (id) ON DELETE SET NULL,
+        created_at    TEXT NOT NULL,
+        started_at    TEXT,
+        finished_at   TEXT
+      ) STRICT;
+
+      CREATE INDEX render_jobs_project ON render_jobs (project_id, created_at DESC);
+      CREATE INDEX render_jobs_state ON render_jobs (state);
+
+      CREATE TABLE artifacts (
+        id          TEXT PRIMARY KEY,
+        project_id  TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+        job_id      TEXT NOT NULL REFERENCES render_jobs (id) ON DELETE CASCADE,
+        path        TEXT NOT NULL,
+        size_bytes  INTEGER NOT NULL,
+        frames      INTEGER NOT NULL,
+        width       INTEGER NOT NULL,
+        height      INTEGER NOT NULL,
+        video_codec TEXT NOT NULL,
+        audio_codec TEXT,
+        created_at  TEXT NOT NULL
+      ) STRICT;
+
+      -- Derived, disposable: the file lives in the cache and is rebuilt if missing.
+      CREATE TABLE proxies (
+        asset_id    TEXT PRIMARY KEY REFERENCES assets (id) ON DELETE CASCADE,
+        path        TEXT NOT NULL,
+        width       INTEGER NOT NULL,
+        height      INTEGER NOT NULL,
+        source_size INTEGER NOT NULL,
+        created_at  TEXT NOT NULL
+      ) STRICT;
+    `,
+  },
 ];
 

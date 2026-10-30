@@ -4,7 +4,9 @@ import { canPlace, clipEnd } from "@reelforge/core/timeline-ops";
 import { formatClock } from "@reelforge/core/timebase";
 import { createClient, resolveApiInfo, type Client } from "./api.ts";
 import { useEditor } from "./editor.ts";
-import { onFileDrop, pickMediaFiles } from "./native.ts";
+import { onFileDrop, pickExportPath, pickMediaFiles } from "./native.ts";
+import { useExports, usePreview } from "./render.ts";
+import { RenderQueue } from "./components/RenderQueue.tsx";
 import { TopBar, type Workspace } from "./components/TopBar.tsx";
 import { LeftRail, type RailItem } from "./components/LeftRail.tsx";
 import { MediaLibrary } from "./components/MediaLibrary.tsx";
@@ -49,6 +51,7 @@ export function App() {
   const [toast, setToast] = useState<{ tone: "info" | "error"; text: string; id: number } | null>(null);
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [playhead, setPlayhead] = useState(0);
+  const [playing, setPlaying] = useState(false);
   const [importing, setImporting] = useState(false);
   const [fileHover, setFileHover] = useState(false);
   const [assetDrag, setAssetDrag] = useState<{ asset: Asset; x: number; y: number } | null>(null);
@@ -115,10 +118,27 @@ export function App() {
   );
   const fps = current?.settings.fps ?? { num: 30, den: 1 };
 
+  const preview = usePreview(client, tl);
+  const exports = useExports(client, notify);
+  /** Any manual playhead move stops playback. */
+  const seek = useCallback((f: number) => {
+    setPlaying(false);
+    setPlayhead(f);
+  }, []);
+
   useEffect(() => {
     setSelection(new Set());
     setPlayhead(0);
+    setPlaying(false);
   }, [current?.id]);
+
+  const doExport = async () => {
+    if (!current || !tl) return;
+    if (!tl.durationFrames) return notify("info", "Add clips to the timeline before exporting.");
+    if (exports.active) return notify("info", "An export is already running.");
+    const path = await pickExportPath(current.name);
+    if (path) void exports.start(current.id, path);
+  };
 
   useEffect(() => {
     if (listed && listed.id !== currentId) selectProject(listed.id);
@@ -206,6 +226,9 @@ export function App() {
         else tl.history.canUndo && void editor.undo();
       } else if (mod) {
         return;
+      } else if (e.key === " ") {
+        e.preventDefault();
+        if (preview.url) setPlaying((p) => !p);
       } else if (e.key === "s" || e.key === "S") {
         e.preventDefault();
         split();
@@ -215,11 +238,11 @@ export function App() {
       } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
         e.preventDefault();
         const d = (e.shiftKey ? second : 1) * (e.key === "ArrowLeft" ? -1 : 1);
-        setPlayhead((p) => Math.max(0, p + d));
+        seek(Math.max(0, playhead + d));
       } else if (e.key === "Home") {
-        setPlayhead(0);
+        seek(0);
       } else if (e.key === "End") {
-        setPlayhead(tl.durationFrames);
+        seek(tl.durationFrames);
       } else if (e.key === "Escape") {
         setSelection(new Set());
       }
@@ -282,11 +305,16 @@ export function App() {
         canRedo={!!tl?.history.canRedo}
         onUndo={() => void editor.undo()}
         onRedo={() => void editor.redo()}
+        exporting={exports.active}
+        onExport={() => void doExport()}
+        onCancelExport={() => void exports.cancel()}
       />
 
       {projects !== null && !current ? (
         <Welcome onCreate={() => setDialogOpen(true)} />
-      ) : workspace !== "edit" ? (
+      ) : workspace === "review" && current ? (
+        <RenderQueue client={client} projectId={current.id} notify={notify} onExport={() => void doExport()} />
+      ) : workspace === "automate" ? (
         <Placeholder workspace={workspace} />
       ) : (
         <div className="rf-studio">
@@ -307,7 +335,15 @@ export function App() {
           ) : (
             <RailPlaceholder item={rail} />
           )}
-          <Preview client={client} timeline={tl} playhead={playhead} onPlayhead={setPlayhead} />
+          <Preview
+            client={client}
+            timeline={tl}
+            preview={preview}
+            playhead={playhead}
+            onPlayhead={(f) => (playing ? setPlayhead(f) : seek(f))}
+            playing={playing}
+            onPlaying={setPlaying}
+          />
           <AIDirector />
           <Timeline
             client={client}
@@ -315,7 +351,7 @@ export function App() {
             selection={selection}
             onSelect={setSelection}
             playhead={playhead}
-            onPlayhead={setPlayhead}
+            onPlayhead={seek}
             onApply={apply}
             onSplit={split}
             onDelete={remove}
