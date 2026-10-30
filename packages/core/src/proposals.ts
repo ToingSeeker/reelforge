@@ -13,6 +13,7 @@ interface ProposalRow {
   project_id: string;
   base_revision: number;
   instruction: string;
+  requested_by: AIProposal["requestedBy"];
   selection: string;
   provider: string;
   model: string;
@@ -37,6 +38,7 @@ const toProposal = (r: ProposalRow): AIProposal => ({
   projectId: r.project_id,
   baseRevision: r.base_revision,
   instruction: r.instruction,
+  requestedBy: r.requested_by,
   selection: JSON.parse(r.selection) as string[],
   provider: r.provider,
   model: r.model,
@@ -117,6 +119,8 @@ export function engineWarnings(after: Timeline): string[] {
 
 export interface NewProposal {
   instruction: string;
+  /** Default "user". */
+  requestedBy?: AIProposal["requestedBy"];
   selection: string[];
   provider: string;
   model: string;
@@ -156,12 +160,12 @@ export class ProposalStore {
     const id = randomUUID();
     this.#db
       .prepare(
-        `INSERT INTO ai_proposals (id, project_id, base_revision, instruction, selection, provider, model, status, summary, operations,
+        `INSERT INTO ai_proposals (id, project_id, base_revision, instruction, requested_by, selection, provider, model, status, summary, operations,
            explanations, warnings, changes, duration_before, duration_after, usage, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        id, pid, preview.before.project.revision, p.instruction, JSON.stringify(p.selection), p.provider, p.model, p.summary,
+        id, pid, preview.before.project.revision, p.instruction, p.requestedBy ?? "user", JSON.stringify(p.selection), p.provider, p.model, p.summary,
         JSON.stringify(preview.operations), JSON.stringify(p.explanations), JSON.stringify(warnings),
         JSON.stringify(describeChanges(preview.before, preview.diff)), preview.before.durationFrames, preview.durationAfter,
         p.usage ? JSON.stringify(p.usage) : null, this.#now(),

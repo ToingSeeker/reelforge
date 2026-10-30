@@ -569,6 +569,8 @@ export interface AIProposal {
   projectId: string;
   baseRevision: number;
   instruction: string;
+  /** Who asked for it: the user, or an MCP client (whose instruction and summary are its own words). */
+  requestedBy: "user" | "mcp";
   selection: string[];
   provider: string;
   model: string;

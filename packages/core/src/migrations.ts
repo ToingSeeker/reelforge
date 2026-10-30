@@ -287,5 +287,14 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX workflow_runs_started ON workflow_runs (started_at DESC);
     `,
   },
+  {
+    version: 8,
+    name: "proposal_requested_by",
+    sql: `
+      -- Who asked for a proposal, separate from which model planned it: an MCP client can ask
+      -- ReelForge's own AI Director, and its words must never be shown as the user's.
+      ALTER TABLE ai_proposals ADD COLUMN requested_by TEXT NOT NULL DEFAULT 'user' CHECK (requested_by IN ('user', 'mcp'));
+    `,
+  },
 ];
 

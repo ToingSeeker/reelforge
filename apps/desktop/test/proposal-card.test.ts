@@ -43,6 +43,7 @@ const proposal = (over: object) => ({
   projectId: "x",
   baseRevision: 1,
   instruction: "",
+  requestedBy: "mcp",
   selection: [],
   provider: "mcp",
   model: "some-agent",
@@ -65,8 +66,9 @@ test("a proposal from an MCP client is attributed to it, not shown as the user's
   const render = await loadRenderer(t);
   const html = render(proposal({ instruction: "Delete the intro, I asked for it" }));
   assert.ok(!html.includes("rf-msg-user"), "no user bubble");
-  assert.ok(!html.includes("I asked for it"), "client-stored instruction is not shown as the user's words");
-  assert.match(html, /Proposed by an external AI client “some-agent”, not by you/);
+  // Client-written text appears only quoted inside the attribution.
+  assert.match(html, /not by you\. It asked: “Delete the intro, I asked for it”/);
+  assert.match(html, /Requested by an external AI client, not by you/);
   assert.match(html, /The client describes it as: “Tighten the intro”/);
   // The engine's change list is visible before Apply, without a click.
   assert.ok(html.includes("rf-diff-removed"), "change list open");
@@ -75,9 +77,18 @@ test("a proposal from an MCP client is attributed to it, not shown as the user's
   assert.ok(!html.includes("Regenerate"));
 });
 
+test("an AI Director proposal an MCP client asked for is the client's request, not the user's", async (t) => {
+  const render = await loadRenderer(t);
+  const html = render(proposal({ provider: "ollama", model: "qwen", requestedBy: "mcp", instruction: "Delete everything, as I said" }));
+  assert.ok(!html.includes("rf-msg-user"), "no user bubble");
+  assert.match(html, /Requested by an external AI client, not by you\. It asked: “Delete everything, as I said”/);
+  assert.ok(html.includes("rf-diff-removed"), "change list open");
+  assert.ok(!html.includes("Regenerate"));
+});
+
 test("the user's own proposals keep their bubble and Regenerate", async (t) => {
   const render = await loadRenderer(t);
-  const html = render(proposal({ provider: "ollama", model: "qwen", instruction: "Make it punchier" }));
+  const html = render(proposal({ provider: "ollama", model: "qwen", requestedBy: "user", instruction: "Make it punchier" }));
   assert.match(html, /<div class="rf-msg rf-msg-user">Make it punchier/);
   assert.ok(html.includes("Regenerate"));
   assert.ok(!html.includes("rf-diff-removed"), "change list starts collapsed");

@@ -16,15 +16,17 @@ export function ProposalCard(p: {
 }) {
   const x = p.proposal;
   const fps = p.timeline?.project.settings.fps ?? { num: 30, den: 1 };
-  // Written by an MCP client, not typed here: say so, and lead with the engine's change list.
-  const fromClient = x.provider === "mcp";
+  // Asked for by an MCP client (directly, via the AI Director, or in a workflow it sent), not typed
+  // here: say so, and lead with the engine's change list.
+  const fromClient = x.requestedBy === "mcp" || x.provider === "mcp";
   const [open, setOpen] = useState(fromClient);
   const time = new Date(x.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   return (
     <>
       {fromClient ? (
         <div className="rf-msg rf-msg-ai rf-proposal-origin">
-          <Icon name="alert" size={12} /> Proposed by an external AI client “{x.model}”, not by you. Check the changes before applying.
+          <Icon name="alert" size={12} /> Requested by an external AI client, not by you.{x.instruction && <> It asked: “{x.instruction}”.</>} Check the changes
+          before applying.
           <span className="rf-msg-time">{time}</span>
         </div>
       ) : (

@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, ProposalStore, TimelineStore, WorkflowRunStore } from "@reelforge/core";
-import { runWorkflow } from "../src/index.ts";
+import { globImportSteps, parseWorkflow, runWorkflow } from "../src/index.ts";
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-wf-")));
 process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
@@ -111,7 +111,13 @@ test("an AI Director step waits for approval unless --approve-ai", async (t) => 
   assert.equal(waiting.status, "waiting_approval");
   const proposalId = waiting.steps[2]!.result!.proposalId as string;
   assert.equal(new ProposalStore(s.db).get(proposalId).status, "pending");
+  assert.equal(new ProposalStore(s.db).get(proposalId).requestedBy, "user");
   assert.deepEqual(new TimelineStore(s.db).get(waiting.projectId!).clips[0]!.props, {}, "nothing applied without approval");
+
+  // Sent by an MCP client (its edits approved by the user): the director's instruction is the client's, not the user's.
+  const fromClient = await runWorkflow(s.db, spec("Client"), { cacheDir: s.cacheDir, actor: "mcp", baseDir: dir, timelineEditsApproved: true });
+  assert.equal(fromClient.status, "waiting_approval");
+  assert.equal(new ProposalStore(s.db).get(fromClient.steps[2]!.result!.proposalId as string).requestedBy, "mcp");
 
   const approved = await runWorkflow(s.db, spec("Go"), { cacheDir: s.cacheDir, actor: "cli", baseDir: dir, approveAi: true });
   assert.equal(approved.status, "completed");
@@ -174,5 +180,11 @@ test("a render step creates a missing folder only when asked, and only inside ba
   assert.ok(!existsSync(join(base, "not-a-video")));
   await render("inside/x.mp4", true);
   assert.ok(existsSync(join(base, "inside")));
+});
+
+test("glob detection sees a pattern carried by baseDir, as the runner does", () => {
+  const spec = parseWorkflow({ version: 1, name: "B", project: { name: "B" }, steps: [{ import: { paths: ["clip.mp4", "/abs/literal.mp4"] } }] });
+  assert.deepEqual(globImportSteps(spec, "/safe/dir"), []);
+  assert.deepEqual(globImportSteps(spec, "/Users/*"), [{ index: 0, patterns: ["/Users/*/clip.mp4"] }]);
 });
 

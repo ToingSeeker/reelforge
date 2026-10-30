@@ -147,9 +147,16 @@ function expandPath(p: string, baseDir: string): string {
   return isAbsolute(home) ? home : resolve(baseDir, home);
 }
 
-/** Steps whose import paths contain glob patterns (they read directory listings). */
-export function globImportSteps(spec: WorkflowSpec): { index: number; patterns: string[] }[] {
-  return spec.steps.flatMap((s, index) => ("import" in s && s.import.paths.some(isGlob) ? [{ index, patterns: s.import.paths.filter(isGlob) }] : []));
+/**
+ * Import steps whose paths are glob patterns once resolved against baseDir (a baseDir can carry the
+ * pattern too), with the resolved patterns: exactly what expandGlobs will search.
+ */
+export function globImportSteps(spec: WorkflowSpec, baseDir: string): { index: number; patterns: string[] }[] {
+  return spec.steps.flatMap((s, index) => {
+    if (!("import" in s)) return [];
+    const patterns = s.import.paths.map((p) => expandPath(p, baseDir)).filter(isGlob);
+    return patterns.length ? [{ index, patterns }] : [];
+  });
 }
 
 const isGlob = (p: string) => /[*?[]/.test(p);
@@ -364,7 +371,8 @@ export async function runWorkflow(db: Database, input: unknown, opts: RunOptions
         const provider = providerFor(step.director.provider ?? "ollama");
         const model = step.director.model ?? (provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : (await listOllamaModels()).models[0]);
         if (!model) throw new ReelForgeError("UNAVAILABLE", "no local model available in Ollama");
-        const proposal = await propose(db, projectId, provider, { instruction: step.director.instruction, model }, opts.signal ? { signal: opts.signal } : {});
+        const requestedBy = opts.actor === "mcp" ? "mcp" : "user"; // an MCP client wrote this workflow
+        const proposal = await propose(db, projectId, provider, { instruction: step.director.instruction, model, requestedBy }, opts.signal ? { signal: opts.signal } : {});
         result = { proposalId: proposal.id, summary: proposal.summary, warnings: proposal.warnings };
         if (!proposal.operations.length) {
           detail = `no changes: ${proposal.warnings.join(" ") || proposal.summary}`;

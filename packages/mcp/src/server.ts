@@ -170,6 +170,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
         if (parsed.errors.length) throw new ReelForgeError("VALIDATION_ERROR", parsed.errors.join("; "));
         const proposal = proposals.create(a.projectId, {
           instruction: "", // the summary is the client's words, never shown as the user's instruction
+          requestedBy: "mcp",
           selection: a.selection ?? [],
           provider: "mcp",
           model: clientName(),
@@ -184,7 +185,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       const provider = providerFor(a.director?.provider ?? "ollama");
       const model = a.director?.model ?? (provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : (await listOllamaModels()).models[0]);
       if (!model) throw new ReelForgeError("UNAVAILABLE", "no local model available in Ollama");
-      return describe(await propose(db, a.projectId, provider, { instruction: a.instruction, model, selection: a.selection ?? [] }));
+      return describe(await propose(db, a.projectId, provider, { instruction: a.instruction, model, selection: a.selection ?? [], requestedBy: "mcp" }));
     }),
   );
   server.registerTool(
@@ -275,6 +276,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       }
       const proposal = proposals.create(projectId, {
         instruction: "Generate captions from speech",
+        requestedBy: "mcp",
         selection: [],
         provider: "mcp",
         model: clientName(),
@@ -358,9 +360,9 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       const spec = parseWorkflow(workflow);
       const editing = timelineSteps(spec);
       // A glob reads directory listings, so it needs the same yes (literal paths are media_import's authority).
-      const globs = globImportSteps(spec);
-      const approved = editing.length > 0 || globs.length > 0;
-      if (approved) {
+      const resolvedBase = baseDir ?? process.cwd();
+      const globs = globImportSteps(spec, resolvedBase);
+      if (editing.length || globs.length) {
         const how = { approve_in_reelforge: "Save the workflow as a .json file and run it from ReelForge → Automate, or with: reelforge workflow run <file.json>" };
         if (!server.server.getClientCapabilities()?.elicitation) return { status: "approval_required", timelineSteps: editing, globImports: globs, ...how };
         // Server-written summary first; anything the client wrote is flattened and quoted.
@@ -384,11 +386,11 @@ export function createMcpServer(db: Database, opts: McpOptions) {
         run: await runWorkflow(db, spec, {
           cacheDir: opts.cacheDir,
           actor: "mcp",
-          baseDir: baseDir ?? process.cwd(),
+          baseDir: resolvedBase,
           source: `mcp:${clientName()}`,
-          // Only reached with the user's yes. createOutputDirs stays off: the client chose baseDir.
-          timelineEditsApproved: approved,
-          globsApproved: approved,
+          // Each approval covers only what the prompt showed. createOutputDirs stays off: the client chose baseDir.
+          timelineEditsApproved: editing.length > 0,
+          globsApproved: globs.length > 0,
         }),
       };
     }),

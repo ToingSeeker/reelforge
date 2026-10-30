@@ -260,6 +260,10 @@ test("workflows_run: glob imports need approval and never list non-media entries
     // Literal paths are still media_import's authority and run without asking.
     const literal = (await call("workflows_run", { workflow: { version: 1, name: "One file", project: { id: project.id }, steps: [{ import: { paths: [f.png] } }] } })).data;
     assert.equal(literal.run.status, "completed");
+    // A pattern hidden in baseDir is still a glob.
+    const viaBase = (await call("workflows_run", { baseDir: `${tree}/*`, workflow: { version: 1, name: "Base glob", project: { id: project.id }, steps: [{ import: { paths: ["clip.mp4"] } }] } })).data;
+    assert.equal(viaBase.status, "approval_required");
+    assert.deepEqual(viaBase.globImports[0].patterns, [`${tree}/*/clip.mp4`]);
   }
 
   {

@@ -17,6 +17,8 @@ export interface ProposeInput {
   instruction: string;
   model: string;
   selection?: string[];
+  /** "mcp" when an MCP client wrote the instruction (default "user"). */
+  requestedBy?: "user" | "mcp";
 }
 
 const MAX_ATTEMPTS = 2;
@@ -58,6 +60,7 @@ export async function propose(db: Database, projectId: string, provider: Planner
       try {
         return proposals.create(projectId, {
           instruction,
+          requestedBy: input.requestedBy ?? "user",
           selection,
           provider: provider.id,
           model: reply.model,
