@@ -14,6 +14,7 @@ import {
   JobStore,
   OPERATION_TYPES,
   ProposalStore,
+  WorkflowRunStore,
   planCaptions,
   type AnalysisKind,
   ProjectStore,
@@ -24,6 +25,7 @@ import {
   type ErrorCode,
 } from "@reelforge/core";
 import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, propose, providerFor } from "@reelforge/ai";
+import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
 import { AnalysisRunner, createRenderJob, ensureProxy, ensureThumbnail, fontsDir, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { join } from "node:path";
 
@@ -381,6 +383,30 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       handle: ({ res, params: [id], actor }) => send(res, 200, proposals.apply(id!, { by: actor, channel: `${actor}:apply` })),
     },
     { method: "POST", pattern: re(`/v1/proposals/${ID}/reject`), handle: ({ res, params: [id], actor }) => send(res, 200, { proposal: proposals.reject(id!, actor) }) },
+    {
+      // Run a workflow file in the background; poll its run record. approveAi comes from the person
+      // pressing Run in ReelForge (MCP clients can't set it).
+      method: "POST",
+      pattern: re("/v1/workflows/run"),
+      handle: async ({ req, res, actor }) => {
+        const b = (await readJson(req)) as { path?: unknown; approveAi?: unknown };
+        if (typeof b.path !== "string" || !b.path.startsWith("/")) throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"path": "/absolute/workflow.json"}');
+        const { spec, baseDir } = readWorkflowFile(b.path);
+        const runId = await new Promise<string>((resolve, reject) => {
+          runWorkflow(opts.db, spec, { cacheDir: opts.cacheDir, actor, baseDir, source: b.path as string, approveAi: b.approveAi === true, onStart: resolve }).catch(reject);
+        });
+        return send(res, 202, { run: new WorkflowRunStore(opts.db).get(runId) });
+      },
+    },
+    {
+      method: "GET",
+      pattern: re("/v1/workflows/runs"),
+      handle: ({ req, res }) => {
+        const projectId = new URL(req.url ?? "", "http://x").searchParams.get("projectId");
+        return send(res, 200, { runs: new WorkflowRunStore(opts.db).list(projectId ? { projectId } : {}) });
+      },
+    },
+    { method: "GET", pattern: re(`/v1/workflows/runs/${ID}`), handle: ({ res, params: [id] }) => send(res, 200, { run: new WorkflowRunStore(opts.db).get(id!) }) },
     {
       // Desktop "Export SRT…": the webview can't write files, so the engine writes where the user chose.
       method: "POST",

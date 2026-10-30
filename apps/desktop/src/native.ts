@@ -67,3 +67,11 @@ export const keychain = {
     await invoke("delete_api_key", { provider });
   },
 };
+
+/** Pick a workflow recipe (.json). */
+export async function pickWorkflowFile(): Promise<string | null> {
+  if (!isTauri()) return window.prompt("Absolute path of a workflow .json (browser dev mode):") || null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({ multiple: false, directory: false, title: "Run workflow", filters: [{ name: "ReelForge workflow", extensions: ["json"] }] });
+  return typeof picked === "string" ? picked : null;
+}

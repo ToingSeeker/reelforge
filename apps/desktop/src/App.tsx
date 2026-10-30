@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AIProposal, Asset, CaptionStylePatch, ClipPropsPatch, Project, Timeline as TimelineData, TimelineOp } from "@reelforge/core/schema";
 import { applyOperations, canPlace, clipEnd } from "@reelforge/core/timeline-ops";
 import { SettingsDialog } from "./components/SettingsDialog.tsx";
+import { AutomationLab } from "./components/AutomationLab.tsx";
 import { formatClock } from "@reelforge/core/timebase";
 import { createClient, resolveApiInfo, type Client } from "./api.ts";
 import { useEditor } from "./editor.ts";
@@ -23,7 +24,7 @@ import type { PreviewMode } from "./components/Preview.tsx";
 import { Timeline, type AssetDropHandler } from "./components/Timeline.tsx";
 import { NewProjectDialog } from "./components/NewProjectDialog.tsx";
 import { Welcome } from "./components/Welcome.tsx";
-import { Placeholder, RailPlaceholder } from "./components/Placeholder.tsx";
+import { RailPlaceholder } from "./components/Placeholder.tsx";
 import { Icon } from "./icons.tsx";
 
 const CURRENT_KEY = "rf.currentProject";
@@ -403,7 +404,15 @@ export function App() {
       ) : workspace === "review" && current ? (
         <RenderQueue client={client} projectId={current.id} notify={notify} onExport={() => void doExport()} />
       ) : workspace === "automate" ? (
-        <Placeholder workspace={workspace} />
+        <AutomationLab
+          client={client}
+          notify={notify}
+          onOpenProject={(id) => {
+            selectProject(id);
+            setWorkspace("edit");
+            void refresh();
+          }}
+        />
       ) : (
         <div className="rf-studio">
           <LeftRail active={rail} onChange={setRail} onSettings={() => setSettingsOpen(true)} />

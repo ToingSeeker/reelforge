@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@reelforge/ai": "workspace:*",
+    "@reelforge/automation": "workspace:*",
     "@reelforge/core": "workspace:*",
     "@reelforge/media": "workspace:*"
   }

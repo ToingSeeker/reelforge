@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "Reel from a folder",
+  "project": { "name": "Cafe reel (workflow)", "width": 1080, "height": 1920, "fps": "30" },
+  "steps": [
+    { "import": { "paths": ["footage/*.mp4", "music/*.wav", "voice/*.wav"] } },
+    { "analyze": { "kinds": ["beats", "transcript"] } },
+    { "append": { "asset": "C001_Espresso.mp4", "track": "V1", "duration": "3s", "props": { "fadeIn": 15 } } },
+    { "append": { "asset": "C002_Barista.mp4", "track": "V1", "duration": "3s", "sourceIn": "0.5s", "props": { "scale": 1, "scaleEnd": 1.15 } } },
+    { "append": { "asset": "C004_Beans.mp4", "track": "V1", "duration": "4s", "props": { "fadeOut": 20 } } },
+    { "append": { "asset": "Cafe_Mood.wav", "track": "A1", "duration": "10s", "props": { "gainDb": -10, "fadeOut": 30 } } },
+    { "append": { "asset": "Voiceover.wav", "track": "A2" } },
+    { "edit": { "operations": [{ "type": "clip.move", "clipId": "${clip:Voiceover.wav}", "start": "0.5s" }] } },
+    { "captions": { "source": ["A2"], "maxWords": 3, "style": "bold" } },
+    { "render": { "out": "out/cafe-reel.mp4" } }
+  ]
+}

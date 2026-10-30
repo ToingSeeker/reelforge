@@ -13,6 +13,7 @@ import {
   OPERATION_TYPES,
   planCaptions,
   ProposalStore,
+  WorkflowRunStore,
   type AnalysisKind,
   openDatabase,
   parseFps,
@@ -31,6 +32,9 @@ import {
 import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, propose, providerFor, setCredential } from "@reelforge/ai";
 import { AnalysisRunner, createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
+import { createMcpServer } from "@reelforge/mcp";
+import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 // Every command prints exactly one JSON document to stdout (errors go to
 // stderr as {"error": …}) so agents and scripts can parse the result.
@@ -87,6 +91,10 @@ Usage:
   reelforge render <project> --out <file.mp4>      (H.264/AAC at project size; never overwrites)
   reelforge preview <project>                      (low-res render of the same graph, from proxies)
   reelforge jobs list <project> | get <job> | cancel <job> | retry <job> [--wait]
+
+  reelforge workflow run <file.json> [--approve-ai]   (repeatable recipe; --approve-ai also applies AI Director steps)
+  reelforge workflow validate <file.json> | workflow runs [--project <id>]
+  reelforge mcp                                (MCP server on stdio, for Claude, ChatGPT, Gemini CLI…)
 
   reelforge serve [--port 0] [--allow-origin <origin>]...
 
@@ -154,6 +162,8 @@ const OPTIONS = {
   selection: { type: "string" },
   yes: { type: "boolean" },
   grant: { type: "boolean" },
+  "approve-ai": { type: "boolean" },
+  project: { type: "string" },
   revoke: { type: "boolean" },
   wait: { type: "boolean" },
 } as const;
@@ -205,6 +215,7 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
       return 0;
     }
     if (cmd === "serve") return await serve(env, values, io);
+    if (cmd === "mcp") return await mcp(env);
 
     if (cmd === "render" || cmd === "preview") {
       const db = openDatabase(resolveDbPath(env));
@@ -212,6 +223,17 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
         const job = await runJob(db, env, io, (sub ? [sub, ...rest] : rest)[0], cmd === "render" ? "export" : "preview", values.out);
         print({ job });
         return job.state === "completed" ? 0 : job.error?.code === "MEDIA_OFFLINE" || job.state === "cancelled" ? EXIT.VALIDATION_ERROR : EXIT.INTERNAL;
+      } finally {
+        db.close();
+      }
+    }
+    if (cmd === "workflow" && sub === "run") {
+      const db = openDatabase(resolveDbPath(env));
+      try {
+        const { spec, baseDir } = readWorkflowFile(resolve(io.cwd ?? process.cwd(), need(rest[0], "<file.json>")));
+        const run = await runWorkflow(db, spec, { cacheDir: resolveCacheDir(env), actor: "cli", baseDir, source: rest[0]!, approveAi: !!values["approve-ai"] });
+        print({ run });
+        return run.status === "completed" ? 0 : run.status === "waiting_approval" ? 0 : EXIT.INTERNAL;
       } finally {
         db.close();
       }
@@ -418,6 +440,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
     }
     return { srt };
   },
+  "workflow validate": ({ args, io }) => {
+    const { spec } = readWorkflowFile(resolve(io.cwd ?? process.cwd(), need(args[0], "<file.json>")));
+    return { valid: true, name: spec.name, steps: spec.steps.map((s) => Object.keys(s)[0]) };
+  },
+  "workflow runs": ({ db, values }) => ({ runs: new WorkflowRunStore(db).list(values.project ? { projectId: values.project } : {}) }),
   "ai proposals": ({ db, args }) => ({ proposals: new ProposalStore(db).list(need(args[0], "<project>")) }),
   "ai show": ({ db, args }) => ({ proposal: new ProposalStore(db).get(need(args[0], "<proposal>")) }),
   "ai apply": ({ db, args, values }) => {
@@ -559,6 +586,23 @@ function history(ctx: Ctx, dir: "undo" | "redo") {
   const timeline = new TimelineStore(ctx.db);
   const baseRevision = int("base-revision", ctx.values["base-revision"]) ?? timeline.get(projectId).project.revision;
   return { timeline: timeline[dir](projectId, { baseRevision }, "cli") };
+}
+
+/** MCP over stdio: stdout carries the protocol, so nothing else may be printed there. */
+async function mcp(env: NodeJS.ProcessEnv): Promise<number> {
+  const db = openDatabase(resolveDbPath(env));
+  const { server, close } = createMcpServer(db, { cacheDir: resolveCacheDir(env) });
+  const transport = new StdioServerTransport();
+  const closed = new Promise<void>((resolve) => {
+    transport.onclose = () => resolve();
+    process.stdin.once("end", () => resolve());
+  });
+  await server.connect(transport);
+  await closed;
+  close();
+  await server.close().catch(() => {});
+  db.close();
+  return 0;
 }
 
 async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<number> {

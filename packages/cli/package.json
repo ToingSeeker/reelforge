@@ -11,8 +11,11 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@reelforge/ai": "workspace:*",
+    "@reelforge/automation": "workspace:*",
     "@reelforge/core": "workspace:*",
+    "@reelforge/mcp": "workspace:*",
     "@reelforge/media": "workspace:*",
     "@reelforge/server": "workspace:*"
   }

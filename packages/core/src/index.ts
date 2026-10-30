@@ -22,3 +22,4 @@ import { TimelineOpSchema as _Ops } from "./schema.ts";
 /** Every operation type the engine accepts (for planners and tool descriptions). */
 export const OPERATION_TYPES: string[] = _Ops.options.map((o) => (o.shape.type as { value: string }).value);
 export { ProposalStore, describeChanges, engineWarnings, type NewProposal } from "./proposals.ts";
+export { WorkflowRunStore } from "./workflow-runs.ts";

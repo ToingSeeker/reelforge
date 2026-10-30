@@ -1,6 +1,6 @@
 export { propose, type ProposeInput } from "./planner.ts";
 export { MODEL_OUTPUT_SCHEMA, parseModelOutput } from "./output-schema.ts";
-export { SYSTEM_PROMPT } from "./prompt.ts";
+export { SYSTEM_PROMPT, OPERATIONS_GUIDE } from "./prompt.ts";
 export { AnthropicProvider, ANTHROPIC_DEFAULT_MODEL } from "./providers/anthropic.ts";
 export { OllamaProvider, listOllamaModels, ollamaUrl } from "./providers/ollama.ts";
 export { setCredential, getCredential, credentialSource } from "./credentials.ts";

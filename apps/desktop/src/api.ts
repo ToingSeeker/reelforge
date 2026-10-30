@@ -1,4 +1,4 @@
-import type { AIConsent, AIProposal, Analysis, AnalysisKind, Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
+import type { WorkflowRun, AIConsent, AIProposal, Analysis, AnalysisKind, Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
 import type { ProjectContext } from "@reelforge/core/context";
 
 // The desktop UI never touches SQLite: it talks to the same core through the
@@ -87,6 +87,8 @@ export function createClient(info: ApiInfo) {
     setConsent: (id: string, granted: boolean) =>
       request<{ consent: AIConsent | null }>("POST", `/v1/projects/${encodeURIComponent(id)}/ai-consent`, { granted }).then((r) => r.consent),
     context: (id: string) => request<{ context: ProjectContext }>("GET", `/v1/projects/${encodeURIComponent(id)}/context`).then((r) => r.context),
+    runWorkflow: (path: string, approveAi: boolean) => request<{ run: WorkflowRun }>("POST", "/v1/workflows/run", { path, approveAi }).then((r) => r.run),
+    workflowRuns: () => request<{ runs: WorkflowRun[] }>("GET", "/v1/workflows/runs").then((r) => r.runs),
     exportSrt: (id: string, outputPath: string, trackId?: string) =>
       request<{ path: string }>("POST", `/v1/projects/${encodeURIComponent(id)}/captions/export-srt`, { outputPath, ...(trackId ? { trackId } : {}) }),
     listProjects: () => request<{ projects: Project[] }>("GET", "/v1/projects").then((r) => r.projects),

@@ -264,5 +264,28 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE projects ADD COLUMN ai_consent TEXT;
     `,
   },
+  {
+    version: 7,
+    name: "workflow_runs",
+    sql: `
+      -- Automation history (PRD WorkflowRun): what ran, step by step, and why it stopped.
+      CREATE TABLE workflow_runs (
+        id          TEXT PRIMARY KEY,
+        project_id  TEXT REFERENCES projects (id) ON DELETE SET NULL,
+        name        TEXT NOT NULL,
+        source      TEXT,
+        spec        TEXT NOT NULL CHECK (json_valid(spec)),
+        status      TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'waiting_approval')),
+        steps       TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(steps)),
+        error       TEXT,
+        actor       TEXT NOT NULL,
+        runner_pid  INTEGER,
+        started_at  TEXT NOT NULL,
+        finished_at TEXT
+      ) STRICT;
+
+      CREATE INDEX workflow_runs_started ON workflow_runs (started_at DESC);
+    `,
+  },
 ];
 

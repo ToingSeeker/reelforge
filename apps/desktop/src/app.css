@@ -1943,3 +1943,67 @@ button:disabled {
   gap: 6px;
   margin-top: 8px;
 }
+
+/* M5: Automation Lab */
+.rf-run {
+  padding: 12px 14px;
+  border: 1px solid var(--rf-border);
+  border-radius: var(--rf-radius-lg);
+  background: var(--rf-surface);
+}
+.rf-run-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.rf-run-head .rf-link-btn {
+  margin-left: auto;
+}
+.rf-run-status {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.rf-run-status-completed { color: var(--rf-success); }
+.rf-run-status-failed { color: var(--rf-danger); }
+.rf-run-status-running { color: var(--rf-primary); }
+.rf-run-status-waiting_approval { color: var(--rf-warning); }
+.rf-run-steps {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.rf-step {
+  display: grid;
+  grid-template-columns: 18px 76px minmax(0, 1fr);
+  gap: 6px;
+  color: var(--rf-text-2);
+}
+.rf-step-icon { text-align: center; }
+.rf-step-completed .rf-step-icon { color: var(--rf-success); }
+.rf-step-failed { color: var(--rf-danger); }
+.rf-step-running .rf-step-icon { color: var(--rf-primary); }
+.rf-step-waiting_approval .rf-step-icon { color: var(--rf-warning); }
+.rf-step-skipped,
+.rf-step-pending { color: var(--rf-text-3); }
+.rf-step-kind {
+  font-family: var(--rf-font-mono);
+}
+.rf-step-detail {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  user-select: text;
+}
+.rf-queue-head code {
+  font-family: var(--rf-font-mono);
+  font-size: 12px;
+}
+.rf-queue-head .rf-check {
+  white-space: nowrap;
+}

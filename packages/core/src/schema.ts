@@ -591,3 +591,32 @@ export interface AIConsent {
   grantedAt: string;
   grantedBy: string;
 }
+
+// ---------------------------------------------------------------------------
+// Automation (M5)
+// ---------------------------------------------------------------------------
+
+export type WorkflowStatus = "running" | "completed" | "failed" | "waiting_approval";
+
+export interface WorkflowStepResult {
+  index: number;
+  kind: string;
+  status: "pending" | "running" | "completed" | "failed" | "skipped" | "waiting_approval";
+  /** Short human-readable outcome ("3 imported", "rendered /path.mp4"). */
+  detail: string | null;
+  /** Machine-readable result (asset ids, proposal id, job id…). */
+  result: Record<string, unknown> | null;
+}
+
+export interface WorkflowRun {
+  id: string;
+  projectId: string | null;
+  name: string;
+  source: string | null;
+  status: WorkflowStatus;
+  steps: WorkflowStepResult[];
+  error: string | null;
+  actor: string;
+  startedAt: string;
+  finishedAt: string | null;
+}

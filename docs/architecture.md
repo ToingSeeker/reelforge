@@ -146,6 +146,22 @@ instruction + selection ──▶ propose() ── buildProjectContext ──▶
 - **Engine warnings** add what the model can't see, e.g. a dissolve that won't play because the clips have no
   spare frames around the cut.
 
+## MCP server & automation
+
+`reelforge mcp` runs `@reelforge/mcp` over stdio: one process per client session, opening the same SQLite workspace and
+running its own render/analysis runners (jobs are claimed atomically, so it coexists with the desktop engine).
+
+| Rule | How |
+|---|---|
+| Timeline changes need a person | `timeline_propose_edit` and `captions_generate` only create proposals. `timeline_apply_proposal` asks the user through MCP **elicitation**; if the client can't elicit, it returns `approval_required` with the ReelForge / CLI way to approve. Approvals are recorded as `mcp:elicitation:<client>`. |
+| Same validation as everywhere | Operations from the client go through the AI output parser (placeholders, schema) and the dry run. |
+| No AI self-approval in workflows | `workflows_run` never accepts `approveAi`; AI Director steps stop at `waiting_approval`. |
+| Tool names | PRD §14 names with `_` instead of `.` (`timeline_get`, …): Claude's API rejects dots in tool names. |
+
+Workflows (`@reelforge/automation`) are JSON recipes validated with zod before anything runs; each step's status,
+detail and result are written to `workflow_runs` as it progresses, so the Automation Lab, `workflow runs` and
+`workflows_runs` all show live progress. Edits a workflow makes carry `workflowRunId` in their revision payload.
+
 ## REST API (v1)
 
 | Method | Path | |
@@ -174,6 +190,8 @@ instruction + selection ──▶ propose() ── buildProjectContext ──▶
 | GET · POST | `/v1/projects/:id/ai-consent` | read / grant or revoke `{granted}` |
 | POST · GET | `/v1/projects/:id/proposals` | ask for a proposal `{instruction, provider, model, selection}` · list |
 | GET · POST | `/v1/proposals/:id` · `/apply` · `/reject` | read · approve and apply · reject |
+| POST | `/v1/workflows/run` | run a workflow file `{path, approveAi}` in the background → 202 run |
+| GET | `/v1/workflows/runs` · `/v1/workflows/runs/:id` | run records with per-step status |
 | GET | `/v1/projects/:id/assets/:assetId/media` | what the live preview plays: video proxy, still proxy or original audio (`Range`) |
 
 Media GET routes (`media`, `thumbnail`, job `output`) also accept `?token=` because media elements cannot send headers.

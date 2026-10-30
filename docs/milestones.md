@@ -163,6 +163,32 @@ Known gaps carried forward:
 - Local models are slow on this Mac (qwen2.5:14b ≈ 4 min, qwen3.5:27b ≈ 2.7 min for the demo project).
 - Conversational revisions ("make it faster") and multi-turn memory are P1; each instruction is a fresh proposal.
 
-## M5–M6
+## M5 — MCP & Automation ✅ (exit criterion met)
 
-MCP & Automation → Alpha Release. See the PRD.
+**Exit criterion:** a compatible AI client can create and process a project through MCP. Verified by `mcp.test.ts`: the
+official MCP SDK client starts `reelforge mcp` over stdio and goes projects_create → media_import → audio_detect_beats
+→ media_analyze + jobs_get → timeline_get → timeline_propose_edit (its own operations, with placeholders) →
+approval → render_start → jobs_get → outputs_get, ending in a verified MP4.
+
+- [x] `reelforge mcp`: all 18 PRD §14 tools (as `snake_case`) + `workflows_run` / `workflows_runs`, with read/write hints
+- [x] Human approval for every timeline change: elicitation in the client (accept → applied, decline → stays pending,
+      both tested), otherwise `approval_required` pointing to ReelForge / `ai apply --yes`
+- [x] Long-running work returns job ids (`render_start`, `preview_create`, `media_analyze`); `jobs_get` covers render
+      and analysis jobs; `jobs_cancel` for renders
+- [x] Workflow JSON (import with globs, analyze, append, edit with `${asset:…}`/`${track:…}`/`${clip:…#n}` and time
+      strings, captions, director, preview, render); validated before running; per-step progress in `workflow_runs`;
+      AI Director steps wait for approval unless the person passes `--approve-ai`
+- [x] `examples/workflows/reel-from-folder.json` runs end to end on the sample media (import → whisper captions →
+      1080×1920 MP4) in ~15 s, from the CLI and from the Automation Lab
+- [x] CLI `workflow run|validate|runs`; REST `/v1/workflows/*`; Automate workspace with live step status
+- [x] 110 tests
+
+Known gaps carried forward:
+- Not yet exercised with a real third-party client (Claude Code/Desktop, ChatGPT, Gemini CLI); the protocol path is
+  covered by the official SDK client over stdio. Compatibility matrix per client/version is M6 (PRD §14).
+- Remote MCP (HTTPS + OAuth) is P1.
+- Analysis jobs can't be cancelled yet (renders can).
+
+## M6
+
+Alpha release: security hardening, end-to-end testing, signing, packaging (bundled Node/engine), docs, license audit.

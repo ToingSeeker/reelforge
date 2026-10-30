@@ -5,10 +5,10 @@
 
 ---
 
-> **Status: pre-alpha, milestone M4.** Multi-track editing with undo/redo, a
+> **Status: pre-alpha, milestone M5.** Multi-track editing with undo/redo, a
 > live preview, frame-exact MP4 export, local scene/beat/speech analysis,
-> animated captions, and an **AI Director** (Claude or a local Ollama model) that
-> proposes timeline edits you preview and approve. MCP & automation (M5) are next. Transcription/captions
+> animated captions, an **AI Director** (Claude or local Ollama), a local **MCP
+> server** for external AI clients, and **workflow recipes**. Alpha hardening (M6) is next. Transcription/captions
 > (M3) and the AI Director (M4) are not built yet. See [docs/milestones.md](docs/milestones.md).
 
 ReelForge turns raw footage into editable, reviewable vertical video. You can drive it
@@ -73,13 +73,42 @@ Rename a project from the CLI while the desktop app is open and the window updat
 
 Data lives in `~/Library/Application Support/ReelForge/reelforge.db`. Set `REELFORGE_HOME` (or pass `--home`) to use another workspace.
 
+## Use it from Claude, ChatGPT or Gemini CLI (MCP)
+
+ReelForge ships a local MCP server over stdio. External AI clients can create projects, import and analyse media,
+read the timeline, propose edits and render. **Every timeline change is a proposal you approve**: the client asks you
+(MCP elicitation), or you press Apply in ReelForge, or run `reelforge ai apply <id> --yes`.
+
+```sh
+# Claude Code
+claude mcp add reelforge -- node /path/to/reelforge/packages/cli/bin/reelforge.js mcp
+```
+
+Claude Desktop and other clients (`mcpServers` config):
+
+```json
+{ "mcpServers": { "reelforge": { "command": "node", "args": ["/path/to/reelforge/packages/cli/bin/reelforge.js", "mcp"] } } }
+```
+
+Tools: `projects_list|create|get`, `media_import|analyze|get_analysis`, `audio_detect_beats`, `timeline_get`,
+`timeline_propose_edit|get_proposal|apply_proposal|undo`, `captions_generate`, `preview_create`, `render_start`,
+`jobs_get|cancel`, `outputs_get`, `workflows_run|runs` (PRD §14 names with `_` instead of `.`, as Claude's API requires).
+
+## Workflow recipes
+
+Repeatable JSON recipes (import → analyse → assemble → captions → AI pass → render): see
+[examples/workflows](examples/workflows/README.md). `reelforge workflow run recipe.json`.
+
 ## Repository layout
 
 ```
 packages/core     editing core: schemas, rational timebase, timeline reducer, SQLite stores, undo
 packages/media    FFprobe/FFmpeg: import, probing, thumbnails and waveforms
 packages/server   local REST API (loopback only, bearer token, Host/Origin checks)
-packages/cli      `reelforge` JSON CLI, including `reelforge serve`
+packages/ai       AI Director: Claude + Ollama adapters, proposal planner
+packages/automation  workflow recipes (JSON) runner
+packages/mcp      MCP server (stdio) over the same engine
+packages/cli      `reelforge` JSON CLI, including `reelforge serve` and `reelforge mcp`
 apps/desktop      Tauri 2 + React studio; the Rust shell runs the engine as a sidecar
 docs/             PRD, architecture, milestones, design reference
 ```
