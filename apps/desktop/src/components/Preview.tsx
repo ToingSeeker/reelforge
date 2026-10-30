@@ -51,7 +51,7 @@ export function Preview(props: Props) {
 
   useEffect(() => {
     if (!live || !canvas.current || !client || !projectId) return;
-    const c = new Compositor(canvas.current, { mediaUrl: (assetId) => client.mediaUrl(projectId, assetId) });
+    const c = new Compositor(canvas.current, { mediaUrl: (assetId) => client.mediaUrl(projectId, assetId), fontUrl: (file) => client.fontUrl(file) });
     comp.current = c;
     return () => {
       c.dispose();

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as RPointerEvent } from "react";
-import type { Asset, Clip, Timeline as TimelineData, TimelineOp, Track } from "@reelforge/core/schema";
+import type { Asset, Caption, Clip, Timeline as TimelineData, TimelineOp, Track } from "@reelforge/core/schema";
 import { canPlace } from "@reelforge/core/timeline-ops";
 import { trackLabels } from "@reelforge/core/schema";
 import { formatClock, type Rational } from "@reelforge/core/timebase";
@@ -29,9 +29,16 @@ interface Props {
   onDelete: (ripple: boolean) => void;
   registerDrop: (handler: AssetDropHandler | null) => void;
   assetDragging: Asset | null;
+  /** Beat / scene-cut markers per clip, in timeline frames. */
+  markers: ReadonlyMap<string, { beats: number[]; cuts: number[] }>;
+  /** Extra snap targets (beats, scene cuts) when beat snapping is on. */
+  snapExtra: readonly number[];
+  selectedCaption: string | null;
+  onSelectCaption: (id: string | null) => void;
 }
 
 type Drag =
+  | { kind: "caption"; caption: Caption; originX: number; delta: number; moved: boolean }
   | { kind: "move"; clip: Clip; originX: number; delta: number; trackId: string; moved: boolean }
   | { kind: "trim-start" | "trim-end"; clip: Clip; originX: number; delta: number; moved: boolean }
   | { kind: "playhead" };
@@ -92,11 +99,12 @@ export function Timeline(p: Props) {
 
   const snapPoints = useCallback(
     (exclude: string | null) => {
-      const pts = [0, p.playhead];
+      const pts = [0, p.playhead, ...p.snapExtra];
       for (const c of tl?.clips ?? []) if (c.id !== exclude) pts.push(c.start, c.start + c.duration);
+      for (const c of tl?.captions ?? []) if (c.id !== exclude) pts.push(c.start, c.start + c.duration);
       return pts;
     },
-    [tl?.clips, p.playhead],
+    [tl?.clips, tl?.captions, p.playhead, p.snapExtra],
   );
 
   const snapFrame = useCallback(
@@ -167,6 +175,13 @@ export function Timeline(p: Props) {
     const move = (e: PointerEvent) => {
       if (drag.kind === "playhead") return p.onPlayhead(frameAtClientX(e.clientX));
       const raw = Math.round((e.clientX - drag.originX) / px);
+      if (drag.kind === "caption") {
+        const c = drag.caption;
+        let delta = Math.max(-c.start, raw);
+        delta += snapFrame([c.start + delta, c.start + delta + c.duration], c.id);
+        setDrag({ ...drag, delta: Math.max(-c.start, delta), moved: drag.moved || Math.abs(e.clientX - drag.originX) > 3 });
+        return;
+      }
       const moved = drag.moved || Math.abs(e.clientX - drag.originX) > 3;
       const c = drag.clip;
       if (drag.kind === "move") {
@@ -184,6 +199,11 @@ export function Timeline(p: Props) {
       }
     };
     const up = () => {
+      if (drag.kind === "caption") {
+        if (drag.moved && drag.delta) p.onApply("Move caption", [{ type: "caption.update", captionId: drag.caption.id, start: drag.caption.start + drag.delta }]);
+        setDrag(null);
+        return;
+      }
       if (drag.kind !== "playhead" && drag.moved) {
         const c = drag.clip;
         if (drag.kind === "move" && (drag.delta !== 0 || drag.trackId !== c.trackId)) {
@@ -318,13 +338,39 @@ export function Timeline(p: Props) {
                   p.onPlayhead(frameAtClientX(e.clientX));
                 }}
               >
+                {track.kind === "caption" &&
+                  tl!.captions
+                    .filter((c) => c.trackId === track.id)
+                    .map((c) => {
+                      const start = c.start + (drag?.kind === "caption" && drag.caption.id === c.id ? drag.delta : 0);
+                      return (
+                        <div
+                          key={c.id}
+                          className={`rf-caption-block${p.selectedCaption === c.id ? " is-selected" : ""}`}
+                          style={{ left: start * px, width: Math.max(2, c.duration * px) }}
+                          title={c.text}
+                          role="button"
+                          aria-pressed={p.selectedCaption === c.id}
+                          aria-label={`Caption: ${c.text}`}
+                          onPointerDown={(e) => {
+                            if (e.button !== 0) return;
+                            e.stopPropagation();
+                            p.onSelect(new Set());
+                            p.onSelectCaption(c.id);
+                            if (!track.locked) setDrag({ kind: "caption", caption: c, originX: e.clientX, delta: 0, moved: false });
+                          }}
+                        >
+                          <span className="rf-clip-label">{c.text}</span>
+                        </div>
+                      );
+                    })}
                 {tl!.clips
                   .filter((c) => (drag?.kind === "move" && drag.clip.id === c.id ? drag.trackId : c.trackId) === track.id)
                   .map((c) => {
                     let start = c.start;
                     let duration = c.duration;
                     let sourceIn = c.sourceIn;
-                    if (drag && drag.kind !== "playhead" && drag.clip.id === c.id) {
+                    if (drag && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id) {
                       if (drag.kind === "move") start += drag.delta;
                       else if (drag.kind === "trim-start") {
                         start += drag.delta;
@@ -345,7 +391,9 @@ export function Timeline(p: Props) {
                         sourceIn={sourceIn}
                         pxPerFrame={px}
                         selected={p.selection.has(c.id)}
-                        dragging={drag !== null && drag.kind !== "playhead" && drag.clip.id === c.id && drag.moved}
+                        markers={p.markers.get(c.id)}
+                        clipStart={start}
+                        dragging={drag !== null && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id && drag.moved}
                         onPointerDown={(e) => startClipDrag(e, c, track)}
                       />
                     );
@@ -429,6 +477,9 @@ interface ClipViewProps {
   selected: boolean;
   dragging: boolean;
   onPointerDown: (e: RPointerEvent) => void;
+  markers: { beats: number[]; cuts: number[] } | undefined;
+  /** Where the clip is drawn (may differ from clip.start while dragging). */
+  clipStart: number;
 }
 
 function ClipView(p: ClipViewProps) {
@@ -464,6 +515,12 @@ function ClipView(p: ClipViewProps) {
       {!!p.clip.props.transitionIn && <span className="rf-clip-transition" style={{ width: (p.clip.props.transitionIn / 2) * p.pxPerFrame }} title="Dissolve / crossfade in" />}
       {!!p.clip.props.fadeIn && <span className="rf-clip-fade rf-clip-fade-in" style={{ width: p.clip.props.fadeIn * p.pxPerFrame }} />}
       {!!p.clip.props.fadeOut && <span className="rf-clip-fade rf-clip-fade-out" style={{ width: p.clip.props.fadeOut * p.pxPerFrame }} />}
+      {p.markers?.beats.map((f) => (
+        <span key={`b${f}`} className="rf-marker rf-marker-beat" style={{ left: (f - p.clip.start) * p.pxPerFrame }} aria-hidden="true" />
+      ))}
+      {p.markers?.cuts.map((f) => (
+        <span key={`s${f}`} className="rf-marker rf-marker-cut" style={{ left: (f - p.clip.start) * p.pxPerFrame }} aria-hidden="true" />
+      ))}
       <span className="rf-clip-handle rf-clip-handle-start" />
       <span className="rf-clip-handle rf-clip-handle-end" />
     </div>

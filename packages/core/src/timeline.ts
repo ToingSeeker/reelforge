@@ -11,6 +11,7 @@ import {
   type Actor,
   type ApplyOperationsInput,
   type Asset,
+  type Caption,
   type Clip,
   type HistoryInput,
   type Timeline,
@@ -27,7 +28,26 @@ interface TrackRow {
   muted: number;
   locked: number;
   hidden: number;
+  props: string;
 }
+
+interface CaptionRow {
+  id: string;
+  track_id: string;
+  start: number;
+  duration: number;
+  text: string;
+  words: string;
+}
+
+const toCaption = (r: CaptionRow): Caption => ({
+  id: r.id,
+  trackId: r.track_id,
+  start: r.start,
+  duration: r.duration,
+  text: r.text,
+  words: JSON.parse(r.words) as Caption["words"],
+});
 
 interface ClipRow {
   id: string;
@@ -39,15 +59,19 @@ interface ClipRow {
   props: string;
 }
 
-const toTrack = (r: TrackRow): Track => ({
-  id: r.id,
-  kind: r.kind,
-  name: r.name,
-  position: r.position,
-  muted: r.muted === 1,
-  locked: r.locked === 1,
-  hidden: r.hidden === 1,
-});
+const toTrack = (r: TrackRow): Track => {
+  const props = JSON.parse(r.props ?? "{}") as { captionStyle?: Track["captionStyle"] };
+  return {
+    id: r.id,
+    kind: r.kind,
+    name: r.name,
+    position: r.position,
+    muted: r.muted === 1,
+    locked: r.locked === 1,
+    hidden: r.hidden === 1,
+    ...(props.captionStyle ? { captionStyle: props.captionStyle } : {}),
+  };
+};
 
 const toClip = (r: ClipRow): Clip => ({
   id: r.id,
@@ -83,6 +107,9 @@ export class TimelineStore {
     const clips = (
       this.#db.prepare("SELECT * FROM clips WHERE project_id = ? ORDER BY start, id").all(project.id) as unknown as ClipRow[]
     ).map(toClip);
+    const captions = (
+      this.#db.prepare("SELECT * FROM captions WHERE project_id = ? ORDER BY start, id").all(project.id) as unknown as CaptionRow[]
+    ).map(toCaption);
     const assets = (
       this.#db.prepare("SELECT * FROM assets WHERE project_id = ? ORDER BY created_at, filename").all(project.id) as never[]
     ).map((r) => toAsset(r, project.settings.fps, checkFiles));
@@ -90,25 +117,31 @@ export class TimelineStore {
       fps: project.settings.fps,
       tracks: new Map(tracks.map((t) => [t.id, t])),
       clips: new Map(clips.map((c) => [c.id, c])),
+      captions: new Map(captions.map((c) => [c.id, c])),
       assets: new Map(assets.map((a) => [a.id, a])),
     };
-    return { project, tracks, clips, assets, state };
+    return { project, tracks, clips, captions, assets, state };
   }
 
   get(projectId: string): Timeline {
     const pid = parse(ProjectIdSchema, projectId);
-    const { project, tracks, clips, assets } = this.#load(pid, true);
-    return this.#view(project.id, project, tracks, clips, assets);
+    const { project, tracks, clips, captions, assets } = this.#load(pid, true);
+    return this.#view(project.id, project, tracks, clips, captions, assets);
   }
 
-  #view(projectId: string, project: Timeline["project"], tracks: Track[], clips: Clip[], assets: Asset[]): Timeline {
+  #view(projectId: string, project: Timeline["project"], tracks: Track[], clips: Clip[], captions: Caption[], assets: Asset[]): Timeline {
     const flag = (sql: string) => this.#db.prepare(sql).get(projectId) !== undefined;
     return {
       project,
       tracks,
       clips,
+      captions,
       assets,
-      durationFrames: clips.reduce((m, c) => Math.max(m, clipEnd(c)), 0),
+      // Captions count too: a caption past the last clip still has to be on screen.
+      durationFrames: Math.max(
+        clips.reduce((m, c) => Math.max(m, clipEnd(c)), 0),
+        captions.reduce((m, c) => Math.max(m, c.start + c.duration), 0),
+      ),
       history: {
         canUndo: flag("SELECT 1 FROM edit_operations WHERE project_id = ? AND undoable = 1 AND state = 'applied' LIMIT 1"),
         canRedo: flag("SELECT 1 FROM edit_operations WHERE project_id = ? AND state = 'undone' LIMIT 1"),
@@ -181,9 +214,14 @@ export class TimelineStore {
   /** Write one side of a diff. Tracks first and clip deletes before upserts keep FKs satisfied. */
   #write(projectId: string, diff: TimelineDiff, side: "before" | "after") {
     const upsertTrack = this.#db.prepare(
-      `INSERT INTO tracks (id, project_id, kind, name, position, muted, locked, hidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO tracks (id, project_id, kind, name, position, muted, locked, hidden, props) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, name = excluded.name, position = excluded.position,
-         muted = excluded.muted, locked = excluded.locked, hidden = excluded.hidden`,
+         muted = excluded.muted, locked = excluded.locked, hidden = excluded.hidden, props = excluded.props`,
+    );
+    const upsertCaption = this.#db.prepare(
+      `INSERT INTO captions (id, project_id, track_id, start, duration, text, words) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET track_id = excluded.track_id, start = excluded.start, duration = excluded.duration,
+         text = excluded.text, words = excluded.words`,
     );
     const upsertClip = this.#db.prepare(
       `INSERT INTO clips (id, project_id, track_id, asset_id, start, duration, source_in, props) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -192,7 +230,7 @@ export class TimelineStore {
     );
     for (const ch of diff.tracks) {
       const t = ch[side];
-      if (t) upsertTrack.run(t.id, projectId, t.kind, t.name, t.position, +t.muted, +t.locked, +t.hidden);
+      if (t) upsertTrack.run(t.id, projectId, t.kind, t.name, t.position, +t.muted, +t.locked, +t.hidden, JSON.stringify(t.captionStyle ? { captionStyle: t.captionStyle } : {}));
     }
     for (const ch of diff.clips) {
       if (!ch[side]) this.#db.prepare("DELETE FROM clips WHERE id = ? AND project_id = ?").run(ch.id, projectId);
@@ -201,6 +239,13 @@ export class TimelineStore {
       const c = ch[side];
       // Diffs recorded before clip props existed have none.
       if (c) upsertClip.run(c.id, projectId, c.trackId, c.assetId, c.start, c.duration, c.sourceIn, JSON.stringify(c.props ?? {}));
+    }
+    for (const ch of diff.captions ?? []) {
+      if (!ch[side]) this.#db.prepare("DELETE FROM captions WHERE id = ? AND project_id = ?").run(ch.id, projectId);
+    }
+    for (const ch of diff.captions ?? []) {
+      const c = ch[side];
+      if (c) upsertCaption.run(c.id, projectId, c.trackId, c.start, c.duration, c.text, JSON.stringify(c.words));
     }
     for (const ch of diff.tracks) {
       if (!ch[side]) this.#db.prepare("DELETE FROM tracks WHERE id = ? AND project_id = ?").run(ch.id, projectId);

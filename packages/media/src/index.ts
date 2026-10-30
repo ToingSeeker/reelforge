@@ -4,3 +4,8 @@ export { importMedia, relinkMedia, MAX_IMPORT_BATCH, type ImportResult, type Imp
 export { compileRender, exportSettings, previewSettings, frameSeconds, AUDIO_RATE } from "./compile.ts";
 export { ensureProxy } from "./proxy.ts";
 export { RenderRunner, createRenderJob, retryRenderJob, validateExportPath, verifyOutput } from "./render.ts";
+export { AnalysisRunner } from "./analysis/runner.ts";
+export { detectScenes } from "./analysis/scenes.ts";
+export { detectBeats, beatsFromSamples, onsetEnvelope, estimateTempo, trackBeats } from "./analysis/beats.ts";
+export { transcribe, interpretWhisper, whisperModelPath, vadModelPath, WHISPER_MODEL, VAD_MODEL } from "./analysis/transcribe.ts";
+export { rasterizeCaption, prepareCaptionOverlays, encodePng, loadFont, fontsDir } from "./captions.ts";

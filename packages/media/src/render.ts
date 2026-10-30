@@ -5,6 +5,7 @@ import { AssetStore, JobStore, ReelForgeError, type Database, type JobKind, type
 import { compileRender, exportSettings, previewSettings } from "./compile.ts";
 import { ffmpegBin, ffprobeBin, run } from "./ffmpeg.ts";
 import { ensureProxy } from "./proxy.ts";
+import { prepareCaptionOverlays } from "./captions.ts";
 
 /**
  * Where an export may be written: an absolute .mp4 path in an existing
@@ -132,6 +133,7 @@ export class RenderRunner {
     const state: Running = { child: null, cancelled: false };
     this.#running.set(jobId, state);
     let tmp: string | null = null;
+    let captionDir: string | null = null;
 
     try {
       // analyzing: every source still where the plan says, proxies ready for previews
@@ -151,10 +153,15 @@ export class RenderRunner {
       mkdirSync(dirname(final), { recursive: true });
       tmp = join(dirname(final), `.${basename(final, ".mp4")}.partial-${jobId}.mp4`);
 
+      // Captions are rasterised by us (FFmpeg builds often lack libass) into a temp PNG sequence.
+      const work = join(this.#cacheDir, "work", jobId);
+      captionDir = work;
+      const overlays = plan.captions.length ? prepareCaptionOverlays(plan, job.settings.width, job.settings.height, work) : [];
+
       // rendering
       if (!this.#jobs.advance(jobId, "rendering", 0.05)) return;
       const totalUs = (plan.totalFrames * plan.fps.den * 1_000_000) / plan.fps.num;
-      await this.#ffmpeg(compileRender({ plan, settings: job.settings, inputs, output: tmp }), state, (outUs, end) => {
+      await this.#ffmpeg(compileRender({ plan, settings: job.settings, inputs, output: tmp, overlays }), state, (outUs, end) => {
         if (end) return this.#jobs.advance(jobId, "muxing", 0.99);
         return this.#jobs.advance(jobId, "rendering", 0.05 + 0.93 * Math.min(1, outUs / totalUs));
       });
@@ -183,6 +190,7 @@ export class RenderRunner {
       }
     } finally {
       if (tmp) rmSync(tmp, { force: true });
+      if (captionDir) rmSync(captionDir, { recursive: true, force: true });
     }
   }
 

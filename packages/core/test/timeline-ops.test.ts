@@ -23,6 +23,7 @@ function state(clips: Clip[] = [], trackPatch: Partial<Record<string, Partial<Tr
     fps: { num: 30, den: 1 },
     tracks: new Map(tracks.map((t) => [t.id, t])),
     clips: new Map(clips.map((c) => [c.id, c])),
+    captions: new Map(),
     assets: new Map(assets.map((a) => [a.id, a])),
   };
 }

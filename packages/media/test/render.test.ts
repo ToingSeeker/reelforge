@@ -277,3 +277,41 @@ test("audio gain and fades", async (t) => {
   assert.ok(meanVolume(out, 2.0, 0.15) < ref - 10, "start of the fade-in is much quieter");
   assert.ok(Math.abs(meanVolume(out, 2.85, 0.1) - ref) < 3, "end of the fade-in is at full level");
 });
+
+test("burned-in captions: word highlight moves on the right frame, track style applies", async (t) => {
+  const s = await project(t, { width: 540, height: 960 });
+  const cc = new TimelineStore(s.db).get(s.projectId).tracks.find((x) => x.kind === "caption")!.id;
+  s.edit([
+    { type: "clip.add", trackId: s.track("Video"), assetId: s.ids.blue, start: 0, duration: 60 },
+    // two five-letter words, so the split between them sits on the frame centre
+    { type: "caption.add", trackId: cc, start: 10, duration: 40, text: "Every story", words: [{ text: "Every", start: 0, end: 15 }, { text: "story", start: 15, end: 40 }] },
+    { type: "track.update", trackId: cc, captionStyle: { y: 0.5, highlight: "#00ff00", color: "#ffffff", shadow: false } },
+  ]);
+  const out = join(s.home, "captions.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  // Count highlight-green and white pixels in the left / right half of the caption row.
+  const row = (frame: number) => {
+    const buf = execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", out, "-vf", `select=eq(n\\,${frame}),format=rgb24,crop=540:120:0:420`, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+    const count = { lg: 0, rg: 0, lw: 0, rw: 0 };
+    for (let i = 0; i < buf.length; i += 3) {
+      const x = (i / 3) % 540;
+      const [r, g, b] = [buf[i]!, buf[i + 1]!, buf[i + 2]!];
+      const green = g > 200 && r < 90 && b < 90;
+      const white = r > 220 && g > 220 && b > 220;
+      if (green) x < 270 ? count.lg++ : count.rg++;
+      if (white) x < 270 ? count.lw++ : count.rw++;
+    }
+    return count;
+  };
+  const none = row(5);
+  assert.equal(none.lg + none.rg + none.lw + none.rw, 0, "nothing before the caption starts");
+  const first = row(12);
+  assert.ok(first.lg > 200 && first.rw > 200 && first.rg < 20, `"EVERY" lit, "STORY" white: ${JSON.stringify(first)}`);
+  const second = row(30);
+  assert.ok(second.rg > 200 && second.lw > 200 && second.lg < 20, `"STORY" lit, "EVERY" white: ${JSON.stringify(second)}`);
+  // exactly at the word boundary (caption start 10 + word start 15 = frame 25)
+  assert.ok(row(24).lg > 200 && row(25).rg > 200 && row(25).lg < 20, "highlight switches on frame 25, not before or after");
+  const gone = row(55);
+  assert.equal(gone.lg + gone.rg + gone.lw + gone.rw, 0, "gone after the caption ends");
+  assert.equal(readdirSync(join(s.home, "cache", "work")).length, 0, "caption frames cleaned up");
+});

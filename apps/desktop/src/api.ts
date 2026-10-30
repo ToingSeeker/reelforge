@@ -1,4 +1,4 @@
-import type { Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
+import type { Analysis, AnalysisKind, Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
 
 // The desktop UI never touches SQLite: it talks to the same core through the
 // local REST sidecar that the Rust shell starts (or, in a plain browser during
@@ -63,6 +63,18 @@ export function createClient(info: ApiInfo) {
     mediaUrl: (id: string, assetId: string) => `${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/media?${q}`,
     thumbnailUrl: (id: string, assetId: string) => `${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/thumbnail?${q}`,
     outputUrl: (jobId: string) => `${info.url}/v1/jobs/${encodeURIComponent(jobId)}/output?${q}`,
+    fontUrl: (file: string) => `${info.url}/v1/fonts/${encodeURIComponent(file)}?${q}`,
+    analyze: (id: string, assetId: string, kinds: AnalysisKind[], language?: string) =>
+      request<{ analyses: Analysis[] }>("POST", `/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/analyze`, { kinds, ...(language ? { language } : {}) }).then((r) => r.analyses),
+    analyses: (id: string) => request<{ analyses: Record<string, Analysis[]> }>("GET", `/v1/projects/${encodeURIComponent(id)}/analyses`).then((r) => r.analyses),
+    generateCaptions: (id: string, body: { trackId?: string; sourceTrackIds?: string[]; maxWords?: number; language?: string; baseRevision?: number }) =>
+      request<{ status: "applied" | "transcribing"; count?: number; missing?: { assetId: string; filename: string; state: string | null }[]; timeline?: Timeline }>(
+        "POST",
+        `/v1/projects/${encodeURIComponent(id)}/captions/generate`,
+        body,
+      ),
+    exportSrt: (id: string, outputPath: string, trackId?: string) =>
+      request<{ path: string }>("POST", `/v1/projects/${encodeURIComponent(id)}/captions/export-srt`, { outputPath, ...(trackId ? { trackId } : {}) }),
     listProjects: () => request<{ projects: Project[] }>("GET", "/v1/projects").then((r) => r.projects),
     createProject: (input: CreateProjectInput) =>
       request<{ project: Project }>("POST", "/v1/projects", input).then((r) => r.project),

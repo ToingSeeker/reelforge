@@ -94,6 +94,30 @@ then encoded as BT.709 limited range with all four colour tags set on the frames
 lets frame properties override encoder flags. Proxies get the same conversion so the browser decodes them to the same
 colours the export produces.
 
+## Media intelligence
+
+| Analysis | Engine | Result (stored per asset) |
+|---|---|---|
+| `scenes` | FFmpeg `scdet` on the proxy | cut times (µs) + scores |
+| `beats` | `media/src/analysis/beats.ts` (FFT, onsets, tempo, DP tracking) | BPM, confidence, beat times |
+| `transcript` | `whisper-cli` large-v3-turbo + Silero VAD | language, segments, words with times and confidence |
+
+Analyses run in an `AnalysisRunner` (one at a time; speech uses the GPU) with their state in the `analyses` table,
+so the desktop, CLI and MCP all see progress. Models live in the app-data `models/` folder (shared by every workspace;
+`REELFORGE_MODELS` overrides), fetched by `scripts/download-models.sh`.
+
+`buildProjectContext` (core) is the planner's view of a project: settings, assets with analysis summaries, timeline
+and captions in frames and seconds, and the accepted operation types.
+
+## Captions
+
+Captions are rows on a caption track (`captions` table) with word timings relative to the caption start; the look is
+the track's `captionStyle`. `layoutCaption` (core) places every word; the export rasterises glyph outlines from the
+bundled OFL fonts (`assets/fonts`) into one RGBA image per visual state (each word start), writes each state once as
+PNG and hard-links it for every frame, then FFmpeg overlays that image sequence frame-exactly. We do this ourselves
+because common FFmpeg builds (Homebrew's included) ship without libass/drawtext. The live preview draws the same
+layout with the same fonts on its canvas.
+
 ## REST API (v1)
 
 | Method | Path | |
@@ -112,6 +136,12 @@ colours the export produces.
 | GET | `/v1/projects/:id/jobs?kind=` · `/artifacts` | job list · finished exports |
 | GET | `/v1/jobs/:id` · POST `/cancel` · `/retry` | job status and control |
 | GET | `/v1/jobs/:id/output` | rendered MP4, supports `Range` |
+| POST/GET | `/v1/projects/:id/assets/:assetId/analyze` · `/analysis` | queue analyses · read them |
+| GET | `/v1/projects/:id/analyses` | every analysis in the project, by asset |
+| POST | `/v1/projects/:id/captions/generate` | 202 `transcribing` (missing transcripts queued) or 200 `applied` |
+| GET · POST | `/v1/projects/:id/captions.srt` · `/captions/export-srt` | SubRip text · write it to a chosen path |
+| GET | `/v1/projects/:id/context` | structured project context for planners |
+| GET | `/v1/fonts/:file` | bundled caption fonts (media route) |
 | GET | `/v1/projects/:id/assets/:assetId/media` | what the live preview plays: video proxy, still proxy or original audio (`Range`) |
 
 Media GET routes (`media`, `thumbnail`, job `output`) also accept `?token=` because media elements cannot send headers.

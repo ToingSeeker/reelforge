@@ -25,9 +25,11 @@ export interface CompileOptions {
   /** Path to read for each asset (original or proxy). */
   inputs: Record<string, string>;
   output: string;
+  /** Pre-rendered caption tracks (PNG sequences we generated), composited on top. */
+  overlays?: { pattern: string; startFrame: number; frames: number; y: number }[];
 }
 
-export function compileRender({ plan, settings, inputs, output }: CompileOptions): string[] {
+export function compileRender({ plan, settings, inputs, output, overlays = [] }: CompileOptions): string[] {
   const fps = `${plan.fps.num}/${plan.fps.den}`;
   const W = settings.width;
   const H = settings.height;
@@ -95,6 +97,14 @@ export function compileRender({ plan, settings, inputs, output }: CompileOptions
       v++;
     }
   }
+  overlays.forEach((o, k) => {
+    // Our own temp-dir PNG sequence: image2 is safe here (no user-controlled names), one file per frame.
+    args.push("-protocol_whitelist", "file", "-framerate", fps, "-start_number", "0", "-f", "image2", "-i", `file:${o.pattern}`);
+    const i = n++;
+    filters.push(`[${i}:v]format=rgba,trim=end_frame=${o.frames},settb=${plan.fps.den}/${plan.fps.num},setpts=PTS-STARTPTS+${o.startFrame}[cap${k}]`);
+    filters.push(`[${composite}][cap${k}]overlay=x=0:y=${o.y}:eof_action=pass:repeatlast=0:format=rgb[cc${k}]`);
+    composite = `cc${k}`;
+  });
   filters.push(
     `[${composite}]scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,` +
       // Frame colour properties win over encoder flags in current FFmpeg, so set all four here.

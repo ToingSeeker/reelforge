@@ -1,12 +1,20 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import {
   ActorSchema,
+  AnalysisStore,
+  ANALYSIS_KINDS,
   AssetStore,
+  buildProjectContext,
+  CAPTION_FONTS,
+  captionsToSrt,
   isReelForgeError,
   JobStore,
+  OPERATION_TYPES,
+  planCaptions,
+  type AnalysisKind,
   ProjectStore,
   ReelForgeError,
   TimelineStore,
@@ -14,7 +22,8 @@ import {
   type Database,
   type ErrorCode,
 } from "@reelforge/core";
-import { createRenderJob, ensureProxy, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, ensureProxy, ensureThumbnail, fontsDir, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import { join } from "node:path";
 
 // Local REST API (PRD §15). Loopback only, bearer token always required,
 // Host/Origin checked so a web page can't reach it via DNS rebinding.
@@ -151,6 +160,15 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
   const jobs = new JobStore(opts.db);
   const runner = new RenderRunner(opts.db, { cacheDir: opts.cacheDir });
   runner.start();
+  const analyses = new AnalysisStore(opts.db);
+  const analysisRunner = new AnalysisRunner(opts.db, { cacheDir: opts.cacheDir });
+  analysisRunner.start();
+  const analyze = (projectId: string, assetId: string, kinds: AnalysisKind[], params: Record<string, unknown>) => {
+    const queued = analyses.enqueue(projectId, assetId, kinds, params);
+    for (const a of queued) if (a.state === "queued") analysisRunner.enqueue(a.id);
+    return queued;
+  };
+  const fontFiles = new Set<string>(Object.values(CAPTION_FONTS));
   const body = (req: IncomingMessage) => readJson(req) as Promise<never>;
   const pathsOf = (b: unknown): string[] => {
     const paths = (b as { paths?: unknown })?.paths;
@@ -247,6 +265,96 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         const job = retryRenderJob(opts.db, id!);
         runner.enqueue(job.id);
         return send(res, 202, { job });
+      },
+    },
+    {
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/assets/${ID}/analyze`),
+      handle: async ({ req, res, params: [id, assetId] }) => {
+        const b = (await readJson(req)) as { kinds?: unknown; language?: unknown };
+        const kinds = (b.kinds ?? [...ANALYSIS_KINDS]) as AnalysisKind[];
+        if (!Array.isArray(kinds) || !kinds.length) throw new ReelForgeError("VALIDATION_ERROR", `kinds must be a non-empty array of ${ANALYSIS_KINDS.join(", ")}`);
+        return send(res, 202, { analyses: analyze(id!, assetId!, kinds, typeof b.language === "string" ? { language: b.language } : {}) });
+      },
+    },
+    {
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/assets/${ID}/analysis`),
+      handle: ({ res, params: [id, assetId] }) => send(res, 200, { analyses: analyses.list(id!, assetId!) }),
+    },
+    {
+      // Status of every analysis in the project (results included), keyed by asset.
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/analyses`),
+      handle: ({ res, params: [id] }) => send(res, 200, { analyses: Object.fromEntries(analyses.forProject(id!)) }),
+    },
+    {
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/captions/generate`),
+      handle: async ({ req, res, params: [id], actor }) => {
+        const b = (await readJson(req)) as { trackId?: string; sourceTrackIds?: string[]; maxWords?: number; language?: string; baseRevision?: number };
+        const plan = planCaptions(opts.db, id!, {
+          ...(b.trackId ? { trackId: b.trackId } : {}),
+          ...(b.sourceTrackIds ? { sourceTrackIds: b.sourceTrackIds } : {}),
+          ...(typeof b.maxWords === "number" ? { maxWords: Math.max(1, Math.min(12, Math.round(b.maxWords))) } : {}),
+        });
+        if (plan.missing.length) {
+          // Start the transcripts that are missing or stale; the client asks again when they finish.
+          for (const m of plan.missing) if (m.state !== "queued" && m.state !== "running") analyze(id!, m.assetId, ["transcript"], b.language ? { language: b.language } : {});
+          return send(res, 202, { status: "transcribing", missing: plan.missing });
+        }
+        const tl = timeline.get(id!);
+        const next = timeline.apply(id!, { baseRevision: b.baseRevision ?? tl.project.revision, operations: [{ type: "captions.replace", trackId: plan.trackId, captions: plan.captions }] }, actor);
+        return send(res, 200, { status: "applied", count: plan.captions.length, timeline: next });
+      },
+    },
+    {
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/captions\\.srt`),
+      handle: ({ req, res, params: [id] }) => {
+        const tl = timeline.get(id!);
+        const trackId = new URL(req.url ?? "", "http://x").searchParams.get("trackId") ?? tl.tracks.find((t) => t.kind === "caption")?.id;
+        const srt = captionsToSrt(tl.captions.filter((c) => c.trackId === trackId), tl.project.settings.fps);
+        res.writeHead(200, { "content-type": "application/x-subrip; charset=utf-8", "content-disposition": `attachment; filename="${tl.project.name.replace(/[^\w.-]+/g, "_")}.srt"` });
+        return res.end(srt);
+      },
+    },
+    {
+      // Desktop "Export SRT…": the webview can't write files, so the engine writes where the user chose.
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/captions/export-srt`),
+      handle: async ({ req, res, params: [id] }) => {
+        const b = (await readJson(req)) as { outputPath?: unknown; trackId?: string };
+        const out = b.outputPath;
+        if (typeof out !== "string" || !out.startsWith("/") || !out.toLowerCase().endsWith(".srt") || out.includes("\0")) {
+          throw new ReelForgeError("VALIDATION_ERROR", "outputPath must be an absolute .srt path");
+        }
+        const tl = timeline.get(id!);
+        const trackId = b.trackId ?? tl.tracks.find((t) => t.kind === "caption")?.id;
+        try {
+          writeFileSync(out, captionsToSrt(tl.captions.filter((c) => c.trackId === trackId), tl.project.settings.fps), { flag: "wx" });
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code === "EEXIST") throw new ReelForgeError("VALIDATION_ERROR", "a file already exists there; not overwriting it");
+          if (code === "ENOENT") throw new ReelForgeError("VALIDATION_ERROR", "that folder does not exist");
+          throw e;
+        }
+        return send(res, 200, { path: out });
+      },
+    },
+    {
+      // What an AI planner reads before proposing edits (M4, MCP).
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/context`),
+      handle: ({ res, params: [id] }) => send(res, 200, { context: buildProjectContext(timeline.get(id!), analyses.forProject(id!), OPERATION_TYPES) }),
+    },
+    {
+      method: "GET",
+      media: true,
+      pattern: re(`/v1/fonts/([A-Za-z0-9-]+\\.ttf)`),
+      handle: ({ req, res, params: [file] }) => {
+        if (!fontFiles.has(file!)) throw new ReelForgeError("NOT_FOUND", "unknown font");
+        return sendFile(req, res, join(fontsDir(), file!), "font/ttf");
       },
     },
     {
@@ -357,6 +465,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         close: () =>
           new Promise((r, j) => {
             runner.stop();
+            analysisRunner.stop();
             server.close((err) => (err ? j(err) : r()));
             // close() already drops idle sockets; also end in-flight ones so shutdown can't hang.
             server.closeAllConnections();

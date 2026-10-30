@@ -104,6 +104,35 @@ Known gaps carried forward:
 - The live preview has no limiter (the export applies a -1 dBFS limiter), so very hot mixes can sound louder live.
 - Colour grading (brightness/contrast/saturation/temperature/LUT) is still to do (PRD §12).
 
-## M3–M6
+## M3 — Media Intelligence ✅ (exit criterion met)
 
-Media Intelligence → AI Director → MCP & Automation → Alpha Release. See the PRD.
+**Exit criterion:** analysis produces structured data the AI Planner can consume. Verified: `GET /v1/projects/:id/context`
+(and `reelforge project context`) returns `reelforge.project-context/1` with per-asset scenes, tempo + beat times and
+timed transcripts, the timeline (clips, captions) in frames and seconds, and the list of accepted operation types.
+
+- [x] **Scene detection**: FFmpeg `scdet` on the proxy; cuts in source time with scores
+- [x] **Beat detection** with no dependencies: spectral-flux onsets, tempo by autocorrelation with a 120 BPM prior,
+      DP beat tracking; a confidence score so "no clear beat" is honest (120/90 BPM metronomes within 35 ms)
+- [x] **Local transcription**: whisper.cpp large-v3-turbo on Metal + Silero VAD, word timings from tokens; audio never
+      leaves the machine. Without VAD whisper wrote "*music*" / "Thank you." for music; with it, nothing
+- [x] Analyses are jobs in SQLite (queued/running/completed/failed, progress, stale when the file changes,
+      recovery after a crash, killed cleanly when the engine stops)
+- [x] **Captions**: generated from voice tracks (words mapped through each clip's trim and position, grouped at
+      pauses/punctuation/limits), one undoable `captions.replace`; editable text and timing; three presets; style kept
+      on the track apart from the text; SRT export
+- [x] **Burned-in captions without libass** (Homebrew FFmpeg has none): shared layout in core, our own anti-aliased
+      rasteriser from bundled OFL fonts (Anton, Poppins), frame-exact PNG sequence overlay; word highlight switches on
+      the exact frame. The live preview draws the same layout with the same fonts (visually identical in tests)
+- [x] Desktop: analysis status + Analyse on media cards, Captions panel (generate, style, editable list, SRT),
+      Beats & analysis panel, beat/scene markers on clips, snap to beats and scene cuts, caption blocks you can move
+- [x] CLI: `media analyze|analysis`, `captions generate|srt`, `project context`; `scripts/download-models.sh`
+- [x] 92 tests, incl. real whisper runs (skipped with a reason when the models aren't installed, e.g. CI)
+
+Known gaps carried forward:
+- Translation, advanced motion captions and auto-cut-to-beat edits are P1 (the planner gets beats/scenes to propose them).
+- Voice ducking and audio loudness analysis are not built yet.
+- No Indonesian system voice on this Mac, so the automated ASR test speaks English; Indonesian works the same way in whisper.
+
+## M4–M6
+
+AI Director → MCP & Automation → Alpha Release. See the PRD.

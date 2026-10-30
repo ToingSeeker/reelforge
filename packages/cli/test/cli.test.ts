@@ -188,3 +188,50 @@ test("clip set / --props: look and sound from the CLI, validated", async (t) => 
   assert.equal((await run("clip", "set", id, clip.id, "--props", '{"opacity":3}')).code, 2);
   assert.equal((await run("clip", "set", id, clip.id, "--props", "nope")).code, 2);
 });
+
+test("M3 from the CLI: beats, auto-transcribed captions, SRT, project context", { timeout: 300_000 }, async (t) => {
+  const { spawnSync, execFileSync } = await import("node:child_process");
+  const { existsSync, mkdtempSync, realpathSync, readFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { whisperModelPath } = await import("../../media/src/index.ts");
+  if (spawnSync("whisper-cli", ["--help"]).status !== 0 || !existsSync(whisperModelPath()) || spawnSync("which", ["say"]).status !== 0) {
+    return t.skip("needs whisper-cli, the large-v3-turbo model and macOS `say`");
+  }
+  const run = harness(t);
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-m3-")));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  execFileSync("say", ["-o", join(dir, "vo.aiff"), "Every cup tells a story. Crafted with passion."]);
+  execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", join(dir, "vo.aiff"), join(dir, "vo.wav")]);
+  execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "aevalsrc='0.8*sin(2*PI*1000*t)*lt(mod(t\\,0.5)\\,0.012)':s=44100:d=8", join(dir, "beat.wav")]);
+
+  const id = (await run("project", "create", "--name", "M3")).json.project.id;
+  const [vo, beat] = (await run("media", "import", id, join(dir, "vo.wav"), join(dir, "beat.wav"))).json.imported;
+  await run("clip", "add", id, "--track", "A2", "--asset", vo.id, "--start", "0");
+  await run("clip", "add", id, "--track", "A1", "--asset", beat.id, "--start", "0");
+
+  const beats = await run("media", "analyze", id, beat.id, "--kinds", "beats");
+  assert.equal(beats.code, 0, JSON.stringify(beats.error));
+  assert.ok(Math.abs(beats.json.analyses[0].result.bpm - 120) < 2);
+
+  // captions from the voice track only (the metronome on A1 is music, not speech)
+  const caps = await run("captions", "generate", id, "--source", "A2", "--max-words", "3");
+  assert.equal(caps.code, 0, JSON.stringify(caps.error));
+  assert.ok(caps.json.count >= 2);
+  assert.match(caps.json.captions.map((c: any) => c.text).join(" ").toLowerCase(), /every cup tells a story/);
+  assert.ok(caps.json.captions.every((c: any) => c.words.length > 0), "word timings for highlighting");
+
+  const srtPath = join(dir, "out.srt");
+  const srt = await run("captions", "srt", id, "--out", srtPath);
+  assert.equal(srt.code, 0);
+  assert.match(readFileSync(srtPath, "utf8"), /^1\n00:00:0\d,\d{3} --> /);
+  assert.equal((await run("captions", "srt", id, "--out", srtPath)).code, 2, "never overwrites");
+
+  const ctx = (await run("project", "context", id)).json.context;
+  assert.equal(ctx.schema, "reelforge.project-context/1");
+  const voCtx = ctx.assets.find((a: any) => a.id === vo.id);
+  assert.equal(voCtx.analysis.transcript.language, "en");
+  assert.ok(voCtx.analysis.transcript.segments.length >= 1);
+  assert.ok(ctx.assets.find((a: any) => a.id === beat.id).analysis.beats.beatsSeconds.length > 10);
+  assert.ok(ctx.timeline.captions.length >= 2);
+  assert.ok(ctx.operations.includes("captions.replace"));
+});

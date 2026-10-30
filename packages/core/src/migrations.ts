@@ -188,5 +188,44 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE clips ADD COLUMN props TEXT NOT NULL DEFAULT '{}';
     `,
   },
+  {
+    version: 5,
+    name: "analyses_and_captions",
+    sql: `
+      -- Per-asset media analysis. One row per (asset, kind); re-running replaces it.
+      CREATE TABLE analyses (
+        id          TEXT PRIMARY KEY,
+        asset_id    TEXT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+        kind        TEXT NOT NULL CHECK (kind IN ('scenes', 'beats', 'transcript')),
+        state       TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'failed')),
+        progress    REAL NOT NULL DEFAULT 0,
+        engine      TEXT,
+        params      TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(params)),
+        result      TEXT CHECK (result IS NULL OR json_valid(result)),
+        error       TEXT,
+        source_size INTEGER NOT NULL,
+        runner_pid  INTEGER,
+        created_at  TEXT NOT NULL,
+        finished_at TEXT,
+        UNIQUE (asset_id, kind)
+      ) STRICT;
+
+      -- Captions live on caption tracks. Word timings are relative to the caption start; the
+      -- look is the track's caption style, kept apart from the text (PRD §10).
+      CREATE TABLE captions (
+        id         TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+        track_id   TEXT NOT NULL REFERENCES tracks (id) ON DELETE CASCADE,
+        start      INTEGER NOT NULL CHECK (start >= 0),
+        duration   INTEGER NOT NULL CHECK (duration > 0),
+        text       TEXT NOT NULL,
+        words      TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(words))
+      ) STRICT;
+
+      CREATE INDEX captions_track ON captions (track_id, start);
+
+      ALTER TABLE tracks ADD COLUMN props TEXT NOT NULL DEFAULT '{}';
+    `,
+  },
 ];
 

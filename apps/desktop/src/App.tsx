@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Asset, ClipPropsPatch, Project, Timeline as TimelineData, TimelineOp } from "@reelforge/core/schema";
+import type { Asset, CaptionStylePatch, ClipPropsPatch, Project, Timeline as TimelineData, TimelineOp } from "@reelforge/core/schema";
 import { canPlace, clipEnd } from "@reelforge/core/timeline-ops";
 import { formatClock } from "@reelforge/core/timebase";
 import { createClient, resolveApiInfo, type Client } from "./api.ts";
@@ -7,6 +7,11 @@ import { useEditor } from "./editor.ts";
 import { onFileDrop, pickExportPath, pickMediaFiles } from "./native.ts";
 import { useExports, usePreview } from "./render.ts";
 import { RenderQueue } from "./components/RenderQueue.tsx";
+import { CaptionsPanel } from "./components/CaptionsPanel.tsx";
+import { AudioPanel } from "./components/AudioPanel.tsx";
+import { analysisOf, useAnalyses } from "./analyses.ts";
+import { beatsOnTimeline } from "@reelforge/core/context";
+import { microsToFrames } from "@reelforge/core/timebase";
 import { TopBar, type Workspace } from "./components/TopBar.tsx";
 import { LeftRail, type RailItem } from "./components/LeftRail.tsx";
 import { MediaLibrary } from "./components/MediaLibrary.tsx";
@@ -57,6 +62,9 @@ export function App() {
   const [previewMode, setPreviewMode] = useState<PreviewMode>(() => (readPref("rf.previewMode") === "rendered" ? "rendered" : "live"));
   const [rightTab, setRightTab] = useState<"inspector" | "director">("director");
   const [draft, setDraft] = useState<{ clipId: string; props: ClipPropsPatch } | null>(null);
+  const [styleDraft, setStyleDraft] = useState<{ trackId: string; style: CaptionStylePatch } | null>(null);
+  const [selectedCaption, setSelectedCaption] = useState<string | null>(null);
+  const [snapToBeats, setSnapToBeats] = useState(() => readPref("rf.snapBeats") !== "0");
   const [importing, setImporting] = useState(false);
   const [fileHover, setFileHover] = useState(false);
   const [assetDrag, setAssetDrag] = useState<{ asset: Asset; x: number; y: number } | null>(null);
@@ -125,11 +133,33 @@ export function App() {
 
   const preview = usePreview(client, tl, previewMode === "rendered");
   const selectedClip = selection.size === 1 && tl ? (tl.clips.find((c) => selection.has(c.id)) ?? null) : null;
-  // The live preview shows inspector drags before they are committed.
+  // The live preview shows inspector / caption-style drags before they are committed.
   const viewTimeline = useMemo<TimelineData | null>(() => {
-    if (!tl || !draft) return tl;
-    return { ...tl, clips: tl.clips.map((c) => (c.id === draft.clipId ? { ...c, props: { ...c.props, ...draft.props } } : c)) };
-  }, [tl, draft]);
+    if (!tl || (!draft && !styleDraft)) return tl;
+    return {
+      ...tl,
+      clips: draft ? tl.clips.map((c) => (c.id === draft.clipId ? { ...c, props: { ...c.props, ...draft.props } } : c)) : tl.clips,
+      tracks: styleDraft ? tl.tracks.map((t) => (t.id === styleDraft.trackId ? { ...t, captionStyle: { ...t.captionStyle, ...styleDraft.style } } : t)) : tl.tracks,
+    };
+  }, [tl, draft, styleDraft]);
+  const analyses = useAnalyses(client, current?.id ?? null, notify);
+  // Beat and scene-cut positions on the timeline, per clip (markers + snapping).
+  const markers = useMemo(() => {
+    const m = new Map<string, { beats: number[]; cuts: number[] }>();
+    if (!tl) return m;
+    const fps = tl.project.settings.fps;
+    for (const c of tl.clips) {
+      const beats = analysisOf(analyses.map, c.assetId, "beats");
+      const scenes = analysisOf(analyses.map, c.assetId, "scenes");
+      const b = beats?.result && beats.result.confidence >= 0.3 ? beatsOnTimeline(c, beats.result, fps) : [];
+      const cuts = scenes?.result
+        ? scenes.result.cuts.map((x) => microsToFrames(x.timeUs, fps, "nearest")).filter((f) => f > c.sourceIn && f < c.sourceIn + c.duration).map((f) => c.start + f - c.sourceIn)
+        : [];
+      if (b.length || cuts.length) m.set(c.id, { beats: b, cuts });
+    }
+    return m;
+  }, [tl, analyses.map]);
+  const snapExtra = useMemo(() => (snapToBeats ? [...markers.values()].flatMap((x) => [...x.beats, ...x.cuts]) : []), [markers, snapToBeats]);
   useEffect(() => {
     if (selectedClip) setRightTab("inspector");
     setDraft(null);
@@ -143,6 +173,7 @@ export function App() {
 
   useEffect(() => {
     setSelection(new Set());
+    setSelectedCaption(null);
     setPlayhead(0);
     setPlaying(false);
   }, [current?.id]);
@@ -224,6 +255,11 @@ export function App() {
   };
 
   const remove = (ripple: boolean) => {
+    if (!selection.size && selectedCaption) {
+      apply("Delete caption", [{ type: "caption.delete", captionIds: [selectedCaption] }]);
+      setSelectedCaption(null);
+      return;
+    }
     if (!selection.size) return;
     apply(ripple ? "Ripple delete" : "Delete", [{ type: "clip.delete", clipIds: Array.from(selection), ...(ripple ? { ripple } : {}) }]);
     setSelection(new Set());
@@ -346,6 +382,33 @@ export function App() {
               onAppend={appendAsset}
               onRelink={(a) => void relink(a)}
               onDragStart={(asset, e) => setAssetDrag({ asset, x: e.clientX, y: e.clientY })}
+              analyses={analyses.map}
+              onAnalyze={(a, kinds) => void analyses.analyze(a.id, kinds)}
+            />
+          ) : rail === "text" && tl ? (
+            <CaptionsPanel
+              client={client}
+              timeline={tl}
+              analyses={analyses.map}
+              notify={notify}
+              selectedCaption={selectedCaption}
+              onSelectCaption={setSelectedCaption}
+              onSeek={seek}
+              onApply={apply}
+              onStyleDraft={(trackId, style) => setStyleDraft(style ? { trackId, style } : null)}
+              onTimelineReplaced={() => void editor.reload()}
+            />
+          ) : rail === "audio" && tl ? (
+            <AudioPanel
+              timeline={tl}
+              clip={selectedClip}
+              analyses={analyses.map}
+              snapToBeats={snapToBeats}
+              onSnapToBeats={(v) => {
+                setSnapToBeats(v);
+                writePref("rf.snapBeats", v ? "1" : "0");
+              }}
+              onAnalyze={(a, kinds) => void analyses.analyze(a.id, kinds)}
             />
           ) : (
             <RailPlaceholder item={rail} />
@@ -397,6 +460,13 @@ export function App() {
               dropHandler.current = h;
             }}
             assetDragging={assetDrag?.asset ?? null}
+            markers={markers}
+            snapExtra={snapExtra}
+            selectedCaption={selectedCaption}
+            onSelectCaption={(id) => {
+              setSelectedCaption(id);
+              if (id) setRail("text");
+            }}
           />
         </div>
       )}

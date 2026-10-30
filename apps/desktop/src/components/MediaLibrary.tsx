@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState, type PointerEvent as RPointerEvent } from "react";
-import type { Asset } from "@reelforge/core/schema";
+import type { AnalysisKind, Asset } from "@reelforge/core/schema";
+import { analysisOf, type AnalysisMap } from "../analyses.ts";
 import { formatClock, type Rational } from "@reelforge/core/timebase";
 import type { Client } from "../api.ts";
 import { useThumbnail } from "../editor.ts";
@@ -19,6 +20,46 @@ interface Props {
   onAppend: (asset: Asset) => void;
   onRelink: (asset: Asset) => void;
   onDragStart: (asset: Asset, e: PointerEvent) => void;
+  analyses: AnalysisMap;
+  onAnalyze: (asset: Asset, kinds: AnalysisKind[]) => void;
+}
+
+function kindsFor(a: Asset): AnalysisKind[] {
+  if (a.kind === "image") return [];
+  return [...(a.kind === "video" ? (["scenes"] as const) : []), ...(a.hasAudio ? (["beats", "transcript"] as const) : [])];
+}
+
+/** One-line summary of what analysis found (or how far it got). */
+function AnalysisLine({ asset, analyses, onAnalyze }: { asset: Asset; analyses: AnalysisMap; onAnalyze: Props["onAnalyze"] }) {
+  const kinds = kindsFor(asset);
+  if (!kinds.length || asset.status === "missing") return null;
+  const items = kinds.map((k) => analysisOf(analyses, asset.id, k)).filter(Boolean);
+  const running = items.find((a) => a!.state === "queued" || a!.state === "running");
+  if (running) {
+    return (
+      <div className="rf-asset-analysis is-running" role="status">
+        <span className="rf-spinner" aria-hidden="true" /> {running.kind === "transcript" ? "Transcribing" : `Analysing ${running.kind}`}{" "}
+        {running.state === "running" ? `${Math.round(running.progress * 100)}%` : "(queued)"}
+      </div>
+    );
+  }
+  const parts: string[] = [];
+  const scenes = analysisOf(analyses, asset.id, "scenes");
+  const beats = analysisOf(analyses, asset.id, "beats");
+  const tr = analysisOf(analyses, asset.id, "transcript");
+  if (scenes?.result) parts.push(`${scenes.result.cuts.length + 1} scene${scenes.result.cuts.length ? "s" : ""}`);
+  if (beats?.result) parts.push(beats.result.confidence >= 0.3 ? `${Math.round(beats.result.bpm)} BPM` : "no clear beat");
+  if (tr?.result) parts.push(tr.result.segments.length ? `speech · ${tr.result.language}` : "no speech");
+  const failed = items.find((a) => a!.state === "failed");
+  const stale = items.some((a) => a!.stale);
+  return (
+    <div className="rf-asset-analysis">
+      <span title={failed?.error ?? undefined}>{failed ? "Analysis failed" : parts.join(" · ") || "Not analysed"}{stale ? " · outdated" : ""}</span>
+      <button className="rf-link-btn" onClick={() => onAnalyze(asset, kinds)} title={`Detect ${kinds.join(", ")} (runs locally)`}>
+        <Icon name="sparkle" size={12} /> {parts.length || failed ? "Re-run" : "Analyse"}
+      </button>
+    </div>
+  );
 }
 
 export function MediaLibrary(p: Props) {
@@ -77,7 +118,7 @@ export function MediaLibrary(p: Props) {
 
 const KIND_ICON: Record<Asset["kind"], IconName> = { video: "film", audio: "audio", image: "media" };
 
-function AssetCard({ asset, client, projectId, fps, onAppend, onRelink, onDragStart }: Props & { asset: Asset }) {
+function AssetCard({ asset, client, projectId, fps, onAppend, onRelink, onDragStart, analyses, onAnalyze }: Props & { asset: Asset }) {
   const thumb = useThumbnail(client, projectId ?? "", asset);
   const down = useRef<{ x: number; y: number } | null>(null);
 
@@ -129,6 +170,7 @@ function AssetCard({ asset, client, projectId, fps, onAppend, onRelink, onDragSt
           </button>
         )}
       </div>
+      <AnalysisLine asset={asset} analyses={analyses} onAnalyze={onAnalyze} />
     </li>
   );
 }

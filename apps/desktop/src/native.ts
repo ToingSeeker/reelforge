@@ -39,3 +39,13 @@ export async function pickExportPath(suggestedName: string): Promise<string | nu
   if (!path) return null;
   return path.toLowerCase().endsWith(".mp4") ? path : `${path}.mp4`;
 }
+
+/** Native save dialog for subtitles. */
+export async function pickSrtPath(suggestedName: string): Promise<string | null> {
+  const name = `${suggestedName.replace(/[\\/:*?"<>|]+/g, "-").trim() || "captions"}.srt`;
+  if (!isTauri()) return window.prompt("Absolute .srt path (browser dev mode):", `/tmp/${name}`) || null;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const path = await save({ title: "Export subtitles", defaultPath: name, filters: [{ name: "SubRip subtitles", extensions: ["srt"] }] });
+  if (!path) return null;
+  return path.toLowerCase().endsWith(".srt") ? path : `${path}.srt`;
+}

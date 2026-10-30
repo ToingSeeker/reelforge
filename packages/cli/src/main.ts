@@ -1,11 +1,18 @@
 import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  AnalysisStore,
+  ANALYSIS_KINDS,
   AssetStore,
+  buildProjectContext,
+  captionsToSrt,
   isReelForgeError,
   JobStore,
+  OPERATION_TYPES,
+  planCaptions,
+  type AnalysisKind,
   openDatabase,
   parseFps,
   parseTime,
@@ -20,7 +27,7 @@ import {
   type ErrorCode,
   type TimelineOp,
 } from "@reelforge/core";
-import { createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 
 // Every command prints exactly one JSON document to stdout (errors go to
@@ -60,6 +67,12 @@ Usage:
   reelforge clip delete <project> <clip>... [--ripple]
   reelforge clip set <project> <clip> --props '{"opacity":0.5,"fadeIn":15,"transitionIn":10,"gainDb":-6}'
                    (also on clip add; fields: fit scale scaleEnd x y rotation opacity crop* fadeIn fadeOut transitionIn gainDb)
+
+  reelforge media analyze <project> <asset> [--kinds scenes,beats,transcript] [--language auto|id|en…]
+  reelforge media analysis <project> <asset>
+  reelforge captions generate <project> [--track C1] [--source A1,A2] [--max-words 3] [--language auto]
+  reelforge captions srt <project> [--track C1] [--out file.srt]
+  reelforge project context <project>          (structured view for AI planners)
 
   reelforge render <project> --out <file.mp4>      (H.264/AAC at project size; never overwrites)
   reelforge preview <project>                      (low-res render of the same graph, from proxies)
@@ -122,6 +135,10 @@ const OPTIONS = {
   ripple: { type: "boolean" },
   out: { type: "string" },
   props: { type: "string" },
+  kinds: { type: "string" },
+  language: { type: "string" },
+  source: { type: "string" },
+  "max-words": { type: "string" },
   wait: { type: "boolean" },
 } as const;
 
@@ -179,6 +196,15 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
         const job = await runJob(db, env, io, (sub ? [sub, ...rest] : rest)[0], cmd === "render" ? "export" : "preview", values.out);
         print({ job });
         return job.state === "completed" ? 0 : job.error?.code === "MEDIA_OFFLINE" || job.state === "cancelled" ? EXIT.VALIDATION_ERROR : EXIT.INTERNAL;
+      } finally {
+        db.close();
+      }
+    }
+    if ((cmd === "media" && sub === "analyze") || (cmd === "captions" && sub === "generate")) {
+      const db = openDatabase(resolveDbPath(env));
+      try {
+        print(cmd === "media" ? await analyzeInline(db, env, io, rest, values) : await captionsInline(db, env, io, rest, values));
+        return 0;
       } finally {
         db.close();
       }
@@ -345,6 +371,28 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
     const p = need(ctx.args[0], "<project>");
     return edit(ctx, p, [{ type: "clip.update", clipId: need(ctx.args[1], "<clip>"), props: need(propsFlag(ctx.values.props), "--props") } as TimelineOp]);
   },
+  "media analysis": ({ db, args }) => ({ analyses: new AnalysisStore(db).list(need(args[0], "<project>"), need(args[1], "<asset>")) }),
+  "project context": ({ db, args }) => {
+    const id = need(args[0], "<project>");
+    return { context: buildProjectContext(new TimelineStore(db).get(id), new AnalysisStore(db).forProject(id), OPERATION_TYPES) };
+  },
+  "captions srt": (ctx) => {
+    const projectId = need(ctx.args[0], "<project>");
+    const tl = new TimelineStore(ctx.db).get(projectId);
+    const track = ctx.values.track ? trackId(ctx, projectId, ctx.values.track) : tl.tracks.find((t) => t.kind === "caption")?.id;
+    const srt = captionsToSrt(tl.captions.filter((c) => c.trackId === track), tl.project.settings.fps);
+    if (ctx.values.out) {
+      const out = resolve(ctx.io.cwd ?? process.cwd(), ctx.values.out);
+      try {
+        writeFileSync(out, srt, { flag: "wx" }); // never overwrite
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "EEXIST") invalid(`${out} already exists`);
+        throw e;
+      }
+      return { path: out, captions: srt ? srt.split("\n\n").length : 0 };
+    }
+    return { srt };
+  },
   "jobs list": ({ db, args }) => ({ jobs: new JobStore(db).list(need(args[0], "<project>")) }),
   "jobs get": ({ db, args }) => ({ job: new JobStore(db).get(need(args[0], "<job>")) }),
   "jobs cancel": ({ db, args }) => ({ job: new JobStore(db).cancel(need(args[0], "<job>")) }),
@@ -355,6 +403,57 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
     return edit(ctx, need(p, "<project>"), [{ type: "clip.delete", clipIds, ...(ctx.values.ripple ? { ripple: true } : {}) }]);
   },
 };
+
+async function runAnalyses(db: Database, env: NodeJS.ProcessEnv, io: Io, ids: string[]) {
+  const runner = new AnalysisRunner(db, { cacheDir: resolveCacheDir(env) });
+  const store = new AnalysisStore(db);
+  const timer = setInterval(() => {
+    if (!io.progress) return;
+    for (const id of ids) {
+      const a = store.get(id);
+      if (a.state === "running") io.err(`[reelforge] ${a.kind} ${Math.round(a.progress * 100)}%\n`);
+    }
+  }, 1000);
+  try {
+    for (const id of ids) runner.enqueue(id);
+    return await Promise.all(ids.map((id) => runner.wait(id)));
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+async function analyzeInline(db: Database, env: NodeJS.ProcessEnv, io: Io, args: string[], values: Values) {
+  const [projectId, assetId] = args;
+  const kinds = (values.kinds?.split(",").map((k) => k.trim()) ?? [...ANALYSIS_KINDS]) as AnalysisKind[];
+  const queued = new AnalysisStore(db).enqueue(need(projectId, "<project>"), need(assetId, "<asset>"), kinds, values.language ? { language: values.language } : {});
+  const done = await runAnalyses(db, env, io, queued.map((a) => a.id));
+  const failed = done.filter((a) => a.state === "failed");
+  if (failed.length === done.length) throw new ReelForgeError("INTERNAL", failed.map((a) => `${a.kind}: ${a.error}`).join("; "));
+  return { analyses: done };
+}
+
+async function captionsInline(db: Database, env: NodeJS.ProcessEnv, io: Io, args: string[], values: Values) {
+  const projectId = need(args[0], "<project>");
+  const opts = {
+    ...(values.track ? { trackId: trackId({ db, values, args, io }, projectId, values.track) } : {}),
+    ...(values.source ? { sourceTrackIds: values.source.split(",").map((t) => trackId({ db, values, args, io }, projectId, t.trim())) } : {}),
+    ...(values["max-words"] ? { maxWords: need(int("max-words", values["max-words"]), "--max-words") } : {}),
+  };
+  let plan = planCaptions(db, projectId, opts);
+  if (plan.missing.length) {
+    // Transcribe what's missing here, then plan again.
+    const store = new AnalysisStore(db);
+    const ids = plan.missing.flatMap((m) => store.enqueue(projectId, m.assetId, ["transcript"], values.language ? { language: values.language } : {}).map((a) => a.id));
+    const done = await runAnalyses(db, env, io, ids);
+    const failed = done.find((a) => a.state === "failed");
+    if (failed) throw new ReelForgeError("INTERNAL", `transcription failed: ${failed.error}`);
+    plan = planCaptions(db, projectId, opts);
+  }
+  const timeline = new TimelineStore(db);
+  const baseRevision = int("base-revision", values["base-revision"]) ?? timeline.get(projectId).project.revision;
+  const tl = timeline.apply(projectId, { baseRevision, operations: [{ type: "captions.replace", trackId: plan.trackId, captions: plan.captions }] }, "cli");
+  return { count: plan.captions.length, captions: tl.captions.filter((c) => c.trackId === plan.trackId) };
+}
 
 /** Render in this process, reporting progress on stderr. Ctrl+C cancels the job. */
 async function runJob(db: Database, env: NodeJS.ProcessEnv, io: Io, projectId: string | undefined, kind: "export" | "preview", out: string | undefined) {

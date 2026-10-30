@@ -203,3 +203,57 @@ test("media streaming: ?token= only on media GETs; proxies for video/image, orig
   const thumb = await call(srv, "GET", `/v1/projects/${project.id}/assets/${video.id}/thumbnail${q}`, { auth: false });
   assert.equal(thumb.status, 200);
 });
+
+test("M3 over REST: analyze → poll, context, captions generate asks for transcripts, SRT, fonts", async (t) => {
+  const srv = await boot(t);
+  const f = fixtures();
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "M3" } })).json()) as any;
+  const imp = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [f.portrait, f.wav] } })).json()) as any;
+  const [video, wav] = imp.imported;
+
+  const bad = await call(srv, "POST", `/v1/projects/${project.id}/assets/${wav.id}/analyze`, { body: { kinds: ["scenes"] } });
+  assert.equal(bad.status, 400, "scene detection needs a video");
+  const started = await call(srv, "POST", `/v1/projects/${project.id}/assets/${video.id}/analyze`, { body: { kinds: ["scenes", "beats"] } });
+  assert.equal(started.status, 202);
+  let list: any[] = [];
+  for (let i = 0; i < 100; i++) {
+    list = ((await (await call(srv, "GET", `/v1/projects/${project.id}/assets/${video.id}/analysis`)).json()) as any).analyses;
+    if (list.length === 2 && list.every((a) => a.state === "completed" || a.state === "failed")) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.deepEqual(list.map((a) => [a.kind, a.state]).sort(), [["beats", "completed"], ["scenes", "completed"]]);
+
+  let tl = ((await (await call(srv, "GET", `/v1/projects/${project.id}/timeline`)).json()) as any).timeline;
+  const voice = tl.tracks.find((x: any) => x.name === "Voice");
+  const cc = tl.tracks.find((x: any) => x.kind === "caption");
+  await call(srv, "POST", `/v1/projects/${project.id}/operations`, {
+    body: {
+      baseRevision: tl.project.revision,
+      operations: [
+        { type: "clip.add", trackId: voice.id, assetId: wav.id, start: 0 },
+        { type: "caption.add", trackId: cc.id, start: 0, duration: 30, text: "Hello there" },
+      ],
+    },
+  });
+
+  const ctx = ((await (await call(srv, "GET", `/v1/projects/${project.id}/context`)).json()) as any).context;
+  assert.equal(ctx.assets.find((a: any) => a.id === video.id).analysis.scenes.state, "completed");
+  assert.deepEqual(ctx.timeline.captions.map((c: any) => c.text), ["Hello there"]);
+
+  // No transcript yet: the engine queues one and says so instead of captioning nothing.
+  const gen = await call(srv, "POST", `/v1/projects/${project.id}/captions/generate`, { body: { language: "en" } });
+  assert.equal(gen.status, 202);
+  const g = (await gen.json()) as any;
+  assert.equal(g.status, "transcribing");
+  assert.equal(g.missing[0].assetId, wav.id);
+
+  const srt = await call(srv, "GET", `/v1/projects/${project.id}/captions.srt`);
+  assert.equal(await srt.text(), "1\n00:00:00,000 --> 00:00:01,000\nHello there\n");
+  assert.match(srt.headers.get("content-disposition") ?? "", /filename="M3\.srt"/);
+
+  const font = await call(srv, "GET", `/v1/fonts/Anton-Regular.ttf?token=${TOKEN}`, { auth: false });
+  assert.equal(font.status, 200);
+  // A traversal attempt doesn't even match the font route, so the query token isn't accepted there.
+  assert.ok([401, 404].includes((await call(srv, "GET", `/v1/fonts/..%2F..%2Fetc%2Fpasswd.ttf?token=${TOKEN}`, { auth: false })).status));
+  assert.equal((await call(srv, "GET", `/v1/fonts/Other.ttf?token=${TOKEN}`, { auth: false })).status, 404);
+});

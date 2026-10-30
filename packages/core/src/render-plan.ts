@@ -4,7 +4,7 @@
 // same thing everywhere.
 
 import { ReelForgeError } from "./errors.ts";
-import { resolveClipProps, type ClipProps, type Timeline } from "./schema.ts";
+import { resolveCaptionStyle, resolveClipProps, type Caption, type CaptionStyle, type ClipProps, type Timeline } from "./schema.ts";
 import type { Rational } from "./timebase.ts";
 
 export interface PlanSource {
@@ -48,6 +48,8 @@ export interface RenderPlan {
   /** Picture layers, bottom first; within a layer, segments in time order (later ones composite over earlier). */
   layers: PlanSegment[][];
   audio: PlanSegment[];
+  /** Visible caption tracks, bottom first; drawn over all picture layers. */
+  captions: { trackId: string; style: CaptionStyle; captions: Caption[] }[];
   sources: Record<string, PlanSource>;
 }
 
@@ -222,6 +224,14 @@ export function buildRenderPlan(t: Timeline): RenderPlan {
     totalFrames: t.durationFrames,
     layers,
     audio,
+    captions: tracks
+      .filter((tr) => tr.kind === "caption" && !tr.hidden)
+      .map((tr) => ({
+        trackId: tr.id,
+        style: resolveCaptionStyle(tr.captionStyle),
+        captions: t.captions.filter((c) => c.trackId === tr.id).sort((a, b) => a.start - b.start),
+      }))
+      .filter((c) => c.captions.length > 0),
     sources,
   };
 }

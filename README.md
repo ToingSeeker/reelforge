@@ -5,9 +5,10 @@
 
 ---
 
-> **Status: pre-alpha, milestone M2.1.** Media import, a multi-track timeline
-> with undo/redo, transforms, fades, dissolves and gain, a live preview, and
-> frame-exact MP4 export (H.264/AAC, BT.709) work from the desktop and the CLI. Transcription/captions
+> **Status: pre-alpha, milestone M3.** Media import, a multi-track timeline
+> with undo/redo, transforms/fades/dissolves, a live preview, frame-exact MP4
+> export, plus local scene/beat detection, speech transcription and animated
+> burned-in captions work from the desktop and the CLI. The AI Director (M4) is next. Transcription/captions
 > (M3) and the AI Director (M4) are not built yet. See [docs/milestones.md](docs/milestones.md).
 
 ReelForge turns raw footage into editable, reviewable vertical video. You can drive it
@@ -25,6 +26,7 @@ Full specification: [docs/PRD.md](docs/PRD.md) · UI reference: [docs/design/edi
 ## Quickstart
 
 Requirements: macOS on Apple Silicon, Node ≥ 24, pnpm 10, FFmpeg (`brew install ffmpeg`), and Rust stable (for the desktop shell).
+For transcription and captions: `brew install whisper-cpp` and `./scripts/download-models.sh` (≈1.6 GB, verified by SHA-256).
 
 ```sh
 pnpm install
@@ -50,6 +52,12 @@ pnpm cli timeline get <project>
 pnpm cli preview <project>
 pnpm cli render <project> --out ~/Movies/reel.mp4
 pnpm cli jobs list <project>
+
+# Media intelligence and captions (all local)
+pnpm cli media analyze <project> <asset> --kinds scenes,beats,transcript
+pnpm cli captions generate <project> --source A2 --max-words 3 --language id
+pnpm cli captions srt <project> --out captions.srt
+pnpm cli project context <project>        # what an AI planner reads
 
 # Desktop studio (starts the engine as a sidecar)
 pnpm desktop
@@ -79,4 +87,5 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and ou
 
 ## License
 
-[Apache-2.0](LICENSE). Third-party components (FFmpeg, models, fonts, LUTs) keep their own licenses and are audited before distribution.
+[Apache-2.0](LICENSE). Third-party components keep their own licenses: FFmpeg, whisper.cpp (MIT) and its models,
+the bundled caption fonts Anton and Poppins (SIL Open Font License, texts in `assets/fonts/`), opentype.js (MIT).

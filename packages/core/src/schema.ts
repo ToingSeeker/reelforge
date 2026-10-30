@@ -137,6 +137,8 @@ export interface Track {
   id: string;
   kind: TrackKind;
   name: string;
+  /** Caption tracks only: sparse style over the "bold" preset. */
+  captionStyle?: CaptionStylePatch;
   /** 0 is the top track (composited last). */
   position: number;
   muted: boolean;
@@ -229,13 +231,14 @@ export interface Timeline {
   project: Project;
   tracks: Track[];
   clips: Clip[];
+  captions: Caption[];
   assets: Asset[];
   /** Last frame covered by any clip. */
   durationFrames: number;
   history: { canUndo: boolean; canRedo: boolean };
 }
 
-export const TimelineOpSchema = z.discriminatedUnion("type", [
+const BaseTimelineOps = [
   z.object({
     type: z.literal("clip.add"),
     clipId: z.uuid().optional(),
@@ -284,15 +287,11 @@ export const TimelineOpSchema = z.discriminatedUnion("type", [
     muted: z.boolean().optional(),
     locked: z.boolean().optional(),
     hidden: z.boolean().optional(),
+    captionStyle: z.lazy(() => CaptionStylePatchSchema).optional(),
   }),
-]);
-export type TimelineOp = z.infer<typeof TimelineOpSchema>;
+] as const;
 
-export const ApplyOperationsInputSchema = z.object({
-  baseRevision: z.number().int().nonnegative(),
-  operations: z.array(TimelineOpSchema).min(1).max(500),
-});
-export type ApplyOperationsInput = z.input<typeof ApplyOperationsInputSchema>;
+
 
 export const HistoryInputSchema = z.object({
   baseRevision: z.number().int().nonnegative(),
@@ -385,3 +384,165 @@ export interface Artifact {
   audioCodec: string | null;
   createdAt: string;
 }
+
+// ---------------------------------------------------------------------------
+// Media intelligence & captions (M3)
+// ---------------------------------------------------------------------------
+
+export const ANALYSIS_KINDS = ["scenes", "beats", "transcript"] as const;
+export type AnalysisKind = (typeof ANALYSIS_KINDS)[number];
+export type AnalysisState = "queued" | "running" | "completed" | "failed";
+
+export interface ScenesResult {
+  /** Scene changes in source time. */
+  cuts: { timeUs: number; score: number }[];
+}
+
+export interface BeatsResult {
+  bpm: number;
+  /** 0..1: how periodic the onsets are; low values mean "no clear beat". */
+  confidence: number;
+  beatsUs: number[];
+}
+
+export interface TranscriptWord {
+  text: string;
+  startUs: number;
+  endUs: number;
+  /** Model confidence 0..1. */
+  p: number;
+}
+
+export interface TranscriptResult {
+  language: string;
+  text: string;
+  segments: { startUs: number; endUs: number; text: string; words: TranscriptWord[] }[];
+}
+
+export interface AnalysisResults {
+  scenes: ScenesResult;
+  beats: BeatsResult;
+  transcript: TranscriptResult;
+}
+
+export interface Analysis<K extends AnalysisKind = AnalysisKind> {
+  id: string;
+  assetId: string;
+  kind: K;
+  state: AnalysisState;
+  progress: number;
+  engine: string | null;
+  params: Record<string, unknown>;
+  result: AnalysisResults[K] | null;
+  error: string | null;
+  /** The source file changed since this ran; re-analyse before trusting it. */
+  stale: boolean;
+  createdAt: string;
+  finishedAt: string | null;
+}
+
+const HexColor = z.string().regex(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/, "colour must be #rrggbb or #rrggbbaa");
+
+/** Bundled OFL fonts (assets/fonts); exports are identical on every machine. */
+export const CAPTION_FONTS = {
+  Anton: "Anton-Regular.ttf",
+  "Poppins Bold": "Poppins-Bold.ttf",
+  "Poppins SemiBold": "Poppins-SemiBold.ttf",
+} as const;
+export type CaptionFont = keyof typeof CAPTION_FONTS;
+
+export const CaptionStyleSchema = z
+  .object({
+    font: z.enum(Object.keys(CAPTION_FONTS) as [CaptionFont, ...CaptionFont[]]),
+    /** Font size as a fraction of the frame height. */
+    size: z.number().min(0.015).max(0.2),
+    color: HexColor,
+    /** Colour of the word being spoken; null = no word highlight. */
+    highlight: HexColor.nullable(),
+    strokeColor: HexColor,
+    /** Outline width as a fraction of the font size (0 = none). */
+    stroke: z.number().min(0).max(0.3),
+    shadow: z.boolean(),
+    /** Background box behind each line (null = none). */
+    box: HexColor.nullable(),
+    /** Vertical centre of the caption block, 0 = top, 1 = bottom (keep inside the safe area). */
+    y: z.number().min(0.05).max(0.95),
+    /** Max line width as a fraction of the frame width. */
+    maxWidth: z.number().min(0.3).max(1),
+    uppercase: z.boolean(),
+  })
+  .strict();
+export type CaptionStyle = z.infer<typeof CaptionStyleSchema>;
+export const CaptionStylePatchSchema = CaptionStyleSchema.partial();
+export type CaptionStylePatch = z.infer<typeof CaptionStylePatchSchema>;
+
+/** The three presets (PRD §10: at least three). */
+export const CAPTION_PRESETS: Record<"bold" | "clean" | "boxed", CaptionStyle> = {
+  bold: {
+    font: "Anton", size: 0.058, color: "#ffffff", highlight: "#00d5ed", strokeColor: "#000000", stroke: 0.12,
+    shadow: true, box: null, y: 0.7, maxWidth: 0.82, uppercase: true,
+  },
+  clean: {
+    font: "Poppins SemiBold", size: 0.038, color: "#ffffff", highlight: "#ffd84a", strokeColor: "#000000", stroke: 0.06,
+    shadow: true, box: null, y: 0.74, maxWidth: 0.8, uppercase: false,
+  },
+  boxed: {
+    font: "Poppins Bold", size: 0.036, color: "#ffffff", highlight: "#00d5ed", strokeColor: "#000000", stroke: 0,
+    shadow: false, box: "#000000b3", y: 0.74, maxWidth: 0.78, uppercase: false,
+  },
+};
+
+export function resolveCaptionStyle(p: CaptionStylePatch | undefined): CaptionStyle {
+  return { ...CAPTION_PRESETS.bold, ...p };
+}
+
+export interface CaptionWord {
+  text: string;
+  /** Frames relative to the caption start. */
+  start: number;
+  end: number;
+}
+
+export interface Caption {
+  id: string;
+  trackId: string;
+  start: number;
+  duration: number;
+  text: string;
+  /** Word timings for highlighting; empty when unknown. */
+  words: CaptionWord[];
+}
+
+const CaptionText = z.string().trim().min(1, "caption text is required").max(300);
+const CaptionWordSchema = z.object({ text: z.string().min(1).max(100), start: z.number().int().min(0), end: z.number().int().min(0) });
+const CaptionInput = z.object({
+  captionId: z.uuid().optional(),
+  start: Frame,
+  duration: FrameCount,
+  text: CaptionText,
+  words: z.array(CaptionWordSchema).max(200).optional(),
+});
+
+export const CaptionOpSchemas = [
+  z.object({ type: z.literal("caption.add"), trackId: z.uuid(), ...CaptionInput.shape }),
+  z.object({
+    type: z.literal("caption.update"),
+    captionId: z.uuid(),
+    text: CaptionText.optional(),
+    start: Frame.optional(),
+    duration: FrameCount.optional(),
+    words: z.array(CaptionWordSchema).max(200).optional(),
+  }),
+  z.object({ type: z.literal("caption.delete"), captionIds: z.array(z.uuid()).min(1).max(5000) }),
+  /** Replace every caption on a track (caption generation is one undo step). */
+  z.object({ type: z.literal("captions.replace"), trackId: z.uuid(), captions: z.array(CaptionInput).max(5000) }),
+] as const;
+
+export const TimelineOpSchema = z.discriminatedUnion("type", [...BaseTimelineOps, ...CaptionOpSchemas]);
+export type TimelineOp = z.infer<typeof TimelineOpSchema>;
+
+export const ApplyOperationsInputSchema = z.object({
+  baseRevision: z.number().int().nonnegative(),
+  operations: z.array(TimelineOpSchema).min(1).max(500),
+});
+export type ApplyOperationsInput = z.input<typeof ApplyOperationsInputSchema>;

@@ -4,9 +4,13 @@
 // while editing matches the render; the "Rendered" mode is the exact output.
 
 import { activeLayers, audioGain, pictureAlpha, placement, type PlanSegment, type RenderPlan } from "@reelforge/core/render-plan";
+import { activeWordAt, layoutCaption, type CaptionLayout } from "@reelforge/core/caption-layout";
+import { CAPTION_FONTS, type Caption, type CaptionFont, type CaptionStyle } from "@reelforge/core/schema";
+import opentype, { type Font } from "opentype.js";
 
 export interface CompositorSources {
   mediaUrl: (assetId: string) => string;
+  fontUrl: (file: string) => string;
 }
 
 const PRELOAD_FRAMES = 45;
@@ -25,6 +29,8 @@ export class Compositor {
   #playing: { f0: number; t0: number; nodes: AudioScheduledSourceNode[]; raf: number } | null = null;
   #frame = 0;
   #drawToken = 0;
+  #fonts = new Map<CaptionFont, Font | Promise<void>>();
+  #layouts = new Map<string, CaptionLayout>();
   onFrame: ((frame: number) => void) | null = null;
   onEnded: (() => void) | null = null;
 
@@ -248,6 +254,85 @@ export class Compositor {
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
+    for (const track of plan.captions) {
+      const c = track.captions.find((x) => x.start <= frame && frame < x.start + x.duration);
+      if (c) this.#drawCaption(c, track.style, frame);
+    }
+  }
+
+  #font(name: CaptionFont): Font | null {
+    const f = this.#fonts.get(name);
+    if (f && !(f instanceof Promise)) return f;
+    if (!f) {
+      this.#fonts.set(
+        name,
+        fetch(this.#sources.fontUrl(CAPTION_FONTS[name]))
+          .then((r) => r.arrayBuffer())
+          .then((buf) => {
+            this.#fonts.set(name, opentype.parse(buf));
+            if (!this.#playing) this.#draw(this.#frame);
+          })
+          .catch(() => {
+            this.#fonts.delete(name);
+          }),
+      );
+    }
+    return null;
+  }
+
+  /** Same layout and word timing as the export rasteriser; canvas does the final pixels. */
+  #drawCaption(c: Caption, style: CaptionStyle, frame: number) {
+    const font = this.#font(style.font);
+    if (!font) return;
+    const ctx = this.#ctx;
+    const W = this.#canvas.width;
+    const H = this.#canvas.height;
+    const key = `${c.id}|${c.text}|${JSON.stringify(c.words)}|${JSON.stringify(style)}|${W}x${H}`;
+    let L = this.#layouts.get(key);
+    if (!L) {
+      L = layoutCaption(c, style, W, H, font);
+      if (this.#layouts.size > 400) this.#layouts.clear();
+      this.#layouts.set(key, L);
+    }
+    const active = style.highlight ? activeWordAt(c, frame - c.start) : -1;
+    const paths = L.words.map((w) => new Path2D(font.getPath(w.text, w.x, w.baseline, L!.fontSize, { kerning: true }).toPathData(2)));
+    const r = style.stroke * L.fontSize;
+    ctx.save();
+    if (style.box) {
+      ctx.fillStyle = cssColor(style.box);
+      for (const ln of L.lines) {
+        ctx.beginPath();
+        ctx.roundRect(ln.x, ln.y, ln.width, ln.height, L.fontSize * 0.18);
+        ctx.fill();
+      }
+    }
+    if (style.shadow) {
+      const off = Math.round(L.fontSize * 0.05);
+      ctx.save();
+      ctx.translate(off, off);
+      ctx.globalAlpha = 0.55;
+      ctx.filter = `blur(${Math.max(1, Math.round(L.fontSize * 0.04)) / 1.5}px)`;
+      ctx.fillStyle = "#000";
+      ctx.strokeStyle = "#000";
+      ctx.lineJoin = "round";
+      ctx.lineWidth = 2 * r;
+      for (const p of paths) {
+        if (r > 0.3) ctx.stroke(p);
+        ctx.fill(p);
+      }
+      ctx.restore();
+    }
+    if (r > 0.3) {
+      ctx.strokeStyle = style.strokeColor;
+      ctx.lineJoin = "round";
+      ctx.lineWidth = 2 * r;
+      for (const p of paths) ctx.stroke(p);
+    }
+    L.words.forEach((w, i) => {
+      ctx.fillStyle = style.highlight && w.index === active ? style.highlight : style.color;
+      ctx.fill(paths[i]!);
+    });
+    ctx.restore();
   }
 
   #buffer(assetId: string): Promise<AudioBuffer | null> {
@@ -307,4 +392,11 @@ export class Compositor {
     }
     if (this.#playing) this.#playing.nodes = [];
   }
+}
+
+/** #rrggbbaa → rgba() (canvas understands 8-digit hex too, but be explicit). */
+function cssColor(hex: string): string {
+  const n = hex.slice(1);
+  const a = n.length === 8 ? parseInt(n.slice(6, 8), 16) / 255 : 1;
+  return `rgba(${parseInt(n.slice(0, 2), 16)},${parseInt(n.slice(2, 4), 16)},${parseInt(n.slice(4, 6), 16)},${a})`;
 }

@@ -3,7 +3,7 @@
 // rejected batch can never leave a half-applied timeline (FR-015, FR-018).
 
 import { ReelForgeError } from "./errors.ts";
-import type { Asset, Clip, ClipPropsPatch, TimelineOp, Track, TrackKind } from "./schema.ts";
+import type { Asset, Caption, CaptionWord, Clip, ClipPropsPatch, TimelineOp, Track, TrackKind } from "./schema.ts";
 import { MAX_FRAME, sparseClipProps } from "./schema.ts";
 import { secondsToFrames, type Rational } from "./timebase.ts";
 
@@ -13,6 +13,7 @@ export interface EditState {
   fps: Rational;
   tracks: ReadonlyMap<string, Track>;
   clips: ReadonlyMap<string, Clip>;
+  captions: ReadonlyMap<string, Caption>;
   assets: ReadonlyMap<string, AssetInfo>;
 }
 
@@ -46,15 +47,49 @@ function fitProps(p: ClipPropsPatch, duration: number): ClipPropsPatch {
   return sparseClipProps(out);
 }
 
+/** Spread words evenly when only the text is known (manual edits), so highlighting keeps working. */
+export function evenWords(text: string, duration: number): CaptionWord[] {
+  const parts = text.split(/\s+/).filter(Boolean);
+  return parts.map((w, i) => ({
+    text: w,
+    start: Math.floor((i * duration) / parts.length),
+    end: Math.floor(((i + 1) * duration) / parts.length),
+  }));
+}
+
 class Draft {
   readonly tracks: Map<string, Track>;
   readonly clips: Map<string, Clip>;
+  readonly captions: Map<string, Caption>;
   readonly state: EditState;
 
   constructor(state: EditState) {
     this.state = state;
     this.tracks = new Map(state.tracks);
     this.clips = new Map(state.clips);
+    this.captions = new Map(state.captions);
+  }
+
+  caption(id: string): Caption {
+    return this.captions.get(id) ?? fail(`caption ${id} not found`, { captionId: id });
+  }
+
+  putCaption(c: Caption): void {
+    const track = this.track(c.trackId);
+    if (track.kind !== "caption") fail(`captions go on a caption track, not "${track.name}"`, { captionId: c.id });
+    if (c.start + c.duration > MAX_FRAME) fail("caption would extend past the maximum timeline length", { captionId: c.id });
+    // Word timings stay inside the caption and in order; out-of-range ones are clamped, not rejected.
+    const words = c.words
+      .map((w) => ({ text: w.text, start: Math.min(Math.max(0, w.start), c.duration), end: Math.min(Math.max(0, w.end), c.duration) }))
+      .map((w) => ({ ...w, end: Math.max(w.start, w.end) }))
+      .sort((a, b) => a.start - b.start);
+    const fixed = { ...c, words };
+    for (const other of this.captions.values()) {
+      if (other.id !== c.id && other.trackId === c.trackId && other.start < c.start + c.duration && c.start < other.start + other.duration) {
+        fail(`caption would overlap another caption on "${track.name}"`, { captionId: c.id, overlaps: other.id });
+      }
+    }
+    this.captions.set(c.id, fixed);
   }
 
   track(id: string): Track {
@@ -184,8 +219,45 @@ function apply(d: Draft, op: TimelineOp, newId: () => string): void {
     }
     case "track.update": {
       const t = d.track(op.trackId);
-      const { type: _type, trackId: _id, ...patch } = op;
-      d.tracks.set(t.id, { ...t, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) });
+      const { type: _type, trackId: _id, captionStyle, ...patch } = op;
+      const next: Track = { ...t, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) };
+      if (captionStyle) {
+        if (t.kind !== "caption") fail("captionStyle only applies to caption tracks", { trackId: t.id });
+        next.captionStyle = { ...t.captionStyle, ...captionStyle };
+      }
+      d.tracks.set(t.id, next);
+      return;
+    }
+    case "caption.add": {
+      d.unlocked(op.trackId);
+      const id = op.captionId ?? newId();
+      if (d.captions.has(id)) fail(`caption ${id} already exists`, { captionId: id });
+      d.putCaption({ id, trackId: op.trackId, start: op.start, duration: op.duration, text: op.text, words: op.words ?? evenWords(op.text, op.duration) });
+      return;
+    }
+    case "caption.update": {
+      const c = d.caption(op.captionId);
+      d.unlocked(c.trackId);
+      const text = op.text ?? c.text;
+      const duration = op.duration ?? c.duration;
+      // New text without new timings: the old word timings no longer line up, so spread evenly.
+      const words = op.words ?? (op.text !== undefined && op.text !== c.text ? evenWords(text, duration) : c.words);
+      d.putCaption({ ...c, text, start: op.start ?? c.start, duration, words });
+      return;
+    }
+    case "caption.delete": {
+      const targets = [...new Set(op.captionIds)].map((id) => d.caption(id));
+      for (const c of targets) d.unlocked(c.trackId);
+      for (const c of targets) d.captions.delete(c.id);
+      return;
+    }
+    case "captions.replace": {
+      d.unlocked(op.trackId);
+      if (d.track(op.trackId).kind !== "caption") fail("captions go on a caption track", { trackId: op.trackId });
+      for (const c of [...d.captions.values()]) if (c.trackId === op.trackId) d.captions.delete(c.id);
+      for (const c of op.captions) {
+        d.putCaption({ id: c.captionId ?? newId(), trackId: op.trackId, start: c.start, duration: c.duration, text: c.text, words: c.words ?? evenWords(c.text, c.duration) });
+      }
       return;
     }
   }
@@ -208,7 +280,7 @@ export function applyOperations(
       throw e;
     }
   });
-  return { ...state, tracks: d.tracks, clips: d.clips };
+  return { ...state, tracks: d.tracks, clips: d.clips, captions: d.captions };
 }
 
 export interface RowChange<T> {
@@ -220,6 +292,8 @@ export interface RowChange<T> {
 export interface TimelineDiff {
   tracks: RowChange<Track>[];
   clips: RowChange<Clip>[];
+  /** Absent in diffs recorded before captions existed. */
+  captions?: RowChange<Caption>[];
 }
 
 function diffMap<T extends { id: string }>(a: ReadonlyMap<string, T>, b: ReadonlyMap<string, T>): RowChange<T>[] {
@@ -233,7 +307,7 @@ function diffMap<T extends { id: string }>(a: ReadonlyMap<string, T>, b: Readonl
 }
 
 export function diffStates(a: EditState, b: EditState): TimelineDiff {
-  return { tracks: diffMap(a.tracks, b.tracks), clips: diffMap(a.clips, b.clips) };
+  return { tracks: diffMap(a.tracks, b.tracks), clips: diffMap(a.clips, b.clips), captions: diffMap(a.captions, b.captions) };
 }
 
-export const isEmptyDiff = (d: TimelineDiff) => d.tracks.length === 0 && d.clips.length === 0;
+export const isEmptyDiff = (d: TimelineDiff) => d.tracks.length === 0 && d.clips.length === 0 && !d.captions?.length;
