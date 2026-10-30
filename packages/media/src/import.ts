@@ -1,5 +1,7 @@
 import { AssetStore, isReelForgeError, type Actor, type Asset, type Database, type ErrorCode } from "@reelforge/core";
-import { probeFile, resolveSource } from "./probe.ts";
+import { readdirSync, statSync } from "node:fs";
+import { extname, join } from "node:path";
+import { probeFile, resolveSource, SUPPORTED_EXTENSIONS } from "./probe.ts";
 
 export interface ImportFailure {
   path: string;
@@ -39,6 +41,40 @@ export async function importMedia(db: Database, projectId: string, paths: string
     result.failed.push({ path, error: { code: "VALIDATION_ERROR", message: `at most ${MAX_IMPORT_BATCH} files per import` } });
   }
   return result;
+}
+
+/**
+ * Folders the user dropped or picked become the media files directly inside them (not subfolders,
+ * not hidden files); other entries are only counted. For the person's own actions (desktop, REST):
+ * MCP imports never take folders, so a client can't use import to list a directory.
+ */
+export function expandFolders(paths: string[]): { paths: string[]; skipped: number } {
+  let skipped = 0;
+  const out: string[] = [];
+  for (const p of paths) {
+    let dir = false;
+    try {
+      dir = statSync(p).isDirectory();
+    } catch {
+      // not there: importMedia reports it
+    }
+    if (!dir) {
+      out.push(p);
+      continue;
+    }
+    for (const name of readdirSync(p).sort()) {
+      const full = join(p, name);
+      let file = false;
+      try {
+        file = statSync(full).isFile();
+      } catch {
+        // dangling link
+      }
+      if (file && !name.startsWith(".") && extname(name).toLowerCase() in SUPPORTED_EXTENSIONS) out.push(full);
+      else skipped++;
+    }
+  }
+  return { paths: out, skipped };
 }
 
 export async function relinkMedia(db: Database, projectId: string, assetId: string, path: string, actor: Actor): Promise<Asset> {

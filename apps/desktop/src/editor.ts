@@ -77,6 +77,7 @@ export function useEditor(client: Client | null, projectId: string | null, notif
         const r = await client.importMedia(projectId, paths);
         const parts = [`${r.imported.length} imported`];
         if (r.existing.length) parts.push(`${r.existing.length} already in project`);
+        if (r.skipped) parts.push(`${r.skipped} non-media item${r.skipped === 1 ? "" : "s"} skipped`);
         if (r.failed.length) parts.push(`${r.failed.length} failed: ${r.failed.map((f) => `${f.path.split("/").pop()} (${f.error.message})`).join("; ")}`);
         notify(r.failed.length ? "error" : "info", parts.join(" · "));
       } catch (e) {

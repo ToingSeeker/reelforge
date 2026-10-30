@@ -106,10 +106,10 @@ export function createClient(info: ApiInfo) {
     redo: (id: string, baseRevision: number) =>
       request<{ timeline: Timeline }>("POST", `/v1/projects/${encodeURIComponent(id)}/redo`, { baseRevision }).then((r) => r.timeline),
     importMedia: (id: string, paths: string[]) =>
-      request<{ imported: Asset[]; existing: Asset[]; failed: { path: string; error: { code: string; message: string } }[] }>(
+      request<{ imported: Asset[]; existing: Asset[]; failed: { path: string; error: { code: string; message: string } }[]; skipped?: number }>(
         "POST",
         `/v1/projects/${encodeURIComponent(id)}/assets`,
-        { paths },
+        { paths, folders: true },
       ),
     relink: (id: string, assetId: string, path: string) =>
       request<{ asset: Asset }>("POST", `/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/relink`, { path }).then((r) => r.asset),

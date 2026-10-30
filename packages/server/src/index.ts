@@ -26,7 +26,7 @@ import {
 } from "@reelforge/core";
 import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor } from "@reelforge/ai";
 import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
-import { AnalysisRunner, createRenderJob, ensureProxy, ensureThumbnail, fontsDir, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, ensureProxy, ensureThumbnail, expandFolders, fontsDir, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { join } from "node:path";
 
 // Local REST API (PRD §15). Loopback only, bearer token always required,
@@ -216,8 +216,12 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       method: "POST",
       pattern: re(`/v1/projects/${ID}/assets`),
       handle: async ({ req, res, params: [id], actor }) => {
-        const result = await importMedia(opts.db, id!, pathsOf(await readJson(req)), actor);
-        return send(res, result.imported.length ? 201 : 200, result);
+        const b = await readJson(req);
+        // Folders (Finder drops) open to the media files inside; only for the token holder, i.e. the user.
+        const { paths, skipped } = (b as { folders?: unknown })?.folders === true ? expandFolders(pathsOf(b)) : { paths: pathsOf(b), skipped: 0 };
+        if (!paths.length) throw new ReelForgeError("VALIDATION_ERROR", `no media files there (${skipped} other item${skipped === 1 ? "" : "s"} skipped)`);
+        const result = await importMedia(opts.db, id!, paths, actor);
+        return send(res, result.imported.length ? 201 : 200, { ...result, skipped });
       },
     },
     {

@@ -359,14 +359,36 @@ export function App() {
     };
   }, [assetDrag?.asset.id]);
 
-  // Files dropped from Finder import into the open project.
-  const importRef = useRef(doImport);
-  importRef.current = doImport;
+  // Files or folders dropped from Finder import into the open project; with none open, into a new one
+  // named after what was dropped (dropping footage is how most people start).
+  const dropIntoNewProject = async (paths: string[]) => {
+    if (!client) return;
+    const first = paths[0]!.split("/").filter(Boolean).pop() ?? "Untitled";
+    const name = (first.replace(/\.[^.]+$/, "") || "Untitled").slice(0, 120);
+    try {
+      const p = await client.createProject({ name });
+      const r = await client.importMedia(p.id, paths);
+      selectProject(p.id);
+      await refresh();
+      const failed = r.failed.length ? ` · ${r.failed.length} failed: ${r.failed.map((f) => `${f.path.split("/").pop()} (${f.error.message})`).join("; ")}` : "";
+      notify(r.failed.length ? "error" : "info", `New project “${name}” · ${r.imported.length} imported${r.skipped ? ` · ${r.skipped} non-media skipped` : ""}${failed}`);
+    } catch (e) {
+      notify("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+  const dropRef = useRef((paths: string[]) => void (current ? doImport(paths) : dropIntoNewProject(paths)));
+  dropRef.current = (paths: string[]) => void (current ? doImport(paths) : dropIntoNewProject(paths));
   useEffect(() => {
     let off: (() => void) | undefined;
-    void onFileDrop((paths) => void importRef.current(paths), setFileHover).then((f) => (off = f));
-    return () => off?.();
-  }, []);
+    let gone = false;
+    onFileDrop((paths) => dropRef.current(paths), setFileHover)
+      .then((f) => (gone ? f() : (off = f)))
+      .catch((e) => notify("error", `Drag and drop is unavailable: ${e instanceof Error ? e.message : String(e)}`));
+    return () => {
+      gone = true;
+      off?.();
+    };
+  }, [notify]);
 
   if (bootError) {
     return (

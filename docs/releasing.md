@@ -27,7 +27,8 @@ whisper.cpp (not bundled; users install them).
 isn't allowed.
 
 Verify a build like a user would: `REELFORGE_APP=/path/ReelForge.app scripts/e2e/native-export.sh` launches it with
-launchd's minimal PATH and exports through the real save panel.
+launchd's minimal PATH and exports through the real save panel. `scripts/e2e/finder-drop.sh` (same `REELFORGE_APP`) drops a file
+and a folder from a real AppKit drag onto the window, with and without a project open.
 
 To bump the Node runtime: change `NODE_VERSION` and the checksum in `build-engine.mjs` from
 `https://nodejs.org/dist/v<version>/SHASUMS256.txt`. Check that file's signature first

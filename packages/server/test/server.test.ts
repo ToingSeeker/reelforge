@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request } from "node:http";
@@ -323,3 +323,34 @@ test("M4 over REST: providers, consent gate, proposal → apply → undo (via a 
   const consent = await call(srv, "POST", `/v1/projects/${project.id}/ai-consent`, { body: { granted: true }, headers: { "x-reelforge-actor": "desktop" } });
   assert.equal(((await consent.json()) as any).consent.grantedBy, "desktop");
 });
+
+test("a dropped folder imports the media files inside it, only when the desktop asks for folders", async (t) => {
+  const srv = await boot(t);
+  const f = fixtures();
+  const dir = mkdtempSync(join(tmpdir(), "reelforge-drop-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  copyFileSync(f.portrait, join(dir, "b.mp4"));
+  copyFileSync(f.mp3, join(dir, "a.mp3"));
+  writeFileSync(join(dir, "notes.txt"), "x");
+  writeFileSync(join(dir, ".hidden.mp4"), "x");
+  mkdirSync(join(dir, "sub"));
+  copyFileSync(f.portrait, join(dir, "sub", "deeper.mp4"));
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Drop" } })).json()) as any;
+
+  const plain = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [dir] } })).json()) as any;
+  assert.equal(plain.imported.length, 0, "without folders: true a folder is just a failed path");
+
+  const res = await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [dir], folders: true } });
+  assert.equal(res.status, 201);
+  const r = (await res.json()) as any;
+  assert.deepEqual(r.imported.map((a: any) => a.filename).sort(), ["a.mp3", "b.mp4"]);
+  assert.equal(r.skipped, 3, "notes.txt, the hidden file and the subfolder");
+
+  const empty = mkdtempSync(join(tmpdir(), "reelforge-drop-empty-"));
+  t.after(() => rmSync(empty, { recursive: true, force: true }));
+  writeFileSync(join(empty, "doc.pdf"), "x");
+  const none = await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [empty], folders: true } });
+  assert.equal(none.status, 400);
+  assert.match(((await none.json()) as any).error.message, /no media files there \(1 other item skipped\)/);
+});
+

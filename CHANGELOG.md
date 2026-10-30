@@ -15,6 +15,9 @@ Security fixes from the first full audit (MCP clients are treated as possibly pr
 - The release app runs only its bundled engine: `REELFORGE_NODE`/`REELFORGE_CLI` work in development builds only,
   and `NODE_*` variables (e.g. `NODE_OPTIONS`) are removed before the engine, which receives the API key, starts
 
+- Dropping files from Finder with no project open did nothing; it now creates a project named after what you dropped.
+  Dropped folders import the media files inside them (not subfolders); other items are counted as skipped
+
 Hardening from the same audit:
 
 - Release builds: thumbnails and the live preview were blocked by the CSP (`img-src`/`media-src` didn't allow the
