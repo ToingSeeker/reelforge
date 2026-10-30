@@ -4,7 +4,7 @@ const PLAN_FIELDS = ["Scenes", "Captions", "Music Sync", "Color Grade", "Aspect 
 
 export function AIDirector() {
   return (
-    <aside className="rf-panel rf-director" aria-label="AI Director">
+    <div className="rf-director">
       <div className="rf-director-head">
         <span className="rf-director-mark">
           <Icon name="sparkle" size={22} />
@@ -43,6 +43,6 @@ export function AIDirector() {
           <Icon name="send" size={17} />
         </button>
       </form>
-    </aside>
+    </div>
   );
 }

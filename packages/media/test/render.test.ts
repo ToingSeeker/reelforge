@@ -23,6 +23,12 @@ function rgbAt(file: string, frame: number): [number, number, number] {
   return [out[0]!, out[1]!, out[2]!];
 }
 
+function pixel(file: string, frame: number, x: number, y: number): [number, number, number] {
+  const out = execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", file, "-vf", `select=eq(n\\,${frame}),format=rgb24,crop=1:1:${x}:${y}`, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+  return [out[0]!, out[1]!, out[2]!];
+}
+const near = (a: number[], b: number[], tol = 28) => a.every((v, i) => Math.abs(v - b[i]!) <= tol);
+
 function colour(file: string, frame: number): string {
   const [r, g, b] = rgbAt(file, frame);
   if (r > 180 && g < 80 && b < 80) return "red";
@@ -147,6 +153,7 @@ test("M2 exit: a 30-second project renders to MP4 H.264/AAC 1080x1920 @ 30 fps",
   assert.equal(info.format.format_name.includes("mp4"), true);
   assert.deepEqual([v.codec_name, v.width, v.height, v.r_frame_rate, v.pix_fmt, Number(v.nb_frames)], ["h264", 1080, 1920, "30/1", "yuv420p", 900]);
   assert.deepEqual([a.codec_name, Number(a.sample_rate), a.channels], ["aac", 48000, 2]);
+  assert.deepEqual([v.color_space, v.color_primaries, v.color_transfer, v.color_range], ["bt709", "bt709", "bt709", "tv"], "tagged as what we encode");
   assert.ok(Math.abs(Number(info.format.duration) - 30) < 0.05, `duration ${info.format.duration}`);
   const head = execFileSync("sh", ["-c", `head -c 4096 "${out}" | strings | grep -c moov || true`]).toString().trim();
   assert.notEqual(head, "0", "moov atom up front (+faststart)");
@@ -207,4 +214,66 @@ test("offline source fails the job with MEDIA_OFFLINE", async (t) => {
   const done = await s.runner.wait(job.id);
   assert.equal(done.state, "failed");
   assert.equal(done.error?.code, "MEDIA_OFFLINE");
+});
+
+test("transform: contain letterboxes, scale + position move the layer, rotation turns it", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  const clip = "00000000-0000-4000-8000-0000000000e1";
+  s.edit([
+    { type: "clip.add", trackId: s.track("Video"), assetId: s.ids.blue, start: 0, duration: 4 },
+    { type: "clip.add", clipId: clip, trackId: s.track("Overlays"), assetId: s.ids.red, start: 1, duration: 1, props: { fit: "contain" } },
+    // frame 2: half size, pushed right by a quarter of the width
+    { type: "clip.add", trackId: s.track("Overlays"), assetId: s.ids.red, start: 2, duration: 1, props: { scale: 0.5, x: 0.25 } },
+    // frame 3: landscape red, contained, rotated 90° → a tall bar
+    { type: "clip.add", trackId: s.track("Overlays"), assetId: s.ids.red, start: 3, duration: 1, props: { fit: "contain", rotation: 90 } },
+  ]);
+  const out = join(s.home, "transform.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  // contain: 640x360 into 160x288 → 160x90 band in the middle, blue above and below
+  assert.ok(near(pixel(out, 1, 80, 144), [255, 0, 0]), "centre is red");
+  assert.ok(near(pixel(out, 1, 80, 20), [0, 0, 255]), "letterbox shows the layer below");
+  // scale 0.5 → 80x144 layer centred at x = 80 + 40 = 120
+  assert.ok(near(pixel(out, 2, 120, 144), [255, 0, 0]));
+  assert.ok(near(pixel(out, 2, 40, 144), [0, 0, 255]), "left half uncovered");
+  assert.ok(near(pixel(out, 2, 120, 30), [0, 0, 255]), "top uncovered");
+  // rotated 90°: the 160x90 band becomes 90x160, so the top of the band area is red, the sides blue
+  assert.ok(near(pixel(out, 3, 80, 80), [255, 0, 0]), "rotated layer reaches up");
+  assert.ok(near(pixel(out, 3, 10, 144), [0, 0, 255]), "and is narrow");
+});
+
+test("opacity, fade-in and dissolve blend exactly as pictureAlpha says", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  s.edit([
+    // V1: red 0–30, blue 30–60 with a 10-frame dissolve (handles: red has 3s, blue starts at source 15)
+    { type: "clip.add", trackId: s.track("Video"), assetId: s.ids.red, start: 0, duration: 30 },
+    { type: "clip.add", trackId: s.track("Video"), assetId: s.ids.blue, start: 30, duration: 30, sourceIn: 15, props: { transitionIn: 10 } },
+    // V2: green at 50% from 60–70 over black, then green with a 10-frame fade-in 70–90 over black
+    { type: "clip.add", trackId: s.track("Overlays"), assetId: s.ids.green, start: 60, duration: 10, props: { opacity: 0.5 } },
+    { type: "clip.add", trackId: s.track("Overlays"), assetId: s.ids.green, start: 70, duration: 20, props: { fadeIn: 10 } },
+  ]);
+  const out = join(s.home, "blend.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  assert.ok(near(rgbAt(out, 24), [255, 0, 0]), "before the dissolve window");
+  assert.ok(near(rgbAt(out, 30), [128, 0, 128], 30), `mid-dissolve is half red, half blue: ${rgbAt(out, 30)}`);
+  assert.ok(near(rgbAt(out, 36), [0, 0, 255]), "after the dissolve window");
+  assert.ok(near(rgbAt(out, 64), [0, 128, 0], 30), `50% green over black: ${rgbAt(out, 64)}`);
+  assert.ok(near(rgbAt(out, 75), [0, 128, 0], 30), `half way through the fade-in: ${rgbAt(out, 75)}`);
+  assert.ok(near(rgbAt(out, 85), [0, 255, 0]));
+});
+
+test("audio gain and fades", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  s.edit([
+    { type: "clip.add", trackId: s.track("Video"), assetId: s.ids.blue, start: 0, duration: 90 },
+    { type: "clip.add", trackId: s.track("Music"), assetId: s.ids.tone, start: 0, duration: 30 },
+    { type: "clip.add", trackId: s.track("Voice"), assetId: s.ids.tone, start: 30, duration: 30, props: { gainDb: -12 } },
+    { type: "clip.add", trackId: s.track("Music"), assetId: s.ids.tone, start: 60, duration: 30, props: { fadeIn: 30 } },
+  ]);
+  const out = join(s.home, "gain.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  const ref = meanVolume(out, 0.1, 0.8);
+  const quiet = meanVolume(out, 1.1, 0.8);
+  assert.ok(Math.abs(ref - quiet - 12) < 1.5, `-12 dB gain: ${ref} vs ${quiet}`);
+  assert.ok(meanVolume(out, 2.0, 0.15) < ref - 10, "start of the fade-in is much quieter");
+  assert.ok(Math.abs(meanVolume(out, 2.85, 0.1) - ref) < 3, "end of the fade-in is at full level");
 });

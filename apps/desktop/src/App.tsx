@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Asset, Project, TimelineOp } from "@reelforge/core/schema";
+import type { Asset, ClipPropsPatch, Project, Timeline as TimelineData, TimelineOp } from "@reelforge/core/schema";
 import { canPlace, clipEnd } from "@reelforge/core/timeline-ops";
 import { formatClock } from "@reelforge/core/timebase";
 import { createClient, resolveApiInfo, type Client } from "./api.ts";
@@ -12,6 +12,8 @@ import { LeftRail, type RailItem } from "./components/LeftRail.tsx";
 import { MediaLibrary } from "./components/MediaLibrary.tsx";
 import { Preview } from "./components/Preview.tsx";
 import { AIDirector } from "./components/AIDirector.tsx";
+import { Inspector, RightPanelTabs } from "./components/Inspector.tsx";
+import type { PreviewMode } from "./components/Preview.tsx";
 import { Timeline, type AssetDropHandler } from "./components/Timeline.tsx";
 import { NewProjectDialog } from "./components/NewProjectDialog.tsx";
 import { Welcome } from "./components/Welcome.tsx";
@@ -52,6 +54,9 @@ export function App() {
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [previewMode, setPreviewMode] = useState<PreviewMode>(() => (readPref("rf.previewMode") === "rendered" ? "rendered" : "live"));
+  const [rightTab, setRightTab] = useState<"inspector" | "director">("director");
+  const [draft, setDraft] = useState<{ clipId: string; props: ClipPropsPatch } | null>(null);
   const [importing, setImporting] = useState(false);
   const [fileHover, setFileHover] = useState(false);
   const [assetDrag, setAssetDrag] = useState<{ asset: Asset; x: number; y: number } | null>(null);
@@ -118,7 +123,17 @@ export function App() {
   );
   const fps = current?.settings.fps ?? { num: 30, den: 1 };
 
-  const preview = usePreview(client, tl);
+  const preview = usePreview(client, tl, previewMode === "rendered");
+  const selectedClip = selection.size === 1 && tl ? (tl.clips.find((c) => selection.has(c.id)) ?? null) : null;
+  // The live preview shows inspector drags before they are committed.
+  const viewTimeline = useMemo<TimelineData | null>(() => {
+    if (!tl || !draft) return tl;
+    return { ...tl, clips: tl.clips.map((c) => (c.id === draft.clipId ? { ...c, props: { ...c.props, ...draft.props } } : c)) };
+  }, [tl, draft]);
+  useEffect(() => {
+    if (selectedClip) setRightTab("inspector");
+    setDraft(null);
+  }, [selectedClip?.id]);
   const exports = useExports(client, notify);
   /** Any manual playhead move stops playback. */
   const seek = useCallback((f: number) => {
@@ -228,7 +243,7 @@ export function App() {
         return;
       } else if (e.key === " ") {
         e.preventDefault();
-        if (preview.url) setPlaying((p) => !p);
+        if (tl.durationFrames > 0 && (previewMode === "live" || preview.url)) setPlaying((p) => !p);
       } else if (e.key === "s" || e.key === "S") {
         e.preventDefault();
         split();
@@ -337,14 +352,37 @@ export function App() {
           )}
           <Preview
             client={client}
-            timeline={tl}
+            timeline={viewTimeline}
+            mode={previewMode}
+            onMode={(m) => {
+              setPlaying(false);
+              setPreviewMode(m);
+              writePref("rf.previewMode", m);
+            }}
             preview={preview}
             playhead={playhead}
             onPlayhead={(f) => (playing ? setPlayhead(f) : seek(f))}
             playing={playing}
             onPlaying={setPlaying}
           />
-          <AIDirector />
+          <aside className="rf-panel rf-right" aria-label={rightTab === "inspector" ? "Inspector" : "AI Director"}>
+            <RightPanelTabs tab={rightTab} onTab={setRightTab} hasClip={!!selectedClip} />
+            {rightTab === "director" ? (
+              <AIDirector />
+            ) : selectedClip && tl ? (
+              <Inspector
+                timeline={tl}
+                clip={selectedClip}
+                onDraft={(props) => setDraft(props ? { clipId: selectedClip.id, props } : null)}
+                onCommit={(props, label) => apply(label, [{ type: "clip.update", clipId: selectedClip.id, props }])}
+              />
+            ) : (
+              <div className="rf-empty">
+                <p className="rf-empty-title">No clip selected</p>
+                <p className="rf-empty-body">Select one clip on the timeline to adjust its transform, fades, transition or gain.</p>
+              </div>
+            )}
+          </aside>
           <Timeline
             client={client}
             timeline={tl}

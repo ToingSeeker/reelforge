@@ -114,28 +114,9 @@ export function useEditor(client: Client | null, projectId: string | null, notif
 
 export type Editor = ReturnType<typeof useEditor>;
 
-const thumbCache = new Map<string, Promise<string>>();
-
-/** Object-URL cache for asset thumbnails, keyed so a changed file refetches. */
+/** Thumbnail URL for an asset (streamed directly; the token rides in the query). Null when offline. */
 export function useThumbnail(client: Client | null, projectId: string, asset: Asset | undefined): string | null {
-  const [url, setUrl] = useState<string | null>(null);
-  const key = asset && asset.status !== "missing" ? `${asset.id}:${asset.sizeBytes}` : null;
-  useEffect(() => {
-    if (!client || !key || !asset) {
-      setUrl(null);
-      return;
-    }
-    let p = thumbCache.get(key);
-    if (!p) {
-      p = client.thumbnail(projectId, asset.id).then((b) => URL.createObjectURL(b));
-      p.catch(() => thumbCache.delete(key));
-      thumbCache.set(key, p);
-    }
-    let live = true;
-    p.then((u) => live && setUrl(u), () => live && setUrl(null));
-    return () => {
-      live = false;
-    };
-  }, [client, projectId, key]);
-  return url;
+  if (!client || !asset || asset.status === "missing" || !projectId) return null;
+  // sizeBytes busts the browser cache when a file is relinked or changes.
+  return `${client.thumbnailUrl(projectId, asset.id)}&v=${asset.sizeBytes}`;
 }

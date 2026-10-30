@@ -5,9 +5,9 @@
 
 ---
 
-> **Status: pre-alpha, milestone M2 (Preview & Render).** Media import, a
-> multi-track timeline with undo/redo, preview playback and frame-exact MP4
-> export (H.264/AAC) work from the desktop and the CLI. Transcription/captions
+> **Status: pre-alpha, milestone M2.1.** Media import, a multi-track timeline
+> with undo/redo, transforms, fades, dissolves and gain, a live preview, and
+> frame-exact MP4 export (H.264/AAC, BT.709) work from the desktop and the CLI. Transcription/captions
 > (M3) and the AI Director (M4) are not built yet. See [docs/milestones.md](docs/milestones.md).
 
 ReelForge turns raw footage into editable, reviewable vertical video. You can drive it
@@ -42,6 +42,7 @@ pnpm cli media import <project> ~/Footage/*.mp4 ~/Music/track.wav
 pnpm cli clip add <project> --track V1 --asset <asset> --start 0 --duration 4s
 pnpm cli clip split <project> <clip> --at 2s
 pnpm cli clip delete <project> <clip> --ripple
+pnpm cli clip set <project> <clip> --props '{"fadeIn":15,"transitionIn":12,"scale":1.1,"scaleEnd":1.3}'
 pnpm cli timeline undo <project>
 pnpm cli timeline get <project>
 

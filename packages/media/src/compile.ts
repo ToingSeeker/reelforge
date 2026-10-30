@@ -7,6 +7,9 @@ import { sourceInputArgs } from "./probe.ts";
 
 export const AUDIO_RATE = 48_000;
 
+/** Container/stream colour tags matching the BT.709 limited-range conversion we perform. */
+export const BT709_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"];
+
 /** Exact frame → seconds as a decimal string FFmpeg accepts. */
 export function frameSeconds(frames: number, fps: { num: number; den: number }): string {
   return ((frames * fps.den) / fps.num).toFixed(6);
@@ -39,37 +42,88 @@ export function compileRender({ plan, settings, inputs, output }: CompileOptions
     return n++;
   };
 
-  filters.push(`color=c=black:s=${W}x${H}:r=${fps}:d=${sec(plan.totalFrames + 1)},format=yuv420p,setsar=1,settb=${plan.fps.den}/${plan.fps.num}[base]`);
+  // Composite in RGB: each source is converted with its own colour matrix (scale reads the tags),
+  // and the result is encoded once as BT.709 and tagged so, which is what browsers and players assume
+  // for HD. Untagged BT.601 output shifts reds and greens in every player.
+  filters.push(`color=c=black:s=${W}x${H}:r=${fps}:d=${sec(plan.totalFrames + 1)},format=rgba,setsar=1,settb=${plan.fps.den}/${plan.fps.num}[base]`);
   let composite = "base";
   let v = 0;
   for (const layer of plan.layers) {
     for (const seg of layer) {
+      const p = seg.props;
       const still = plan.sources[seg.assetId]?.kind === "image";
-      const i = input(seg.assetId, still ? [] : ["-ss", sec(seg.sourceIn), "-t", sec(seg.duration + 1)]);
-      // Fill the frame (crop to cover), conform to the project rate, take exactly `duration` frames,
-      // then shift to the clip's timeline position.
-      filters.push(
-        `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${fps},format=yuva420p,` +
-          `tpad=stop_mode=clone:stop_duration=${still ? sec(seg.duration) : "0.5"},trim=end_frame=${seg.duration},` +
-          // One tick = one project frame, so the offset is an exact integer. Seconds would be
-          // rounded (1/30 s × 30 = 0.99999 → frame 0) and land cuts a frame early.
-          `settb=${plan.fps.den}/${plan.fps.num},setpts=PTS-STARTPTS+${seg.start}[v${v}]`,
+      const len = seg.renderEnd - seg.renderStart;
+      const i = input(seg.assetId, still ? [] : ["-ss", sec(seg.renderSourceIn), "-t", sec(len + 1)]);
+      const f: string[] = [];
+      if (p.cropLeft || p.cropTop || p.cropRight || p.cropBottom) {
+        f.push(`crop=w=iw*${1 - p.cropLeft - p.cropRight}:h=ih*${1 - p.cropTop - p.cropBottom}:x=iw*${p.cropLeft}:y=ih*${p.cropTop}`);
+      }
+      f.push(
+        p.fit === "cover"
+          ? `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}`
+          : `scale=${W}:${H}:force_original_aspect_ratio=decrease`,
       );
-      filters.push(`[${composite}][v${v}]overlay=eof_action=pass:repeatlast=0:format=auto[c${v}]`);
+      f.push("setsar=1", `fps=${fps}`, "format=rgba");
+      // Exactly `len` frames (clip + dissolve handles), padding with the last frame if the source runs short.
+      f.push(`tpad=stop_mode=clone:stop_duration=${still ? sec(len) : "0.5"}`, `trim=end_frame=${len}`);
+      const animated = p.scaleEnd !== null && p.scaleEnd !== p.scale;
+      if (animated) {
+        // n counts frames from renderStart; the zoom runs across the clip itself (same as scaleAt()).
+        const off = seg.renderStart - seg.start;
+        const span = Math.max(1, seg.duration - 1);
+        f.push(`scale=w='max(2,trunc(iw*(${p.scale}+(${p.scaleEnd! - p.scale})*clip((n+${off})/${span},0,1))/2)*2)':h=-2:eval=frame`);
+      } else if (p.scale !== 1) {
+        f.push(`scale=w='max(2,trunc(iw*${p.scale}/2)*2)':h=-2`);
+      }
+      if (p.rotation) {
+        const a = `${p.rotation}*PI/180`;
+        f.push(`rotate=a=${a}:c=none:ow=rotw(${a}):oh=roth(${a})`);
+      }
+      if (p.opacity < 1) f.push(`colorchannelmixer=aa=${p.opacity}`);
+      // Frame-based alpha ramps; these are the formulas pictureAlpha() mirrors for the live preview.
+      if (seg.inH > 0) f.push(`fade=t=in:s=0:n=${2 * seg.inH}:alpha=1`);
+      if (p.fadeIn > 0) f.push(`fade=t=in:s=${seg.start - seg.renderStart}:n=${p.fadeIn}:alpha=1`);
+      if (p.fadeOut > 0) f.push(`fade=t=out:s=${seg.start + seg.duration - p.fadeOut - seg.renderStart}:n=${p.fadeOut}:alpha=1`);
+      // One tick = one project frame, so the offset is an exact integer. Seconds would be
+      // rounded (1/30 s × 30 = 0.99999 → frame 0) and land cuts a frame early.
+      f.push(`settb=${plan.fps.den}/${plan.fps.num}`, `setpts=PTS-STARTPTS+${seg.renderStart}`);
+      filters.push(`[${i}:v]${f.join(",")}[v${v}]`);
+      const x = `(main_w-overlay_w)/2+${p.x}*main_w`;
+      const y = `(main_h-overlay_h)/2+${p.y}*main_h`;
+      filters.push(`[${composite}][v${v}]overlay=x='${x}':y='${y}':eval=${animated || p.rotation ? "frame" : "init"}:eof_action=pass:repeatlast=0:format=rgb[c${v}]`);
       composite = `c${v}`;
       v++;
     }
   }
-  filters.push(`[${composite}]format=yuv420p[vout]`);
+  filters.push(
+    `[${composite}]scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,` +
+      // Frame colour properties win over encoder flags in current FFmpeg, so set all four here.
+      `setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv[vout]`,
+  );
 
   const total = frameSamples(plan.totalFrames, plan.fps);
+  const smp = (frames: number) => frameSamples(frames, plan.fps);
   const mix: string[] = [];
   plan.audio.forEach((seg, k) => {
-    const i = input(seg.assetId, ["-ss", sec(seg.sourceIn), "-t", sec(seg.duration + 1)]);
-    filters.push(
-      `[${i}:a]aresample=${AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad,` +
-        `atrim=end_sample=${frameSamples(seg.duration, plan.fps)},asetpts=PTS-STARTPTS,adelay=delays=${frameSamples(seg.start, plan.fps)}S:all=1[a${k}]`,
-    );
+    const p = seg.props;
+    const len = seg.renderEnd - seg.renderStart;
+    const end = seg.start + seg.duration;
+    const i = input(seg.assetId, ["-ss", sec(seg.renderSourceIn), "-t", sec(len + 1)]);
+    const f = [
+      `aresample=${AUDIO_RATE}`,
+      "aformat=sample_fmts=fltp:channel_layouts=stereo",
+      "apad",
+      `atrim=end_sample=${smp(len)}`,
+      "asetpts=PTS-STARTPTS",
+    ];
+    if (p.gainDb !== 0) f.push(`volume=${p.gainDb}dB`);
+    // Sample-exact linear ramps; audioGain() is the same function for the live preview.
+    if (seg.inH > 0) f.push(`afade=t=in:ss=0:ns=${smp(2 * seg.inH)}`);
+    if (seg.outH > 0) f.push(`afade=t=out:ss=${smp(end - seg.outH - seg.renderStart)}:ns=${smp(2 * seg.outH)}`);
+    if (p.fadeIn > 0) f.push(`afade=t=in:ss=${smp(seg.start - seg.renderStart)}:ns=${smp(p.fadeIn)}`);
+    if (p.fadeOut > 0) f.push(`afade=t=out:ss=${smp(end - p.fadeOut - seg.renderStart)}:ns=${smp(p.fadeOut)}`);
+    f.push(`adelay=delays=${smp(seg.renderStart)}S:all=1`);
+    filters.push(`[${i}:a]${f.join(",")}[a${k}]`);
     mix.push(`[a${k}]`);
   });
   if (mix.length) {
@@ -97,6 +151,7 @@ export function compileRender({ plan, settings, inputs, output }: CompileOptions
     String(settings.crf),
     "-pix_fmt",
     "yuv420p",
+    ...BT709_TAGS,
     "-profile:v",
     "high",
     "-r",

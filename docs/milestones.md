@@ -75,6 +75,35 @@ Known gaps carried forward:
 - Preview output is fetched whole as a blob (fine for short reels; long timelines should stream via Range with a URL token).
 - Not verified by UI automation: the native save dialog (browser dev mode uses a prompt).
 
+## M2.1 — Look, sound and live preview ✅
+
+Closes the gaps left by M2.
+
+- [x] **Clip properties** (`clip.update`, undoable): fit cover/contain, scale + animated zoom, position, rotation,
+      opacity, crop, fade in/out, dissolve/crossfade in, audio gain. Stored sparse, validated by `ClipPropsSchema`;
+      split hands fade-in to the left half and fade-out to the right; trims shrink fades instead of failing
+- [x] **Dissolves with real handles**: the outgoing clip plays past its out point and the incoming one starts before
+      its in point; the plan shrinks a dissolve to the frames the media actually has, and the Inspector says so
+- [x] **Shared maths** in `render-plan.ts` (`pictureAlpha`, `audioGain`, `placement`, `activeLayers`) used by the FFmpeg
+      compiler and the live preview; FFmpeg ramps are frame-based (`fade s/n`) and sample-based (`afade ss/ns`)
+- [x] **Live preview**: canvas compositor over proxies + WebAudio clock, reacts to every edit and to Inspector drags
+      before they are committed. "Rendered" mode keeps the exact FFmpeg output. Measured parity on a solid-colour
+      project (fade, dissolve, 50 % opacity, scale, offset, 30° rotation): within 3/255 of the full-size export
+- [x] **Colour pipeline**: composite in RGB from each source's own matrix, encode BT.709 limited range and tag it
+      (exports and proxies). Before, untagged BT.601 output shifted colours in browsers and players
+- [x] **Streaming**: proxies, audio, thumbnails and render outputs are served with `Range`; media elements use
+      `?token=` (accepted on media GET routes only). No more whole-file blobs
+- [x] **Native save dialog verified**: `scripts/e2e/native-export.sh` drives the real app through Accessibility
+      (Export → NSSavePanel → Save) and checks the MP4. macOS only, needs Accessibility permission; not in CI
+- [x] Inspector panel (right panel tab), fade/dissolve markers on clips, `clip set` / `--props` in the CLI
+- [x] 77 tests: pixel-level render checks for contain/scale/position/rotation, opacity/fade/dissolve blends, audio gain
+      and fades, BT.709 tags; unit tests for handles, ramps and placement
+
+Known gaps carried forward:
+- RGB compositing made the 30 s 1080×1920 export ~2× slower (≈10 s on this Mac); worth optimising later.
+- The live preview has no limiter (the export applies a -1 dBFS limiter), so very hot mixes can sound louder live.
+- Colour grading (brightness/contrast/saturation/temperature/LUT) is still to do (PRD §12).
+
 ## M3–M6
 
 Media Intelligence → AI Director → MCP & Automation → Alpha Release. See the PRD.

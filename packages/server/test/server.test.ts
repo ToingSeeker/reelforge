@@ -177,3 +177,29 @@ test("M2 over REST: preview job (deduped per revision), Range output, export val
   const list = ((await (await call(srv, "GET", `/v1/projects/${project.id}/jobs?kind=preview`)).json()) as any).jobs;
   assert.equal(list.length, 1);
 });
+
+test("media streaming: ?token= only on media GETs; proxies for video/image, originals for audio, with Range", async (t) => {
+  const srv = await boot(t);
+  const f = fixtures();
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Media" } })).json()) as any;
+  const r = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [f.portrait, f.png, f.mp3] } })).json()) as any;
+  const [video, image, audio] = r.imported;
+  const q = `?token=${TOKEN}`;
+
+  assert.equal((await call(srv, "GET", `/v1/projects${q}`, { auth: false })).status, 401, "query token is not a general credential");
+  assert.equal((await call(srv, "GET", `/v1/projects/${project.id}/assets/${video.id}/media?token=wrong`, { auth: false })).status, 401);
+
+  const v = await call(srv, "GET", `/v1/projects/${project.id}/assets/${video.id}/media${q}`, { auth: false, headers: { range: "bytes=0-1023" } });
+  assert.equal(v.status, 206);
+  assert.equal(v.headers.get("content-type"), "video/mp4");
+  assert.equal((await v.arrayBuffer()).byteLength, 1024);
+
+  const img = await call(srv, "GET", `/v1/projects/${project.id}/assets/${image.id}/media${q}`, { auth: false });
+  assert.equal(img.headers.get("content-type"), "image/jpeg");
+  const a = await call(srv, "GET", `/v1/projects/${project.id}/assets/${audio.id}/media${q}`, { auth: false });
+  assert.equal(a.headers.get("content-type"), "audio/mpeg");
+  assert.equal((await a.arrayBuffer()).byteLength, (await import("node:fs")).statSync(f.mp3).size, "audio is the original file");
+
+  const thumb = await call(srv, "GET", `/v1/projects/${project.id}/assets/${video.id}/thumbnail${q}`, { auth: false });
+  assert.equal(thumb.status, 200);
+});

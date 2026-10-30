@@ -80,6 +80,20 @@ Timeline ──buildRenderPlan──▶ RenderPlan (frames, layers bottom→top,
 - Output: `.<name>.partial-<job>.mp4` in the target folder → ffprobe verification → `link()` to the final name (fails
   rather than overwrites) → unlink the temp file.
 
+## Live preview
+
+`apps/desktop/src/compositor.ts` draws the same `RenderPlan` on a canvas. Each visible clip gets a muted `<video>`
+on its proxy (warmed up ~1.5 s before it starts, released when far away); stills use ≤1280 px JPEG proxies. Sound is
+decoded into WebAudio buffers and scheduled with gain envelopes from `audioGain()`; the AudioContext clock drives the
+picture, and videos are re-seeked when they drift more than 3 frames. Scrubbing seeks to the middle of the frame.
+
+## Colour
+
+Layers are composited in RGB after each source is converted with its own matrix (FFmpeg's scale reads the frame tags),
+then encoded as BT.709 limited range with all four colour tags set on the frames (`setparams`), because current FFmpeg
+lets frame properties override encoder flags. Proxies get the same conversion so the browser decodes them to the same
+colours the export produces.
+
 ## REST API (v1)
 
 | Method | Path | |
@@ -98,6 +112,10 @@ Timeline ──buildRenderPlan──▶ RenderPlan (frames, layers bottom→top,
 | GET | `/v1/projects/:id/jobs?kind=` · `/artifacts` | job list · finished exports |
 | GET | `/v1/jobs/:id` · POST `/cancel` · `/retry` | job status and control |
 | GET | `/v1/jobs/:id/output` | rendered MP4, supports `Range` |
+| GET | `/v1/projects/:id/assets/:assetId/media` | what the live preview plays: video proxy, still proxy or original audio (`Range`) |
+
+Media GET routes (`media`, `thumbnail`, job `output`) also accept `?token=` because media elements cannot send headers.
+No other route does, and the access log never records query strings.
 
 ## Sidecar lifecycle
 

@@ -3,8 +3,8 @@
 // rejected batch can never leave a half-applied timeline (FR-015, FR-018).
 
 import { ReelForgeError } from "./errors.ts";
-import type { Asset, Clip, TimelineOp, Track, TrackKind } from "./schema.ts";
-import { MAX_FRAME } from "./schema.ts";
+import type { Asset, Clip, ClipPropsPatch, TimelineOp, Track, TrackKind } from "./schema.ts";
+import { MAX_FRAME, sparseClipProps } from "./schema.ts";
 import { secondsToFrames, type Rational } from "./timebase.ts";
 
 export type AssetInfo = Pick<Asset, "id" | "kind" | "durationFrames" | "hasVideo" | "hasAudio">;
@@ -35,6 +35,16 @@ export function canPlace(asset: AssetInfo, track: TrackKind): boolean {
 }
 
 export const clipEnd = (c: Clip) => c.start + c.duration;
+
+/** Fades and transitions shrink with the clip instead of blocking a trim. */
+function fitProps(p: ClipPropsPatch, duration: number): ClipPropsPatch {
+  const out = { ...p };
+  if (out.fadeIn !== undefined) out.fadeIn = Math.min(out.fadeIn, duration);
+  if (out.fadeOut !== undefined) out.fadeOut = Math.min(out.fadeOut, duration - (out.fadeIn ?? 0));
+  if (out.transitionIn !== undefined) out.transitionIn = Math.min(out.transitionIn, duration);
+  if (out.scaleEnd === null) delete out.scaleEnd;
+  return sparseClipProps(out);
+}
 
 class Draft {
   readonly tracks: Map<string, Track>;
@@ -92,8 +102,9 @@ class Draft {
   }
 
   put(c: Clip): void {
-    this.clips.set(c.id, c);
-    this.check(c);
+    const fixed = { ...c, props: fitProps(c.props, c.duration) };
+    this.clips.set(c.id, fixed);
+    this.check(fixed);
   }
 }
 
@@ -110,7 +121,13 @@ function apply(d: Draft, op: TimelineOp, newId: () => string): void {
           : asset.durationFrames - sourceIn);
       const id = op.clipId ?? newId();
       if (d.clips.has(id)) fail(`clip ${id} already exists`, { clipId: id });
-      d.put({ id, trackId: op.trackId, assetId: op.assetId, start: op.start, duration, sourceIn });
+      d.put({ id, trackId: op.trackId, assetId: op.assetId, start: op.start, duration, sourceIn, props: op.props ?? {} });
+      return;
+    }
+    case "clip.update": {
+      const c = d.clip(op.clipId);
+      d.unlocked(c.trackId);
+      d.put({ ...c, props: { ...c.props, ...op.props } });
       return;
     }
     case "clip.move": {
@@ -143,8 +160,11 @@ function apply(d: Draft, op: TimelineOp, newId: () => string): void {
       const left = op.frame - c.start;
       const id = op.newClipId ?? newId();
       if (d.clips.has(id)) fail(`clip ${id} already exists`, { clipId: id });
-      d.put({ ...c, duration: left });
-      d.put({ ...c, id, start: op.frame, sourceIn: c.sourceIn + left, duration: c.duration - left });
+      // The left half keeps the entry (fade in, incoming transition), the right half the exit (fade out).
+      const { fadeOut, ...leftProps } = c.props;
+      const { fadeIn: _fi, transitionIn: _ti, ...rightProps } = c.props;
+      d.put({ ...c, duration: left, props: leftProps });
+      d.put({ ...c, id, start: op.frame, sourceIn: c.sourceIn + left, duration: c.duration - left, props: { ...rightProps, ...(fadeOut ? { fadeOut } : {}) } });
       return;
     }
     case "clip.delete": {

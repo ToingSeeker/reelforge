@@ -461,6 +461,9 @@ function ClipView(p: ClipViewProps) {
       <span className="rf-clip-label">
         {missing && <Icon name="alert" size={12} />} {p.asset?.filename.replace(/\.[^.]+$/, "") ?? "clip"}
       </span>
+      {!!p.clip.props.transitionIn && <span className="rf-clip-transition" style={{ width: (p.clip.props.transitionIn / 2) * p.pxPerFrame }} title="Dissolve / crossfade in" />}
+      {!!p.clip.props.fadeIn && <span className="rf-clip-fade rf-clip-fade-in" style={{ width: p.clip.props.fadeIn * p.pxPerFrame }} />}
+      {!!p.clip.props.fadeOut && <span className="rf-clip-fade rf-clip-fade-out" style={{ width: p.clip.props.fadeOut * p.pxPerFrame }} />}
       <span className="rf-clip-handle rf-clip-handle-start" />
       <span className="rf-clip-handle rf-clip-handle-end" />
     </div>

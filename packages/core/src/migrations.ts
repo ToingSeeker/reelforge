@@ -180,5 +180,13 @@ export const MIGRATIONS: readonly Migration[] = [
       ) STRICT;
     `,
   },
+  {
+    version: 4,
+    name: "clip_props",
+    sql: `
+      -- Sparse per-clip look/sound settings (transform, fades, transition, gain), validated by ClipPropsSchema.
+      ALTER TABLE clips ADD COLUMN props TEXT NOT NULL DEFAULT '{}';
+    `,
+  },
 ];
 

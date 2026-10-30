@@ -14,7 +14,7 @@ import {
   type Database,
   type ErrorCode,
 } from "@reelforge/core";
-import { createRenderJob, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import { createRenderJob, ensureProxy, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 
 // Local REST API (PRD §15). Loopback only, bearer token always required,
 // Host/Origin checked so a web page can't reach it via DNS rebinding.
@@ -64,12 +64,42 @@ function sendError(res: ServerResponse, err: ReelForgeError) {
   send(res, STATUS[err.code], { error: err.toJSON() });
 }
 
-function tokenMatches(header: string | undefined, token: string): boolean {
-  const m = /^Bearer (.+)$/.exec(header ?? "");
-  if (!m?.[1]) return false;
-  const a = Buffer.from(m[1]);
+function sameToken(given: string, token: string): boolean {
+  const a = Buffer.from(given);
   const b = Buffer.from(token);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function tokenMatches(header: string | undefined, token: string): boolean {
+  const m = /^Bearer (.+)$/.exec(header ?? "");
+  return !!m?.[1] && sameToken(m[1], token);
+}
+
+/**
+ * Stream a file, honouring a single byte Range so <video>/<audio> can seek
+ * without downloading everything first.
+ */
+function sendFile(req: IncomingMessage, res: ServerResponse, path: string, contentType: string) {
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    throw new ReelForgeError("NOT_FOUND", "file is no longer on disk");
+  }
+  const headers = { "content-type": contentType, "accept-ranges": "bytes", "cache-control": "private, max-age=3600", "x-content-type-options": "nosniff" };
+  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
+  if (range && (range[1] || range[2])) {
+    const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
+    const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+    if (start > end || start >= size) {
+      res.writeHead(416, { "content-range": `bytes */${size}` });
+      return res.end();
+    }
+    res.writeHead(206, { ...headers, "content-range": `bytes ${start}-${end}/${size}`, "content-length": String(end - start + 1) });
+    return createReadStream(path, { start, end }).pipe(res);
+  }
+  res.writeHead(200, { ...headers, "content-length": String(size) });
+  createReadStream(path).pipe(res);
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -102,6 +132,8 @@ interface Route {
   method: string;
   pattern: RegExp;
   handle: (ctx: RouteContext) => unknown;
+  /** Read-only media endpoint that also accepts ?token= (for media elements). */
+  media?: boolean;
 }
 
 const re = (path: string) => new RegExp(`^${path}$`);
@@ -219,34 +251,33 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     },
     {
       method: "GET",
+      media: true,
       pattern: re(`/v1/jobs/${ID}/output`),
       handle: ({ req, res, params: [id] }) => {
         const job = jobs.get(id!);
         if (job.state !== "completed" || !job.outputPath) throw new ReelForgeError("NOT_FOUND", `job is ${job.state}; no output yet`, { jobId: job.id });
-        let size: number;
-        try {
-          size = statSync(job.outputPath).size;
-        } catch {
-          throw new ReelForgeError("NOT_FOUND", "the rendered file is no longer on disk", { jobId: job.id });
+        return sendFile(req, res, job.outputPath, "video/mp4");
+      },
+    },
+    {
+      // What the live preview plays: the proxy for video, a ≤1280 px still for images, the file itself for audio.
+      method: "GET",
+      media: true,
+      pattern: re(`/v1/projects/${ID}/assets/${ID}/media`),
+      handle: async ({ req, res, params: [id, assetId] }) => {
+        const asset = assets.get(id!, assetId!);
+        if (asset.status === "missing") throw new ReelForgeError("NOT_FOUND", "source media is offline", { assetId: asset.id });
+        if (asset.kind === "audio") {
+          const ext = asset.sourcePath.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav";
+          return sendFile(req, res, asset.sourcePath, ext);
         }
-        const headers = { "content-type": "video/mp4", "accept-ranges": "bytes", "cache-control": "private, max-age=3600", "x-content-type-options": "nosniff" };
-        const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
-        if (range && (range[1] || range[2])) {
-          const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
-          const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
-          if (start > end || start >= size) {
-            res.writeHead(416, { "content-range": `bytes */${size}` });
-            return res.end();
-          }
-          res.writeHead(206, { ...headers, "content-range": `bytes ${start}-${end}/${size}`, "content-length": String(end - start + 1) });
-          return createReadStream(job.outputPath, { start, end }).pipe(res);
-        }
-        res.writeHead(200, { ...headers, "content-length": String(size) });
-        createReadStream(job.outputPath).pipe(res);
+        const path = await ensureProxy(opts.db, opts.cacheDir, asset.id, asset.sourcePath, asset.kind);
+        return sendFile(req, res, path, asset.kind === "image" ? "image/jpeg" : "video/mp4");
       },
     },
     {
       method: "GET",
+      media: true,
       pattern: re(`/v1/projects/${ID}/assets/${ID}/thumbnail`),
       handle: async ({ res, params: [id, assetId] }) => {
         const thumb = await ensureThumbnail(opts.cacheDir, assets.get(id!, assetId!));
@@ -290,7 +321,12 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       if (req.method === "GET" && path === "/v1/health") {
         return send(res, 200, { ok: true, name: "reelforge", api: "v1" });
       }
-      if (!tokenMatches(req.headers.authorization, opts.token)) {
+      // <video>, <audio> and <img> can't send headers, so media GETs may carry the token as ?token=.
+      // Only those routes accept it; the access log never records query strings.
+      const queryToken = url.searchParams.get("token");
+      const mediaRoute = req.method === "GET" && routes.some((r) => r.media && r.method === "GET" && r.pattern.test(path));
+      const authed = tokenMatches(req.headers.authorization, opts.token) || (mediaRoute && queryToken !== null && sameToken(queryToken, opts.token));
+      if (!authed) {
         return sendError(res, new ReelForgeError("UNAUTHORIZED", "missing or invalid bearer token"));
       }
 

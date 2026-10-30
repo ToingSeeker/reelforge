@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { RenderJob, Timeline } from "@reelforge/core/schema";
 import { ApiError, type Client } from "./api.ts";
 import type { Notify } from "./editor.ts";
@@ -31,26 +31,19 @@ export interface PreviewState {
  * a short pause in editing) asks the engine for a preview of exactly that
  * revision, rendered through the same graph as the export.
  */
-export function usePreview(client: Client | null, timeline: Timeline | null): PreviewState {
+export function usePreview(client: Client | null, timeline: Timeline | null, enabled = true): PreviewState {
   const [state, setState] = useState<PreviewState>({ url: null, revision: null, pending: null, error: null });
   const projectId = timeline?.project.id ?? null;
   const revision = timeline?.project.revision ?? null;
   const empty = !timeline || timeline.durationFrames === 0;
-  const urlRef = useRef<string | null>(null);
-
   useEffect(() => {
-    // New project: drop the old preview.
-    if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-    urlRef.current = null;
     setState({ url: null, revision: null, pending: null, error: null });
   }, [projectId]);
 
   useEffect(() => {
     if (!client || !projectId || revision === null) return;
-    if (empty) {
-      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-      urlRef.current = null;
-      setState({ url: null, revision, pending: null, error: null });
+    if (empty || !enabled) {
+      if (empty) setState({ url: null, revision, pending: null, error: null });
       return;
     }
     let alive = true;
@@ -63,11 +56,8 @@ export function usePreview(client: Client | null, timeline: Timeline | null): Pr
           setState((s) => ({ ...s, pending: null, error: done.error?.message ?? `preview ${done.state}` }));
           return;
         }
-        const url = URL.createObjectURL(await client.jobOutput(done.id));
-        if (!alive) return URL.revokeObjectURL(url);
-        if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-        urlRef.current = url;
-        setState({ url, revision: done.revision, pending: null, error: null });
+        // Streamed with Range from the engine; nothing is held in memory.
+        setState({ url: client.outputUrl(done.id), revision: done.revision, pending: null, error: null });
       } catch (e) {
         if (alive) setState((s) => ({ ...s, pending: null, error: e instanceof ApiError ? e.message : String(e) }));
       }
@@ -76,7 +66,7 @@ export function usePreview(client: Client | null, timeline: Timeline | null): Pr
       alive = false;
       clearTimeout(timer);
     };
-  }, [client, projectId, revision, empty]);
+  }, [client, projectId, revision, empty, enabled]);
 
   return state;
 }

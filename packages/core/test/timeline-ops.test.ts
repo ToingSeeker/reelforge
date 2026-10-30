@@ -28,7 +28,7 @@ function state(clips: Clip[] = [], trackPatch: Partial<Record<string, Partial<Tr
 }
 
 const clip = (n: number, start: number, duration: number, extra: Partial<Clip> = {}): Clip => ({
-  id: T(100 + n), trackId: V1, assetId: VID, start, duration, sourceIn: 0, ...extra,
+  id: T(100 + n), trackId: V1, assetId: VID, start, duration, sourceIn: 0, props: {}, ...extra,
 });
 
 let seq = 0;

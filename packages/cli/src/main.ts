@@ -58,6 +58,8 @@ Usage:
   reelforge clip trim <project> <clip> --edge start|end --at <t>
   reelforge clip split <project> <clip> --at <t>
   reelforge clip delete <project> <clip>... [--ripple]
+  reelforge clip set <project> <clip> --props '{"opacity":0.5,"fadeIn":15,"transitionIn":10,"gainDb":-6}'
+                   (also on clip add; fields: fit scale scaleEnd x y rotation opacity crop* fadeIn fadeOut transitionIn gainDb)
 
   reelforge render <project> --out <file.mp4>      (H.264/AAC at project size; never overwrites)
   reelforge preview <project>                      (low-res render of the same graph, from proxies)
@@ -119,6 +121,7 @@ const OPTIONS = {
   edge: { type: "string" },
   ripple: { type: "boolean" },
   out: { type: "string" },
+  props: { type: "string" },
   wait: { type: "boolean" },
 } as const;
 
@@ -313,7 +316,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
         start: need(time(ctx, p, v.start), "--start"),
         ...(sourceIn !== undefined ? { sourceIn } : {}),
         ...(duration !== undefined ? { duration } : {}),
-      },
+        ...(v.props !== undefined ? { props: propsFlag(v.props) } : {}),
+      } as TimelineOp,
     ]);
   },
   "clip move": (ctx) => {
@@ -336,6 +340,10 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
   "clip split": (ctx) => {
     const p = need(ctx.args[0], "<project>");
     return edit(ctx, p, [{ type: "clip.split", clipId: need(ctx.args[1], "<clip>"), frame: need(time(ctx, p, ctx.values.at), "--at") }]);
+  },
+  "clip set": (ctx) => {
+    const p = need(ctx.args[0], "<project>");
+    return edit(ctx, p, [{ type: "clip.update", clipId: need(ctx.args[1], "<clip>"), props: need(propsFlag(ctx.values.props), "--props") } as TimelineOp]);
   },
   "jobs list": ({ db, args }) => ({ jobs: new JobStore(db).list(need(args[0], "<project>")) }),
   "jobs get": ({ db, args }) => ({ job: new JobStore(db).get(need(args[0], "<job>")) }),
@@ -376,6 +384,17 @@ async function runQueued(db: Database, env: NodeJS.ProcessEnv, io: Io, jobId: st
     clearInterval(timer);
     process.removeListener("SIGINT", onSigint);
   }
+}
+
+function propsFlag(v: string | undefined): Record<string, unknown> | undefined {
+  if (v === undefined) return undefined;
+  try {
+    const p = JSON.parse(v) as unknown;
+    if (p && typeof p === "object" && !Array.isArray(p)) return p as Record<string, unknown>;
+  } catch {
+    /* fall through */
+  }
+  invalid('--props must be a JSON object, e.g. \'{"opacity":0.5}\'');
 }
 
 function history(ctx: Ctx, dir: "undo" | "redo") {

@@ -57,7 +57,12 @@ export function createClient(info: ApiInfo) {
     return json as T;
   }
 
+  const q = `token=${encodeURIComponent(info.token)}`;
   return {
+    /** Streamable URLs for media elements (which can't send an Authorization header). */
+    mediaUrl: (id: string, assetId: string) => `${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/media?${q}`,
+    thumbnailUrl: (id: string, assetId: string) => `${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/thumbnail?${q}`,
+    outputUrl: (jobId: string) => `${info.url}/v1/jobs/${encodeURIComponent(jobId)}/output?${q}`,
     listProjects: () => request<{ projects: Project[] }>("GET", "/v1/projects").then((r) => r.projects),
     createProject: (input: CreateProjectInput) =>
       request<{ project: Project }>("POST", "/v1/projects", input).then((r) => r.project),
@@ -87,20 +92,6 @@ export function createClient(info: ApiInfo) {
     jobs: (id: string) => request<{ jobs: RenderJob[] }>("GET", `/v1/projects/${encodeURIComponent(id)}/jobs`).then((r) => r.jobs),
     cancelJob: (jobId: string) => request<{ job: RenderJob }>("POST", `/v1/jobs/${encodeURIComponent(jobId)}/cancel`).then((r) => r.job),
     retryJob: (jobId: string) => request<{ job: RenderJob }>("POST", `/v1/jobs/${encodeURIComponent(jobId)}/retry`).then((r) => r.job),
-    /** The preview file, as a blob (a <video src> can't carry the bearer token). */
-    jobOutput: async (jobId: string): Promise<Blob> => {
-      const res = await fetch(`${info.url}/v1/jobs/${encodeURIComponent(jobId)}/output`, { headers: { authorization: `Bearer ${info.token}` } });
-      if (!res.ok) throw new ApiError(res.status, "OUTPUT", `render output unavailable (${res.status})`);
-      return res.blob();
-    },
-    /** Thumbnails need the bearer token, so they're fetched and handed to <img> as blob URLs. */
-    thumbnail: async (id: string, assetId: string): Promise<Blob> => {
-      const res = await fetch(`${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/thumbnail`, {
-        headers: { authorization: `Bearer ${info.token}` },
-      });
-      if (!res.ok) throw new ApiError(res.status, "THUMBNAIL", `thumbnail unavailable (${res.status})`);
-      return res.blob();
-    },
   };
 }
 

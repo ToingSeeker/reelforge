@@ -172,3 +172,19 @@ test("render and preview from the CLI, JSON job result, path rules", async (t) =
   assert.equal(jobs.json.jobs.length, 2);
   assert.equal((await run("jobs", "cancel", r.json.job.id)).code, 2);
 });
+
+test("clip set / --props: look and sound from the CLI, validated", async (t) => {
+  const run = harness(t);
+  const { fixtures } = await import("../../media/test/fixtures.ts");
+  const f = fixtures();
+  const id = (await run("project", "create", "--name", "Props")).json.project.id;
+  const asset = (await run("media", "import", id, f.portrait)).json.imported[0];
+  const added = await run("clip", "add", id, "--track", "V1", "--asset", asset.id, "--start", "0", "--props", '{"fit":"contain"}');
+  assert.equal(added.code, 0, JSON.stringify(added.error));
+  const clip = added.json.timeline.clips[0];
+  assert.deepEqual(clip.props, { fit: "contain" });
+  const set = await run("clip", "set", id, clip.id, "--props", '{"opacity":0.5,"fadeIn":10}');
+  assert.deepEqual(set.json.timeline.clips[0].props, { fit: "contain", opacity: 0.5, fadeIn: 10 });
+  assert.equal((await run("clip", "set", id, clip.id, "--props", '{"opacity":3}')).code, 2);
+  assert.equal((await run("clip", "set", id, clip.id, "--props", "nope")).code, 2);
+});

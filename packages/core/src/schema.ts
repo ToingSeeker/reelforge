@@ -144,6 +144,74 @@ export interface Track {
   hidden: boolean;
 }
 
+/**
+ * Per-clip look and sound. Stored sparse (only what differs from the
+ * defaults); `resolveClipProps` fills in the rest. Every value is a plain
+ * number so FFmpeg and the live preview can apply identical maths.
+ */
+export const ClipPropsSchema = z
+  .object({
+    /** cover = fill the frame (cropping), contain = fit inside it (letterbox). */
+    fit: z.enum(["cover", "contain"]),
+    /** Size multiplier around the frame centre. */
+    scale: z.number().min(0.05).max(10),
+    /** If set, scale animates linearly from `scale` to this over the clip (zoom / Ken Burns). */
+    scaleEnd: z.number().min(0.05).max(10).nullable(),
+    /** Centre offset as a fraction of the frame width / height. */
+    x: z.number().min(-2).max(2),
+    y: z.number().min(-2).max(2),
+    /** Degrees, clockwise. */
+    rotation: z.number().min(-360).max(360),
+    opacity: z.number().min(0).max(1),
+    /** Fraction of the source cut from each edge before fitting. */
+    cropLeft: z.number().min(0).max(0.45),
+    cropTop: z.number().min(0).max(0.45),
+    cropRight: z.number().min(0).max(0.45),
+    cropBottom: z.number().min(0).max(0.45),
+    /** Frames. Picture fades through transparency (to whatever is below), audio fades to silence. */
+    fadeIn: z.number().int().min(0).max(MAX_FRAME),
+    fadeOut: z.number().int().min(0).max(MAX_FRAME),
+    /** Frames of dissolve (picture) / crossfade (audio) from the clip that ends where this one starts. */
+    transitionIn: z.number().int().min(0).max(MAX_FRAME),
+    /** Audio gain in dB (audio tracks). */
+    gainDb: z.number().min(-60).max(12),
+  })
+  .strict();
+export type ClipProps = z.infer<typeof ClipPropsSchema>;
+export const ClipPropsPatchSchema = ClipPropsSchema.partial();
+export type ClipPropsPatch = z.infer<typeof ClipPropsPatchSchema>;
+
+export const DEFAULT_CLIP_PROPS: ClipProps = {
+  fit: "cover",
+  scale: 1,
+  scaleEnd: null,
+  x: 0,
+  y: 0,
+  rotation: 0,
+  opacity: 1,
+  cropLeft: 0,
+  cropTop: 0,
+  cropRight: 0,
+  cropBottom: 0,
+  fadeIn: 0,
+  fadeOut: 0,
+  transitionIn: 0,
+  gainDb: 0,
+};
+
+export function resolveClipProps(p: ClipPropsPatch | undefined): ClipProps {
+  return { ...DEFAULT_CLIP_PROPS, ...p };
+}
+
+/** Keep only values that differ from the defaults (what gets stored). */
+export function sparseClipProps(p: ClipPropsPatch): ClipPropsPatch {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (v !== undefined && v !== DEFAULT_CLIP_PROPS[k as keyof ClipProps]) out[k] = v;
+  }
+  return out as ClipPropsPatch;
+}
+
 export interface Clip {
   id: string;
   trackId: string;
@@ -153,6 +221,8 @@ export interface Clip {
   duration: number;
   /** Offset into the source, project frames. */
   sourceIn: number;
+  /** Sparse look/sound settings; see resolveClipProps. */
+  props: ClipPropsPatch;
 }
 
 export interface Timeline {
@@ -174,6 +244,13 @@ export const TimelineOpSchema = z.discriminatedUnion("type", [
     start: Frame,
     sourceIn: Frame.optional(),
     duration: FrameCount.optional(),
+    props: ClipPropsPatchSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("clip.update"),
+    clipId: z.uuid(),
+    /** Fields to change; others keep their value. */
+    props: ClipPropsPatchSchema,
   }),
   z.object({
     type: z.literal("clip.move"),
