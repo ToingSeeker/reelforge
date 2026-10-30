@@ -155,7 +155,7 @@ running its own render/analysis runners (jobs are claimed atomically, so it coex
 |---|---|
 | Timeline changes need a person | `timeline_propose_edit` and `captions_generate` only create proposals. `timeline_apply_proposal` asks the user through MCP **elicitation**; if the client can't elicit, it returns `approval_required` with the ReelForge / CLI way to approve. Approvals are recorded as `mcp:elicitation:<client>`. |
 | Same validation as everywhere | Operations from the client go through the AI output parser (placeholders, schema) and the dry run. |
-| No AI self-approval in workflows | `workflows_run` never accepts `approveAi`; AI Director steps stop at `waiting_approval`. |
+| No AI self-approval in workflows | A workflow sent over MCP was written by the client, so running it is not consent: if it has steps that change the timeline (`append`, `edit`, `captions`), `workflows_run` asks the user (elicitation) and otherwise returns `approval_required`. `runWorkflow` enforces this itself (`timelineEditsApproved: false` fails those steps). `approveAi` is never taken from the client. |
 | Tool names | PRD §14 names with `_` instead of `.` (`timeline_get`, …): Claude's API rejects dots in tool names. |
 
 Workflows (`@reelforge/automation`) are JSON recipes validated with zod before anything runs; each step's status,

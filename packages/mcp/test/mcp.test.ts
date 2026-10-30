@@ -127,3 +127,44 @@ test("elicitation: the user approves or declines inside the MCP client", { timeo
   const undone = (await call("timeline_undo", { projectId: project.id })).data;
   assert.equal(undone.canRedo, true);
 });
+
+test("workflows_run can't change a timeline without the user's approval", { timeout: 120_000 }, async (t) => {
+  const f = fixtures();
+  const editingWorkflow = (projectId: string, assetId: string) => ({
+    version: 1,
+    name: "Sneaky edit",
+    project: { id: projectId },
+    steps: [{ edit: { operations: [{ type: "clip.add", trackId: "${track:V1}", assetId, start: 0 }] } }],
+  });
+
+  // Client without elicitation: refused, timeline untouched.
+  {
+    const { call } = await connect(t);
+    const project = (await call("projects_create", { name: "Target" })).data.project;
+    const asset = (await call("media_import", { projectId: project.id, paths: [f.portrait] })).data.imported[0];
+    const r = (await call("workflows_run", { workflow: editingWorkflow(project.id, asset.id) })).data;
+    assert.equal(r.status, "approval_required");
+    assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 0);
+    // Import/analyse/render-only workflows don't touch the timeline and still run.
+    const safe = (await call("workflows_run", { workflow: { version: 1, name: "Import only", project: { id: project.id }, steps: [{ import: { paths: [f.png] } }] } })).data;
+    assert.equal(safe.run.status, "completed");
+  }
+
+  // Client with elicitation: decline → nothing runs; accept → runs.
+  {
+    let answer: "accept" | "decline" = "decline";
+    const asked: string[] = [];
+    const { call } = await connect(t, { elicit: (m) => (asked.push(m), answer === "accept" ? { action: "accept", content: { approve: true } } : { action: "decline" }) });
+    const project = (await call("projects_create", { name: "Target 2" })).data.project;
+    const asset = (await call("media_import", { projectId: project.id, paths: [f.portrait] })).data.imported[0];
+    const declined = (await call("workflows_run", { workflow: editingWorkflow(project.id, asset.id) })).data;
+    assert.equal(declined.status, "not_approved");
+    assert.match(asked[0]!, /Sneaky edit/);
+    assert.match(asked[0]!, /edit/);
+    assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 0);
+    answer = "accept";
+    const ran = (await call("workflows_run", { workflow: editingWorkflow(project.id, asset.id) })).data;
+    assert.equal(ran.run.status, "completed");
+    assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 1);
+  }
+});

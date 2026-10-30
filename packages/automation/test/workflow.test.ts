@@ -115,3 +115,16 @@ test("an AI Director step waits for approval unless --approve-ai", async (t) => 
   assert.equal(approved.status, "completed");
   assert.deepEqual(new TimelineStore(s.db).get(approved.projectId!).clips[0]!.props, { fadeOut: 9 });
 });
+
+test("timelineEditsApproved: false blocks every timeline-changing step in the runner itself", async (t) => {
+  const s = db(t);
+  const run = await runWorkflow(
+    s.db,
+    { version: 1, name: "Unapproved", project: { name: "U" }, steps: [{ import: { paths: [join(dir, "footage", "a_red.mp4")] } }, { append: { asset: "a_red.mp4", track: "V1" } }] },
+    { cacheDir: s.cacheDir, actor: "mcp", baseDir: dir, timelineEditsApproved: false },
+  );
+  assert.equal(run.status, "failed");
+  assert.deepEqual(run.steps.map((x) => x.status), ["completed", "failed"]);
+  assert.match(run.error!, /needs the user's approval/);
+  assert.equal(new TimelineStore(s.db).get(run.projectId!).clips.length, 0);
+});

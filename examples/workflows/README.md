@@ -19,4 +19,5 @@ reelforge workflow runs
 | `director {instruction, provider?, model?}` | Asks the AI Director; the run waits for your approval unless `--approve-ai` |
 | `preview {}` · `render {out}` | Preview render · MP4 export (never overwrites) |
 
-Steps you write out are approved by running the workflow. AI Director steps are not: the AI can only propose.
+Steps you write out are approved by running the workflow yourself (CLI or Automate). AI Director steps are not: the AI
+can only propose. A workflow an AI client sends over MCP is not approved by being run: the client must ask you first.

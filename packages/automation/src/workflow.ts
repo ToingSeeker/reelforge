@@ -80,6 +80,12 @@ export function parseWorkflow(input: unknown): WorkflowSpec {
 
 const stepKind = (s: WorkflowStep) => Object.keys(s)[0]!;
 
+/** Steps that change the timeline directly (director steps make proposals and are gated separately). */
+export const TIMELINE_STEPS = new Set(["append", "edit", "captions"]);
+export function timelineSteps(spec: WorkflowSpec): { index: number; kind: string }[] {
+  return spec.steps.map((s, index) => ({ index, kind: stepKind(s) })).filter((x) => TIMELINE_STEPS.has(x.kind));
+}
+
 export interface RunOptions {
   cacheDir: string;
   actor: Actor;
@@ -88,6 +94,11 @@ export interface RunOptions {
   source?: string | null;
   /** The person running it also approves AI Director proposals. */
   approveAi?: boolean;
+  /**
+   * Whether the steps that change the timeline (append, edit, captions) are approved. True when a person runs
+   * the file (CLI, desktop). An AI client (MCP) that wrote the workflow must get the user's approval first.
+   */
+  timelineEditsApproved?: boolean;
   signal?: AbortSignal;
   /** Called with the run id as soon as the run is recorded (for callers that don't wait). */
   onStart?: (runId: string) => void;
@@ -202,7 +213,11 @@ export async function runWorkflow(db: Database, input: unknown, opts: RunOptions
   runs.setProject(run.id, projectId);
 
   const timeline = new TimelineStore(db);
-  const apply = (ops: TimelineOp[], label: string) => timeline.apply(projectId, { baseRevision: timeline.get(projectId).project.revision, operations: ops }, opts.actor, { workflowRunId: run.id, step: label });
+  const apply = (ops: TimelineOp[], label: string) => {
+    // Enforced here too, not only by callers: an unapproved run can never write to the timeline.
+    if (opts.timelineEditsApproved === false) throw new ReelForgeError("VALIDATION_ERROR", `${label} needs the user's approval before it can change the timeline`);
+    return timeline.apply(projectId, { baseRevision: timeline.get(projectId).project.revision, operations: ops }, opts.actor, { workflowRunId: run.id, step: label });
+  };
 
   for (const [index, step] of spec.steps.entries()) {
     if (opts.signal?.aborted) return runs.finish(run.id, "failed", "cancelled");

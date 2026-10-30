@@ -26,7 +26,7 @@ import {
 } from "@reelforge/core";
 import { AnalysisRunner, createRenderJob, importMedia, RenderRunner } from "@reelforge/media";
 import { ANTHROPIC_DEFAULT_MODEL, listOllamaModels, OPERATIONS_GUIDE, parseModelOutput, propose, providerFor } from "@reelforge/ai";
-import { runWorkflow } from "@reelforge/automation";
+import { parseWorkflow, runWorkflow, timelineSteps } from "@reelforge/automation";
 
 export const SERVER_INFO = { name: "reelforge", version: "0.0.0" };
 
@@ -321,14 +321,36 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       title: "Run a workflow",
       description:
         "Run a ReelForge workflow JSON (version 1: name, project {id}|{name}, steps of import/analyze/append/edit/captions/director/preview/render). " +
-        "Runs to completion and returns the run record. AI Director steps stop with waiting_approval for the user.",
+        "Runs to completion and returns the run record. Steps that change the timeline (append, edit, captions) need the user's approval, which this tool asks for; " +
+        "AI Director steps stop with waiting_approval for the user.",
       inputSchema: { workflow: z.record(z.string(), z.unknown()), baseDir: z.string().optional().describe("Folder relative paths resolve from") },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    tool(async ({ workflow, baseDir }: { workflow: Record<string, unknown>; baseDir?: string }) =>
-      // approveAi is never taken from the client: an AI can't approve AI proposals.
-      ({ run: await runWorkflow(db, workflow, { cacheDir: opts.cacheDir, actor: "mcp", baseDir: baseDir ?? process.cwd(), source: `mcp:${clientName()}` }) }),
-    ),
+    tool(async ({ workflow, baseDir }: { workflow: Record<string, unknown>; baseDir?: string }) => {
+      // The client wrote this workflow, so running it is not the user's approval. Steps that change the
+      // timeline need the user to say yes (elicitation); approveAi is never taken from the client.
+      const spec = parseWorkflow(workflow);
+      const editing = timelineSteps(spec);
+      if (editing.length) {
+        const how = { approve_in_reelforge: "Save the workflow as a .json file and run it from ReelForge → Automate, or with: reelforge workflow run <file.json>" };
+        if (!server.server.getClientCapabilities()?.elicitation) return { status: "approval_required", timelineSteps: editing, ...how };
+        const target = "id" in spec.project ? `project "${projects.get(spec.project.id).name}"` : `a new project "${spec.project.name}"`;
+        const answer = await server.server.elicitInput({
+          message: `Run the workflow "${spec.name}" on ${target}?\n\nThese steps change the timeline:\n${editing.map((x) => `• step ${x.index + 1}: ${x.kind}`).join("\n")}\n\nAll steps: ${spec.steps.map((st) => Object.keys(st)[0]).join(" → ")}`,
+          requestedSchema: { type: "object", properties: { approve: { type: "boolean", title: "Run it", description: "Each change can be undone in ReelForge" } }, required: ["approve"] },
+        });
+        if (answer.action !== "accept" || answer.content?.approve !== true) return { status: "not_approved", action: answer.action, ...how };
+      }
+      return {
+        run: await runWorkflow(db, spec, {
+          cacheDir: opts.cacheDir,
+          actor: "mcp",
+          baseDir: baseDir ?? process.cwd(),
+          source: `mcp:${clientName()}`,
+          timelineEditsApproved: editing.length > 0, // only reached with the user's yes
+        }),
+      };
+    }),
   );
   server.registerTool(
     "workflows_runs",
