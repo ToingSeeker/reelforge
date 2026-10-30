@@ -1,0 +1,163 @@
+import { randomUUID } from "node:crypto";
+import type { z } from "zod";
+import { transaction, type Database } from "./db.ts";
+import { ReelForgeError } from "./errors.ts";
+import {
+  ActorSchema,
+  CreateProjectInputSchema,
+  DEFAULT_PROJECT_SETTINGS,
+  PROJECT_SCHEMA_VERSION,
+  ProjectIdSchema,
+  ProjectSettingsSchema,
+  RenameProjectInputSchema,
+  type Actor,
+  type CreateProjectInput,
+  type EditOperation,
+  type Project,
+  type RenameProjectInput,
+} from "./schema.ts";
+
+interface ProjectRow {
+  id: string;
+  name: string;
+  schema_version: number;
+  revision: number;
+  width: number;
+  height: number;
+  fps_num: number;
+  fps_den: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface OperationRow {
+  id: string;
+  project_id: string;
+  revision: number;
+  kind: string;
+  payload: string;
+  actor: string;
+  created_at: string;
+}
+
+function toProject(r: ProjectRow): Project {
+  return {
+    id: r.id,
+    name: r.name,
+    schemaVersion: r.schema_version,
+    revision: r.revision,
+    settings: { width: r.width, height: r.height, fps: { num: r.fps_num, den: r.fps_den } },
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function toOperation(r: OperationRow): EditOperation {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    revision: r.revision,
+    kind: r.kind,
+    payload: JSON.parse(r.payload) as Record<string, unknown>,
+    actor: ActorSchema.parse(r.actor),
+    createdAt: r.created_at,
+  };
+}
+
+function parse<S extends z.ZodType>(schema: S, input: unknown): z.output<S> {
+  const result = schema.safeParse(input);
+  if (!result.success) {
+    throw new ReelForgeError("VALIDATION_ERROR", "invalid input", {
+      issues: result.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+    });
+  }
+  return result.data;
+}
+
+/**
+ * The single place project state changes. Every mutation bumps the revision
+ * and appends an edit_operations row inside one transaction (FR-004, FR-015);
+ * a stale baseRevision is rejected, never merged over (FR-016).
+ */
+export class ProjectStore {
+  readonly #db: Database;
+  readonly #now: () => string;
+
+  constructor(db: Database, opts: { now?: () => string } = {}) {
+    this.#db = db;
+    this.#now = opts.now ?? (() => new Date().toISOString());
+  }
+
+  list(): Project[] {
+    const rows = this.#db
+      .prepare("SELECT * FROM projects ORDER BY updated_at DESC, id")
+      .all() as unknown as ProjectRow[];
+    return rows.map(toProject);
+  }
+
+  get(id: string): Project {
+    const pid = parse(ProjectIdSchema, id);
+    const row = this.#db.prepare("SELECT * FROM projects WHERE id = ?").get(pid) as unknown as
+      | ProjectRow
+      | undefined;
+    if (!row) throw new ReelForgeError("NOT_FOUND", `project ${pid} not found`, { projectId: pid });
+    return toProject(row);
+  }
+
+  create(input: CreateProjectInput, actor: Actor): Project {
+    const { name, settings } = parse(CreateProjectInputSchema, input);
+    const full = parse(ProjectSettingsSchema, { ...DEFAULT_PROJECT_SETTINGS, ...settings });
+    const id = randomUUID();
+    const now = this.#now();
+    return transaction(this.#db, () => {
+      this.#db
+        .prepare(
+          `INSERT INTO projects
+             (id, name, schema_version, revision, width, height, fps_num, fps_den, created_at, updated_at)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(id, name, PROJECT_SCHEMA_VERSION, full.width, full.height, full.fps.num, full.fps.den, now, now);
+      this.#record(id, 1, "project.create", { name, settings: full }, actor, now);
+      return this.get(id);
+    });
+  }
+
+  rename(id: string, input: RenameProjectInput, actor: Actor): Project {
+    const pid = parse(ProjectIdSchema, id);
+    const { name, baseRevision } = parse(RenameProjectInputSchema, input);
+    return transaction(this.#db, () => {
+      const current = this.get(pid);
+      if (current.revision !== baseRevision) {
+        throw new ReelForgeError(
+          "REVISION_CONFLICT",
+          `project changed since revision ${baseRevision} (now ${current.revision}); reload and retry`,
+          { projectId: pid, baseRevision, currentRevision: current.revision },
+        );
+      }
+      const next = current.revision + 1;
+      const now = this.#now();
+      this.#db
+        .prepare("UPDATE projects SET name = ?, revision = ?, updated_at = ? WHERE id = ?")
+        .run(name, next, now, pid);
+      this.#record(pid, next, "project.rename", { from: current.name, to: name }, actor, now);
+      return this.get(pid);
+    });
+  }
+
+  history(id: string): EditOperation[] {
+    const pid = this.get(id).id;
+    const rows = this.#db
+      .prepare("SELECT * FROM edit_operations WHERE project_id = ? ORDER BY revision")
+      .all(pid) as unknown as OperationRow[];
+    return rows.map(toOperation);
+  }
+
+  #record(projectId: string, revision: number, kind: string, payload: object, actor: Actor, at: string) {
+    this.#db
+      .prepare(
+        `INSERT INTO edit_operations (id, project_id, revision, kind, payload, actor, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(randomUUID(), projectId, revision, kind, JSON.stringify(payload), actor, at);
+  }
+}

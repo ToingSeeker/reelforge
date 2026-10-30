@@ -1,0 +1,17 @@
+{
+  "name": "@reelforge/cli",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "reelforge": "./bin/reelforge.js"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@reelforge/core": "workspace:*",
+    "@reelforge/server": "workspace:*"
+  }
+}

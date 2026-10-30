@@ -1,0 +1,46 @@
+/* ReelForge design tokens (PRD §16). Dark professional only. */
+:root {
+  color-scheme: dark;
+
+  --rf-bg: #090f16;
+  --rf-surface: #141e2b;
+  --rf-surface-2: #1a2636;
+  --rf-surface-3: #223146;
+  --rf-panel: #0e1620;
+  --rf-border: #213044;
+  --rf-border-strong: #2d4058;
+
+  --rf-primary: #00d5ed;
+  --rf-primary-ink: #04161b;
+  --rf-primary-soft: rgba(0, 213, 237, 0.12);
+  --rf-selection: #186ce6;
+  --rf-selection-soft: rgba(24, 108, 230, 0.22);
+
+  --rf-text: #e6edf5;
+  --rf-text-2: #a3b1c2;
+  --rf-text-3: #6b7c90;
+  --rf-success: #2bd47d;
+  --rf-warning: #f5b544;
+  --rf-danger: #ff5c6c;
+
+  /* Track lane colours (timeline) */
+  --rf-track-overlay: #4b3a8f;
+  --rf-track-video: #1d4f9a;
+  --rf-track-music: #1f7a4a;
+  --rf-track-voice: #2f3f9e;
+  --rf-track-caption: #5b3693;
+
+  --rf-radius-sm: 4px;
+  --rf-radius: 6px;
+  --rf-radius-lg: 10px;
+
+  --rf-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
+  --rf-font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+
+  --rf-topbar-h: 56px;
+  --rf-rail-w: 76px;
+  --rf-library-w: 340px;
+  --rf-director-w: 420px;
+  --rf-timeline-h: 340px;
+  --rf-statusbar-h: 32px;
+}
