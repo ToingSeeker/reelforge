@@ -294,3 +294,30 @@ test("workflows_run never creates folders, whatever baseDir the client sends", {
   }
 });
 
+test("MCP render housekeeping: previews are reused per revision, and only this session's jobs can be cancelled", { timeout: 120_000 }, async (t) => {
+  const f = fixtures();
+  const { call, home } = await connect(t);
+  const project = (await call("projects_create", { name: "Jobs", width: 270, height: 480 })).data.project;
+  const asset = (await call("media_import", { projectId: project.id, paths: [f.portrait] })).data.imported[0];
+  const db = openDatabase(join(home, "reelforge.db"));
+  t.after(() => db.close());
+  const store = new TimelineStore(db);
+  const tl = store.get(project.id);
+  store.apply(project.id, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: tl.tracks.find((x) => x.kind === "video")!.id, assetId: asset.id, start: 0, duration: 15 }] }, "desktop");
+
+  const first = (await call("preview_create", { projectId: project.id })).data;
+  const again = (await call("preview_create", { projectId: project.id })).data;
+  assert.equal(again.jobId, first.jobId);
+  assert.equal(again.reused, true);
+
+  // A render the user started (another process, same database) can't be cancelled by the client.
+  const { createRenderJob } = await import("@reelforge/media");
+  const users = createRenderJob(db, project.id, "export", join(home, "users-export.mp4"));
+  const denied = await call("jobs_cancel", { jobId: users.id });
+  assert.equal(denied.isError, true);
+  assert.equal(denied.data.error.code, "UNAUTHORIZED");
+  const mine = (await call("render_start", { projectId: project.id, outputPath: join(home, "mine.mp4") })).data;
+  const cancelled = await call("jobs_cancel", { jobId: mine.jobId });
+  assert.equal(cancelled.isError, false, JSON.stringify(cancelled.data));
+});
+

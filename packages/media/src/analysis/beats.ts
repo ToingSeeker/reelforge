@@ -164,10 +164,10 @@ export function beatsFromSamples(samples: Float32Array): BeatsResult {
   return { bpm, confidence: Math.round(confidence * 1000) / 1000, beatsUs: trackBeats(env, period).map(frameUs) };
 }
 
-export async function detectBeats(path: string): Promise<BeatsResult> {
+export async function detectBeats(path: string, opts: { timeoutMs?: number } = {}): Promise<BeatsResult> {
   let stdout: Buffer;
   try {
-    stdout = await decodePcm(path);
+    stdout = await decodePcm(path, opts.timeoutMs);
   } catch (e) {
     throw new Error(`beat detection failed: ${ffmpegReason(e, path)}`);
   }
@@ -175,17 +175,26 @@ export async function detectBeats(path: string): Promise<BeatsResult> {
   return beatsFromSamples(samples);
 }
 
-/** Mono float PCM at 22.05 kHz (first 20 minutes). */
-function decodePcm(path: string): Promise<Buffer> {
+/** Mono float PCM at 22.05 kHz (first 20 minutes). Killed on a stall, stderr kept to its tail, like run(). */
+function decodePcm(path: string, timeoutMs = 10 * 60_000): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegBin(), ["-hide_banner", "-nostdin", "-loglevel", "error", ...sourceInputArgs(path), "-vn", "-t", String(MAX_SECONDS), "-ac", "1", "-ar", String(SR), "-f", "f32le", "-"], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     const chunks: Buffer[] = [];
     let err = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
     child.stdout.on("data", (c: Buffer) => chunks.push(c));
-    child.stderr.on("data", (c: Buffer) => (err += c.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => (code === 0 ? resolve(Buffer.concat(chunks)) : reject(Object.assign(new Error(`ffmpeg exit ${code}`), { stderr: err }))));
+    child.stderr.on("data", (c: Buffer) => (err = (err + c.toString()).slice(-8000)));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else if (signal) reject(Object.assign(new Error(`ffmpeg killed (${signal})`), { stderr: `decoding timed out after ${Math.round(timeoutMs / 1000)}s` }));
+      else reject(Object.assign(new Error(`ffmpeg exit ${code}`), { stderr: err }));
+    });
   });
 }

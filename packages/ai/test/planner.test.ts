@@ -165,3 +165,36 @@ test("Claude without any credential fails with guidance, not an internal error",
   await assert.rejects(provider.complete({ model: "claude-opus-5-5", system: "s", turns: [{ role: "user", content: "x" }], schema: {} }), (e: unknown) =>
     e instanceof ReelForgeError && e.code === "UNAVAILABLE" && /API key/.test(e.message));
 });
+
+test("selection context: track, caption and new-clip changes are flagged too", async (t) => {
+  const s = setup(t);
+  const c1 = s.timeline.get(s.p.id).tracks.find((x) => x.kind === "caption")!.id;
+  const provider = new FakeProvider([plan([
+    { type: "clip.update", why: "x", clipId: s.clip.id, props: { scale: 1.1 } },
+    { type: "track.update", why: "x", trackId: s.v1, muted: true, locked: true },
+    { type: "caption.add", why: "x", trackId: c1, start: 0, duration: 30, text: "hi" },
+  ])]);
+  const p = await propose(s.db, s.p.id, provider, { instruction: "zoom", model: "m", selection: [s.clip.id] });
+  assert.match(p.warnings.join(" "), /Also makes 2 change\(s\) beyond your selected clips \(track\.update, caption\.add\)/);
+});
+
+test("a track rename is visible in the diff", async (t) => {
+  const s = setup(t);
+  const provider = new FakeProvider([plan([{ type: "track.update", why: "x", trackId: s.v1, name: "Totally normal" }])]);
+  const p = await propose(s.db, s.p.id, provider, { instruction: "rename", model: "m" });
+  const row = p.changes.find((c) => c.kind === "changed")!;
+  assert.notEqual(row.before, row.after);
+  assert.match(row.after!, /“Totally normal”/);
+});
+
+test("Ollama on another host counts as external and needs consent", async (t) => {
+  const { OllamaProvider, isLoopbackUrl } = await import("../src/providers/ollama.ts");
+  for (const u of ["http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"]) assert.ok(isLoopbackUrl(u), u);
+  for (const u of ["http://192.168.1.20:11434", "https://ollama.example.com", "http://127.0.0.1.evil.com"]) assert.ok(!isLoopbackUrl(u), u);
+  const s = setup(t);
+  const prev = process.env.REELFORGE_OLLAMA_URL;
+  process.env.REELFORGE_OLLAMA_URL = "http://192.0.2.1:11434"; // TEST-NET: never contacted, consent comes first
+  t.after(() => (prev === undefined ? delete process.env.REELFORGE_OLLAMA_URL : (process.env.REELFORGE_OLLAMA_URL = prev)));
+  await assert.rejects(propose(s.db, s.p.id, new OllamaProvider(), { instruction: "x", model: "m" }), (e: unknown) => e instanceof ReelForgeError && e.code === "CONSENT_REQUIRED");
+});
+

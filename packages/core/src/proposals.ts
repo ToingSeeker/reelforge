@@ -81,7 +81,7 @@ export function describeChanges(before: Timeline, diff: TimelineDiff): ProposalC
   for (const ch of diff.tracks) {
     const t = (ch.after ?? ch.before)!;
     const fmt = (x: typeof ch.before) =>
-      x ? [x.muted && "muted", x.hidden && "hidden", x.locked && "locked", x.captionStyle && `style ${JSON.stringify(x.captionStyle)}`].filter(Boolean).join(", ") || "normal" : null;
+      x ? [`“${x.name}”`, x.muted && "muted", x.hidden && "hidden", x.locked && "locked", x.captionStyle && `style ${JSON.stringify(x.captionStyle)}`].filter(Boolean).join(", ") : null;
     out.push({ kind: kindOf(ch.before, ch.after), target: "track", id: ch.id, label: `${labels.get(t.id) ?? ""} ${t.name}`.trim(), before: fmt(ch.before), after: fmt(ch.after) });
   }
   return out;

@@ -3,7 +3,8 @@
 // the file are approved by running it; an AI Director step still needs its
 // own explicit approval (--approve-ai), otherwise the run stops for review.
 
-import { existsSync, globSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { glob } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
@@ -31,7 +32,7 @@ import {
   type WorkflowRun,
   type WorkflowStepResult,
 } from "@reelforge/core";
-import { AnalysisRunner, createRenderJob, importMedia, RenderRunner, SUPPORTED_EXTENSIONS } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, importMedia, MAX_IMPORT_BATCH, RenderRunner, SUPPORTED_EXTENSIONS } from "@reelforge/media";
 import { ANTHROPIC_DEFAULT_MODEL, listOllamaModels, parseModelOutput, propose, providerFor } from "@reelforge/ai";
 
 const Time = z.union([z.number().int().nonnegative(), z.string().min(1)]);
@@ -165,22 +166,36 @@ const isGlob = (p: string) => /[*?[]/.test(p);
  * Literal paths pass through (import reports their errors). A glob keeps only regular files with a
  * supported extension, and other entries are counted, never named, so a broad pattern can't list a folder.
  */
-function expandGlobs(paths: string[], baseDir: string, approved: boolean): { paths: string[]; skipped: number } {
+/** A glob stops early instead of walking a whole disk ("/**" ) or importing thousands of files. */
+export const MAX_GLOB_MATCHES = MAX_IMPORT_BATCH;
+export const MAX_GLOB_ENTRIES = 20_000;
+
+async function expandGlobs(paths: string[], baseDir: string, approved: boolean): Promise<{ paths: string[]; skipped: number }> {
   let skipped = 0;
-  const out = paths.flatMap((p) => {
+  const out: string[] = [];
+  for (const p of paths) {
     const abs = expandPath(p, baseDir);
-    if (!isGlob(abs)) return [abs];
+    if (!isGlob(abs)) {
+      out.push(abs);
+      continue;
+    }
     if (!approved) throw new ReelForgeError("VALIDATION_ERROR", `the glob pattern ${p} needs the user's approval`);
-    const hits = globSync(abs).filter((h) => {
-      const media = extname(h).toLowerCase() in SUPPORTED_EXTENSIONS && isRegularFile(h);
-      if (!media) skipped++;
-      return media;
-    });
+    const hits: string[] = [];
+    let seen = 0;
+    for await (const h of glob(abs)) {
+      if (++seen > MAX_GLOB_ENTRIES) throw new ReelForgeError("VALIDATION_ERROR", `${p} matches more than ${MAX_GLOB_ENTRIES} entries; use a narrower pattern`);
+      if (extname(h).toLowerCase() in SUPPORTED_EXTENSIONS && isRegularFile(h)) hits.push(h);
+      else skipped++;
+      if (hits.length > MAX_GLOB_MATCHES) throw new ReelForgeError("VALIDATION_ERROR", `${p} matches more than ${MAX_GLOB_MATCHES} media files; use a narrower pattern`);
+    }
     if (!hits.length) throw new ReelForgeError("VALIDATION_ERROR", `no media files match ${p}`);
-    return hits.sort();
-  });
+    out.push(...hits.sort());
+  }
   return { paths: out, skipped };
 }
+
+/** At most a few failures by name in errors and run records; the rest as a count. */
+const MAX_LISTED_FAILURES = 10;
 
 function isRegularFile(p: string) {
   try {
@@ -307,11 +322,13 @@ export async function runWorkflow(db: Database, input: unknown, opts: RunOptions
       let detail = "";
       let result: Record<string, unknown> = {};
       if ("import" in step) {
-        const files = expandGlobs(step.import.paths, opts.baseDir, opts.globsApproved !== false);
+        const files = await expandGlobs(step.import.paths, opts.baseDir, opts.globsApproved !== false);
         const r = await importMedia(db, projectId, files.paths, opts.actor);
-        if (!r.imported.length && !r.existing.length) throw new ReelForgeError("VALIDATION_ERROR", `nothing imported: ${r.failed.map((f) => `${f.path}: ${f.error.message}`).join("; ")}`);
+        const more = r.failed.length > MAX_LISTED_FAILURES ? ` (and ${r.failed.length - MAX_LISTED_FAILURES} more)` : "";
+        const failed = r.failed.slice(0, MAX_LISTED_FAILURES);
+        if (!r.imported.length && !r.existing.length) throw new ReelForgeError("VALIDATION_ERROR", `nothing imported: ${failed.map((f) => `${f.path}: ${f.error.message}`).join("; ")}${more}`);
         detail = `${r.imported.length} imported${r.existing.length ? `, ${r.existing.length} already there` : ""}${r.failed.length ? `, ${r.failed.length} failed` : ""}${files.skipped ? `, ${files.skipped} non-media entries skipped` : ""}`;
-        result = { assetIds: [...r.imported, ...r.existing].map((a) => a.id), failed: r.failed };
+        result = { assetIds: [...r.imported, ...r.existing].map((a) => a.id), failed, ...(more ? { failedCount: r.failed.length } : {}) };
       } else if ("analyze" in step) {
         const tl = timeline.get(projectId);
         const assets = step.analyze.assets?.length ? step.analyze.assets.map((ref) => findAsset(tl, ref)) : tl.assets;

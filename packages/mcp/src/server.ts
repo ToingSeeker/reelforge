@@ -74,6 +74,8 @@ export function createMcpServer(db: Database, opts: McpOptions) {
   renderRunner.start();
   analysisRunner.start();
   const clientName = () => server.server.getClientVersion()?.name ?? "client";
+  // Render jobs this session queued: the only ones it may cancel, and the queued ones are dropped on close.
+  const ownJobs = new Set<string>();
 
   // ---- projects -------------------------------------------------------------
   server.registerTool("projects_list", { title: "List projects", description: "All projects, most recently changed first.", annotations: READ }, tool(() => ({ projects: projects.list() })));
@@ -131,6 +133,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       const [a] = analyses.enqueue(projectId, assetId, ["beats"]);
       analysisRunner.enqueue(a!.id);
       const done = await analysisRunner.wait(a!.id);
+      if (done.state === "queued" || done.state === "running") return { status: "in_progress", jobId: done.id, next: "another ReelForge process is detecting beats; call jobs_get with this id" };
       if (done.state !== "completed") throw new ReelForgeError("INTERNAL", done.error ?? "beat detection failed");
       return { beats: done.result };
     }),
@@ -214,7 +217,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       const lines = p.changes.slice(0, 12).map((c) => `• ${c.kind} ${quoteUntrusted(c.label, 60)}${c.after ? `: ${quoteUntrusted(c.after, 120)}` : ""}`);
       const answer = await server.server.elicitInput({
         message:
-          `Apply ${p.operations.length} change${p.operations.length === 1 ? "" : "s"} to ${quoteUntrusted(projects.get(p.projectId).name)}?\n\n${lines.join("\n")}` +
+          `Apply ${p.changes.length} change${p.changes.length === 1 ? "" : "s"} to ${quoteUntrusted(projects.get(p.projectId).name)}?\n\n${lines.join("\n")}` +
           `${p.changes.length > 12 ? `\n…and ${p.changes.length - 12} more` : ""}\n\n` +
           `Summary (written by ${p.provider === "mcp" ? "the client" : "the AI"}): ${quoteUntrusted(p.summary, 200)}` +
           `${p.warnings.length ? `\nWarnings: ${p.warnings.map((w) => quoteUntrusted(w, 160)).join(" ")}` : ""}` +
@@ -294,7 +297,12 @@ export function createMcpServer(db: Database, opts: McpOptions) {
     "preview_create",
     { title: "Create preview", description: "Low-resolution render of the current timeline (same graph as the export). Returns a job id.", inputSchema: { projectId: Id }, annotations: WRITE },
     tool(({ projectId }: { projectId: string }) => {
+      // One preview per revision (as over REST): repeated calls reuse it instead of rendering again.
+      const revision = projects.get(projectId).revision;
+      const existing = jobs.list(projectId, { kind: "preview", limit: 10 }).find((j) => j.revision === revision && !["failed", "cancelled"].includes(j.state));
+      if (existing) return { jobId: existing.id, state: existing.state, reused: true };
       const job = createRenderJob(db, projectId, "preview");
+      ownJobs.add(job.id);
       renderRunner.enqueue(job.id);
       return { jobId: job.id, state: job.state };
     }),
@@ -309,6 +317,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
     },
     tool(({ projectId, outputPath }: { projectId: string; outputPath: string }) => {
       const job = createRenderJob(db, projectId, "export", outputPath);
+      ownJobs.add(job.id);
       renderRunner.enqueue(job.id);
       return { jobId: job.id, state: job.state, outputPath: job.outputPath };
     }),
@@ -329,8 +338,9 @@ export function createMcpServer(db: Database, opts: McpOptions) {
   );
   server.registerTool(
     "jobs_cancel",
-    { title: "Cancel job", inputSchema: { jobId: Id }, annotations: WRITE },
+    { title: "Cancel job", description: "Cancel a render or preview this session started (the user's own renders are cancelled in ReelForge).", inputSchema: { jobId: Id }, annotations: WRITE },
     tool(({ jobId }: { jobId: string }) => {
+      if (!ownJobs.has(jobId)) throw new ReelForgeError("UNAUTHORIZED", "only jobs started in this MCP session can be cancelled here; the user can cancel others in ReelForge");
       const j = renderRunner.cancel(jobId);
       return { state: j.state };
     }),
@@ -401,9 +411,17 @@ export function createMcpServer(db: Database, opts: McpOptions) {
     tool(({ projectId }: { projectId?: string }) => ({ runs: new WorkflowRunStore(db).list(projectId ? { projectId } : {}) })),
   );
 
-  const close = () => {
-    renderRunner.stop();
+  const close = async () => {
+    // Queued work this session asked for shouldn't be picked up later by the desktop engine.
+    for (const id of ownJobs) {
+      try {
+        if (jobs.get(id).state === "queued") renderRunner.cancel(id);
+      } catch {
+        // already gone
+      }
+    }
     analysisRunner.stop();
+    await renderRunner.stop();
   };
   return { server, close };
 }

@@ -19,12 +19,15 @@ export function thumbnailFile(cacheDir: string, asset: Asset): Thumbnail {
   return { path: join(cacheDir, "thumbs", name), contentType: audio ? "image/png" : "image/jpeg" };
 }
 
+/** One image to exactly this path: no %d sequence expansion, no protocol prefixes read from the path. */
+const SINGLE_IMAGE = ["-update", "1", "-f", "image2"];
+
 function args(asset: Asset, out: string): string[] {
   const input = sourceInputArgs(asset.sourcePath);
   const common = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"];
   if (asset.kind === "audio") {
     // Waveform strip in the music-track colour; also used as the clip background in the timeline.
-    return [...common, ...input, "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=960x120:colors=0x2bd47d", "-frames:v", "1", out];
+    return [...common, ...input, "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=960x120:colors=0x2bd47d", "-frames:v", "1", ...SINGLE_IMAGE, `file:${out}`];
   }
   // Poster frame 10% in (capped at 3s) so black lead-ins don't become the thumbnail.
   const seek = asset.kind === "video" && asset.durationUs ? Math.min(asset.durationUs * 0.1, 3_000_000) / 1_000_000 : 0;
@@ -38,7 +41,8 @@ function args(asset: Asset, out: string): string[] {
     "scale=480:480:force_original_aspect_ratio=decrease",
     "-q:v",
     "5",
-    out,
+    ...SINGLE_IMAGE,
+    `file:${out}`,
   ];
 }
 

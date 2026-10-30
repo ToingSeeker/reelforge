@@ -1806,6 +1806,10 @@ button:disabled {
   background: var(--rf-surface);
   border: 1px solid var(--rf-border);
 }
+.rf-diff-why-label {
+  color: var(--rf-text-2);
+  font-weight: 600;
+}
 .rf-proposal-origin {
   color: var(--rf-text-2);
   border-style: dashed;

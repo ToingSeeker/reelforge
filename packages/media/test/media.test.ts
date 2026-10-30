@@ -4,7 +4,7 @@ import { copyFileSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AssetStore, openDatabase, ProjectStore, ReelForgeError, TimelineStore } from "@reelforge/core";
-import { ensureThumbnail, importMedia, probeFile, relinkMedia, resolveSource } from "../src/index.ts";
+import { ensureThumbnail, importMedia, probeFile, relinkMedia, resolveSource, sourceInputArgs } from "../src/index.ts";
 import { fixtures } from "./fixtures.ts";
 
 const f = fixtures();
@@ -167,3 +167,23 @@ test("a playlist disguised as .mp4 is refused, not demuxed (no SSRF / local file
   const { asset } = new AssetStore(db).add(project.id, resolveSource(concat), real, "cli");
   await assert.rejects(ensureThumbnail(join(home, "cache"), asset), (e: unknown) => e instanceof ReelForgeError);
 });
+
+test("thumbnails go to exactly their path, even when the cache folder name looks like a pattern", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "reelforge-thumb-%d-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const db = openDatabase(join(home, "db.sqlite"));
+  const project = new ProjectStore(db).create({ name: "T" }, "cli");
+  const { imported } = await importMedia(db, project.id, [f.landscape, f.mp3], "cli");
+  const cache = join(home, "cache-%03d");
+  for (const a of imported) {
+    const thumb = await ensureThumbnail(cache, a);
+    assert.ok(existsSync(thumb.path), `missing ${thumb.path}`);
+  }
+});
+
+test("mov sources never follow external data references", () => {
+  const args = sourceInputArgs("/x/clip.mov");
+  assert.deepEqual(args.slice(args.indexOf("-f"), args.indexOf("-i")), ["-f", "mov", "-enable_drefs", "0"]);
+  assert.ok(!sourceInputArgs("/x/a.wav").includes("-enable_drefs"));
+});
+

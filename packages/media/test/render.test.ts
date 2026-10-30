@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JobStore, openDatabase, ProjectStore, TimelineStore, type Database, type TimelineOp } from "@reelforge/core";
@@ -194,6 +194,9 @@ test("export path rules and interrupted-job recovery", async (t) => {
   writeFileSync(join(s.home, "taken.mp4"), "x");
   bad(join(s.home, "taken.mp4"));
   bad(src("red.mp4"));
+  // A dangling symlink is refused up front, not after the whole render.
+  symlinkSync(join(s.home, "nowhere.mp4"), join(s.home, "dangling.mp4"));
+  bad(join(s.home, "dangling.mp4"));
 
   const jobs = new JobStore(s.db);
   const job = createRenderJob(s.db, s.projectId, "preview");
@@ -315,3 +318,20 @@ test("burned-in captions: word highlight moves on the right frame, track style a
   assert.equal(gone.lg + gone.rg + gone.lw + gone.rw, 0, "gone after the caption ends");
   assert.equal(readdirSync(join(s.home, "cache", "work")).length, 0, "caption frames cleaned up");
 });
+
+test("the partial render file has an unguessable name and is created exclusively", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  s.edit([{ type: "clip.add", trackId: s.track("Video"), assetId: s.ids.red, start: 0, duration: 10 }]);
+  const out = join(s.home, "named.mp4");
+  const job = createRenderJob(s.db, s.projectId, "export", out);
+  // The old name was predictable from the job id: something planted there must not be followed or truncated.
+  const victim = join(s.home, "victim.txt");
+  writeFileSync(victim, "keep me");
+  symlinkSync(victim, join(s.home, `.named.partial-${job.id}.mp4`));
+  s.runner.enqueue(job.id);
+  const done = await s.runner.wait(job.id);
+  assert.equal(done.state, "completed", JSON.stringify(done.error));
+  assert.equal(readFileSync(victim, "utf8"), "keep me");
+  assert.ok(existsSync(out));
+});
+

@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AnalysisStore, openDatabase, ProjectStore } from "@reelforge/core";
-import { AnalysisRunner, detectBeats, detectScenes, importMedia, interpretWhisper, whisperModelPath } from "../src/index.ts";
+import { AnalysisRunner, detectBeats, detectScenes, extractSpeechAudio, importMedia, interpretWhisper, MAX_TRANSCRIPT_SECONDS, whisperModelPath } from "../src/index.ts";
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-analysis-")));
 process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
@@ -132,3 +132,26 @@ test("enqueue validates kinds against the media", async (t) => {
   assert.equal(done.state, "completed");
   assert.equal(done.stale, false);
 });
+
+test("the speech WAV is capped, so a long or crafted file can't fill the disk", async () => {
+  // 12 s of audio with a 2 s cap: the WAV holds 2 s (16 kHz mono 16-bit = 32 000 bytes/s).
+  const wav = p("capped.wav");
+  await extractSpeechAudio(p("m120.wav"), wav, 2);
+  const seconds = Number(execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", wav]).toString());
+  assert.ok(seconds <= 2.01, `got ${seconds}s`);
+  assert.ok(statSync(wav).size <= 2 * 32_000 + 1024 * 1024);
+  assert.equal(MAX_TRANSCRIPT_SECONDS, 6 * 60 * 60);
+});
+
+test("beat decoding is killed when FFmpeg stalls instead of blocking the analysis queue", async (t) => {
+  const stub = p("stalling-ffmpeg");
+  writeFileSync(stub, "#!/bin/sh\nwhile :; do echo 'warning: still decoding' >&2; sleep 0.05; done\n");
+  chmodSync(stub, 0o755);
+  const prev = process.env.REELFORGE_FFMPEG;
+  process.env.REELFORGE_FFMPEG = stub;
+  t.after(() => (prev === undefined ? delete process.env.REELFORGE_FFMPEG : (process.env.REELFORGE_FFMPEG = prev)));
+  const started = Date.now();
+  await assert.rejects(detectBeats(p("m120.wav"), { timeoutMs: 500 }), /timed out/);
+  assert.ok(Date.now() - started < 5000);
+});
+

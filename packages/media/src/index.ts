@@ -7,5 +7,5 @@ export { RenderRunner, createRenderJob, retryRenderJob, validateExportPath, veri
 export { AnalysisRunner } from "./analysis/runner.ts";
 export { detectScenes } from "./analysis/scenes.ts";
 export { detectBeats, beatsFromSamples, onsetEnvelope, estimateTempo, trackBeats } from "./analysis/beats.ts";
-export { transcribe, interpretWhisper, whisperModelPath, vadModelPath, WHISPER_MODEL, VAD_MODEL } from "./analysis/transcribe.ts";
+export { transcribe, extractSpeechAudio, MAX_TRANSCRIPT_SECONDS, interpretWhisper, whisperModelPath, vadModelPath, WHISPER_MODEL, VAD_MODEL } from "./analysis/transcribe.ts";
 export { rasterizeCaption, prepareCaptionOverlays, encodePng, loadFont, fontsDir } from "./captions.ts";

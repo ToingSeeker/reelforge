@@ -37,7 +37,7 @@ export function ensureProxy(db: Database, cacheDir: string, assetId: string, sou
         ffmpegBin(),
         kind === "image"
           ? // Stills: one ≤1280 px JPEG, enough for a 1080-wide frame at preview size.
-            [...common, "-frames:v", "1", "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2", "-q:v", "3", "-f", "image2", tmp]
+            [...common, "-frames:v", "1", "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2", "-q:v", "3", "-update", "1", "-f", "image2", `file:${tmp}`]
           : [
               ...common,
               // Same BT.709 conversion + tags as the export, so the browser decodes the proxy to the colours the render produces.
@@ -45,7 +45,7 @@ export function ensureProxy(db: Database, cacheDir: string, assetId: string, sou
               // Short GOP: the live preview seeks a lot.
               "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-g", "15", "-pix_fmt", "yuv420p", ...BT709_TAGS,
               "-c:a", "aac", "-b:a", "128k",
-              "-movflags", "+faststart", "-f", "mp4", tmp,
+              "-movflags", "+faststart", "-f", "mp4", `file:${tmp}`,
             ],
         { timeoutMs: 30 * 60_000 },
       );
@@ -54,7 +54,8 @@ export function ensureProxy(db: Database, cacheDir: string, assetId: string, sou
       rmSync(tmp, { force: true });
       throw new Error(`could not create a proxy: ${ffmpegReason(e, sourcePath)}`);
     }
-    const dims = (await run(ffprobeBin(), ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", out])).stdout
+    // Our own file, but probed like every source: forced demuxer, local files only.
+    const dims = (await run(ffprobeBin(), ["-v", "error", ...sourceInputArgs(out), "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])).stdout
       .trim()
       .split(",")
       .map(Number);

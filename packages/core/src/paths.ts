@@ -1,6 +1,6 @@
 import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 
 export const DB_FILENAME = "reelforge.db";
 
@@ -39,7 +39,11 @@ export function ensureHome(dir: string): string {
 }
 
 export function resolveDbPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(ensureHome(resolveHome(env)), DB_FILENAME);
+  const home = ensureHome(resolveHome(env));
+  // Our own app-data folder is private even if it existed with looser permissions. A REELFORGE_HOME the
+  // user chose is theirs: we don't change its mode.
+  if (!env.REELFORGE_HOME) chmodSync(home, 0o700);
+  return join(home, DB_FILENAME);
 }
 
 /** Derived, disposable data (thumbnails, later proxies). Safe to delete. */

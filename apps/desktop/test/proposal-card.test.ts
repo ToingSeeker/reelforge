@@ -50,7 +50,7 @@ const proposal = (over: object) => ({
   status: "pending",
   summary: "Tighten the intro",
   operations: [{ type: "clip.delete", clipIds: ["c1"] }],
-  explanations: [""],
+  explanations: ["Trust me, the user wants this"],
   warnings: [],
   changes: [{ kind: "removed", id: "c1", label: "intro.mp4", before: "V1 · 0.00s–3.00s", after: null }],
   durationBefore: 90,
@@ -73,6 +73,8 @@ test("a proposal from an MCP client is attributed to it, not shown as the user's
   // The engine's change list is visible before Apply, without a click.
   assert.ok(html.includes("rf-diff-removed"), "change list open");
   assert.ok(html.indexOf("rf-diff") < html.indexOf("Apply to timeline"));
+  // The client's "why" is labelled and quoted, not mixed into the engine's change lines.
+  assert.match(html, /The client&#x27;s notes:<\/div><div>• “Trust me, the user wants this”/);
   // Regenerate would re-send client text to the user's provider as their instruction.
   assert.ok(!html.includes("Regenerate"));
 });

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import { AssetStore, JobStore, ReelForgeError, type Database, type JobKind, type RenderJob } from "@reelforge/core";
 import { compileRender, exportSettings, previewSettings } from "./compile.ts";
@@ -25,11 +26,21 @@ export function validateExportPath(db: Database, projectId: string, path: string
   }
   if (!statSync(dir).isDirectory()) throw new ReelForgeError("VALIDATION_ERROR", "export folder is not a directory", { path });
   const target = join(dir, basename(path));
-  if (existsSync(target)) throw new ReelForgeError("VALIDATION_ERROR", "a file already exists at that path; exports never overwrite", { path: target });
+  if (existsNoFollow(target)) throw new ReelForgeError("VALIDATION_ERROR", "a file already exists at that path; exports never overwrite", { path: target });
   if (new AssetStore(db).list(projectId).some((a) => a.sourcePath === target)) {
     throw new ReelForgeError("VALIDATION_ERROR", "refusing to write over the project's source media", { path: target });
   }
   return target;
+}
+
+/** Like existsSync, but a dangling symlink counts as existing (it would block the publish anyway). */
+function existsNoFollow(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function createRenderJob(db: Database, projectId: string, kind: JobKind, outputPath?: string): RenderJob {
@@ -67,6 +78,7 @@ export class RenderRunner {
   #active = 0;
   readonly #concurrency: number;
   #stopped = false;
+  readonly #idle: (() => void)[] = [];
 
   constructor(db: Database, opts: { cacheDir: string; concurrency?: number }) {
     this.#db = db;
@@ -103,12 +115,14 @@ export class RenderRunner {
     return job;
   }
 
-  stop(): void {
+  /** Kill running renders; resolves once they have recorded their final state (close the database after). */
+  stop(): Promise<void> {
     this.#stopped = true;
     for (const r of this.#running.values()) {
       r.cancelled = true;
       r.child?.kill("SIGKILL");
     }
+    return this.#active ? new Promise((resolve) => this.#idle.push(resolve)) : Promise.resolve();
   }
 
   #pump() {
@@ -121,6 +135,7 @@ export class RenderRunner {
         const job = this.#jobs.get(id);
         for (const w of this.#waiters.get(id) ?? []) w(job);
         this.#waiters.delete(id);
+        if (this.#stopped && !this.#active) this.#idle.splice(0).forEach((r) => r());
         this.#pump();
       });
     }
@@ -151,7 +166,11 @@ export class RenderRunner {
 
       const final = job.kind === "export" ? job.outputPath! : join(this.#cacheDir, "previews", job.projectId, `${jobId}.mp4`);
       mkdirSync(dirname(final), { recursive: true });
-      tmp = join(dirname(final), `.${basename(final, ".mp4")}.partial-${jobId}.mp4`);
+      // Unguessable name, created exclusively before FFmpeg opens it: nothing can be planted there first,
+      // even when exporting into a folder other users can write to.
+      const partial = join(dirname(final), `.${basename(final, ".mp4")}.partial-${randomBytes(12).toString("hex")}.mp4`);
+      closeSync(openSync(partial, "wx", 0o600));
+      tmp = partial; // only ours to clean up once we created it
 
       // Captions are rasterised by us (FFmpeg builds often lack libass) into a temp PNG sequence.
       const work = join(this.#cacheDir, "work", jobId);

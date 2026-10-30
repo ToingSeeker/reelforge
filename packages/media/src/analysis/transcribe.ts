@@ -57,6 +57,26 @@ export function interpretWhisper(data: WhisperJson): TranscriptResult {
   return { language: data.result?.language ?? "unknown", text: segments.map((s) => s.text).join(" "), segments };
 }
 
+/** Longest speech transcribed per file: 16 kHz mono PCM is ~115 MB per hour, so this bounds the temp WAV too. */
+export const MAX_TRANSCRIPT_SECONDS = 6 * 60 * 60;
+
+/**
+ * The 16 kHz mono WAV whisper.cpp reads. Capped by duration and by size (a crafted file can claim any
+ * length), so it can't fill the disk.
+ */
+export async function extractSpeechAudio(path: string, wav: string, maxSeconds = MAX_TRANSCRIPT_SECONDS): Promise<void> {
+  const maxBytes = Math.ceil(maxSeconds * 16000 * 2) + 1024 * 1024;
+  try {
+    await run(
+      ffmpegBin(),
+      ["-hide_banner", "-nostdin", "-loglevel", "error", "-y", ...sourceInputArgs(path), "-vn", "-t", String(maxSeconds), "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-fs", String(maxBytes), "-f", "wav", wav],
+      { timeoutMs: 30 * 60_000 },
+    );
+  } catch (e) {
+    throw new Error(`could not extract audio: ${ffmpegReason(e, path)}`);
+  }
+}
+
 /**
  * Local speech-to-text with whisper.cpp (Metal on Apple Silicon). Audio never
  * leaves the machine. `language` is an ISO code or "auto".
@@ -77,13 +97,7 @@ export async function transcribe(
   const wav = join(workDir, "audio.wav");
   const base = join(workDir, "transcript");
   try {
-    try {
-      await run(ffmpegBin(), ["-hide_banner", "-nostdin", "-loglevel", "error", "-y", ...sourceInputArgs(path), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", wav], {
-        timeoutMs: 30 * 60_000,
-      });
-    } catch (e) {
-      throw new Error(`could not extract audio: ${ffmpegReason(e, path)}`);
-    }
+    await extractSpeechAudio(path, wav);
     await new Promise<void>((resolve, reject) => {
       if (opts.signal?.aborted) return reject(new Error("cancelled"));
       const vad = vadModelPath();

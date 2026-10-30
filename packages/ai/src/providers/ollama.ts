@@ -3,10 +3,25 @@ import type { CompletionRequest, CompletionResult, PlannerProvider } from "./typ
 
 export const ollamaUrl = () => (process.env.REELFORGE_OLLAMA_URL ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
 
-/** Local models through Ollama: nothing leaves the machine, so no consent is needed. */
+/** Whether a URL points at this machine (the only case where project context doesn't leave it). */
+export function isLoopbackUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Local models through Ollama: nothing leaves the machine, so no consent is needed. If
+ * REELFORGE_OLLAMA_URL points at another host, it is treated as external and needs consent.
+ */
 export class OllamaProvider implements PlannerProvider {
   readonly id = "ollama";
-  readonly external = false;
+  get external() {
+    return !isLoopbackUrl(ollamaUrl());
+  }
 
   async complete(req: CompletionRequest): Promise<CompletionResult> {
     let res: Response;

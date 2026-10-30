@@ -29,7 +29,7 @@ import {
   type ErrorCode,
   type TimelineOp,
 } from "@reelforge/core";
-import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, propose, providerFor, setCredential } from "@reelforge/ai";
+import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor, setCredential } from "@reelforge/ai";
 import { AnalysisRunner, createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 import { createMcpServer } from "@reelforge/mcp";
@@ -96,7 +96,7 @@ Usage:
   reelforge workflow validate <file.json> | workflow runs [--project <id>]
   reelforge mcp                                (MCP server on stdio, for Claude, ChatGPT, Gemini CLI…)
 
-  reelforge serve [--port 0] [--allow-origin <origin>]...
+  reelforge serve [--port 0] [--allow-origin <origin>]... [--token-stdin]
 
 Times <t>: frames (90), seconds (2.5s), timecode (00:00:03:00) or MM:SS.FF (00:03.10).
 Edits accept --base-revision for strict conflict detection; without it the
@@ -141,6 +141,7 @@ const OPTIONS = {
   "base-revision": { type: "string" },
   port: { type: "string" },
   "allow-origin": { type: "string", multiple: true },
+  "token-stdin": { type: "boolean" },
   ops: { type: "string" },
   "ops-file": { type: "string" },
   track: { type: "string" },
@@ -473,7 +474,7 @@ async function providersInfo() {
   return {
     providers: [
       { id: "anthropic", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL },
-      { id: "ollama", external: false, available: ollama.available, models: ollama.models },
+      { id: "ollama", external: new OllamaProvider().external, available: ollama.available, models: ollama.models },
     ],
   };
 }
@@ -599,15 +600,49 @@ async function mcp(env: NodeJS.ProcessEnv): Promise<number> {
   });
   await server.connect(transport);
   await closed;
-  close();
+  await close();
   await server.close().catch(() => {});
   db.close();
   return 0;
 }
 
 async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<number> {
-  // The desktop shell passes its own token via env; standalone runs get a fresh one.
-  const provided = env.REELFORGE_API_TOKEN;
+  // The desktop shell sends API keys from the OS keychain as JSON lines; they stay in memory only.
+  // With --token-stdin the first line carries the engine token, so it is never in the environment
+  // (where child processes inherit it and `ps -E` shows it).
+  let gotToken: (token: string) => void = () => {};
+  const tokenLine = new Promise<string | null>((resolve) => {
+    gotToken = resolve;
+    process.stdin.once("end", () => resolve(null)); // parent gone before sending it
+  });
+  let buf = "";
+  const onData = (chunk: Buffer) => {
+    buf += chunk.toString("utf8");
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line) as { type?: string; provider?: string; apiKey?: string | null; token?: string };
+        if (msg.type === "credential" && typeof msg.provider === "string") setCredential(msg.provider, msg.apiKey ?? null);
+        else if (msg.type === "token" && typeof msg.token === "string" && msg.token.length >= 32) gotToken(msg.token);
+      } catch {
+        io.err("[reelforge-server] ignored a malformed control line on stdin\n");
+      }
+    }
+  };
+  process.stdin.on("data", onData);
+  process.stdin.resume();
+
+  // Standalone runs get a fresh token; an env token (older shells, scripts) is read once and removed
+  // so FFmpeg/whisper children don't inherit it.
+  const provided = values["token-stdin"] ? await tokenLine : env.REELFORGE_API_TOKEN;
+  delete process.env.REELFORGE_API_TOKEN;
+  if (values["token-stdin"] && !provided) {
+    io.err("[reelforge-server] --token-stdin: stdin closed before a token line arrived\n");
+    return 1;
+  }
   const token = provided ?? randomBytes(32).toString("base64url");
   const db = openDatabase(resolveDbPath(env));
   const srv = await startApiServer({
@@ -627,24 +662,6 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     process.once("SIGTERM", stop);
     // When the parent (desktop app) dies, stdin closes: exit instead of lingering.
     process.stdin.once("end", stop);
-    // The desktop shell sends API keys from the OS keychain as JSON lines; they stay in memory only.
-    let buf = "";
-    process.stdin.on("data", (chunk: Buffer) => {
-      buf += chunk.toString("utf8");
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        try {
-          const msg = JSON.parse(line) as { type?: string; provider?: string; apiKey?: string | null };
-          if (msg.type === "credential" && typeof msg.provider === "string") setCredential(msg.provider, msg.apiKey ?? null);
-        } catch {
-          io.err("[reelforge-server] ignored a malformed control line on stdin\n");
-        }
-      }
-    });
-    process.stdin.resume();
   });
   // stdin was only a liveness signal; release it or it keeps the event loop alive.
   process.stdin.destroy();

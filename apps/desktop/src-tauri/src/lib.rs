@@ -11,7 +11,18 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tauri::{Manager, RunEvent};
 
-const ALLOWED_ORIGINS: &[&str] = &["http://localhost:5173", "tauri://localhost", "http://tauri.localhost"];
+/// Origins the engine accepts. The Vite dev server's origin only in development builds: in a release
+/// any page served on that port (an unrelated project) would otherwise pass the Origin check.
+const ALLOWED_ORIGINS: &[&str] = &["tauri://localhost", "http://tauri.localhost"];
+const DEV_ORIGIN: &str = "http://localhost:5173";
+
+fn allowed_origins(release: bool) -> Vec<&'static str> {
+    let mut origins = ALLOWED_ORIGINS.to_vec();
+    if !release {
+        origins.push(DEV_ORIGIN);
+    }
+    origins
+}
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Serialize)]
@@ -59,7 +70,8 @@ fn save_api_key(engine: tauri::State<'_, Engine>, provider: String, key: String)
         return Err("that doesn't look like an API key".into());
     }
     keychain(&provider)?.set_password(key).map_err(|e| e.to_string())?;
-    push_credential(&engine, &provider, Some(key))
+    // Saved either way; an engine that isn't running gets it from the Keychain when it starts.
+    push_credential(&engine, &provider, Some(key)).map_err(|e| format!("saved in the Keychain, but the running engine didn't get it ({e}); restart ReelForge to use it"))
 }
 
 #[tauri::command]
@@ -68,7 +80,7 @@ fn delete_api_key(engine: tauri::State<'_, Engine>, provider: String) -> Result<
         Ok(()) | Err(keyring::Error::NoEntry) => {}
         Err(e) => return Err(e.to_string()),
     }
-    push_credential(&engine, &provider, None)
+    push_credential(&engine, &provider, None).map_err(|e| format!("removed from the Keychain, but the running engine still has it ({e}); restart ReelForge"))
 }
 
 #[tauri::command]
@@ -167,7 +179,8 @@ fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Opt
     let token = random_token()?;
     let EngineCommand { node, cli, fonts } = engine_command()?;
     let mut cmd = Command::new(&node);
-    cmd.arg(&cli).arg("serve").env("PATH", engine_path());
+    // The token goes over stdin, not the environment, which FFmpeg/whisper children would inherit.
+    cmd.arg(&cli).arg("serve").arg("--token-stdin").env("PATH", engine_path()).env_remove("REELFORGE_API_TOKEN");
     for name in node_vars_to_remove(!cfg!(debug_assertions), std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
         cmd.env_remove(name);
     }
@@ -175,11 +188,10 @@ fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Opt
         // The bundle can't find assets relative to its own source tree.
         cmd.env("REELFORGE_FONTS", format!("{}/", fonts.display()));
     }
-    for origin in ALLOWED_ORIGINS {
+    for origin in allowed_origins(!cfg!(debug_assertions)) {
         cmd.arg("--allow-origin").arg(origin);
     }
     let mut child = cmd
-        .env("REELFORGE_API_TOKEN", &token)
         // Keep stdin open: the engine exits when it closes, so it never outlives us.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -188,7 +200,11 @@ fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Opt
         .map_err(|e| format!("could not start the ReelForge engine with `{node} {}`: {e}", cli.display()))?;
 
     let stdout = child.stdout.take().ok_or("engine stdout unavailable")?;
-    let stdin = child.stdin.take();
+    let mut stdin = child.stdin.take();
+    if let Some(pipe) = stdin.as_mut() {
+        let line = serde_json::json!({ "type": "token", "token": token }).to_string();
+        pipe.write_all(format!("{line}\n").as_bytes()).and_then(|_| pipe.flush()).map_err(|e| format!("could not hand the engine its token: {e}"))?;
+    }
     std::thread::spawn(move || {
         let mut line = String::new();
         let outcome = match BufReader::new(stdout).read_line(&mut line) {
@@ -276,6 +292,13 @@ mod tests {
         assert_eq!(e.node, "/opt/node");
         assert_eq!(e.cli, PathBuf::from("/src/cli.js"));
         assert_eq!(resolve_engine(false, None, None, None).unwrap().node, "node");
+    }
+
+    #[test]
+    fn dev_origin_only_in_debug() {
+        assert!(!allowed_origins(true).contains(&DEV_ORIGIN));
+        assert!(allowed_origins(true).contains(&"tauri://localhost"));
+        assert!(allowed_origins(false).contains(&DEV_ORIGIN));
     }
 
     #[test]

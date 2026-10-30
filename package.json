@@ -14,7 +14,7 @@
     "check": "pnpm typecheck && pnpm test",
     "cli": "node packages/cli/bin/reelforge.js",
     "desktop": "pnpm --filter @reelforge/desktop tauri dev",
-    "release:mac": "CI=true pnpm --filter @reelforge/desktop tauri build"
+    "release:mac": "CI=true pnpm --filter @reelforge/desktop tauri build -- --locked"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

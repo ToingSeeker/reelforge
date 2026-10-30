@@ -15,6 +15,25 @@ Security fixes from the first full audit (MCP clients are treated as possibly pr
 - The release app runs only its bundled engine: `REELFORGE_NODE`/`REELFORGE_CLI` work in development builds only,
   and `NODE_*` variables (e.g. `NODE_OPTIONS`) are removed before the engine, which receives the API key, starts
 
+Hardening from the same audit:
+
+- Release builds: thumbnails and the live preview were blocked by the CSP (`img-src`/`media-src` didn't allow the
+  local engine); fixed, and the CSP gained `object-src`/`base-uri`/`form-action`/`frame-ancestors 'none'`
+- The engine token goes to the engine over its stdin pipe, never the environment, so FFmpeg/whisper never inherit it
+- The Vite dev origin is accepted only by development builds; webview permissions narrowed to event listening and
+  open/save dialogs
+- Transcription audio is capped (6 h, and by size); beat decoding has a timeout
+- Workflow globs stop past 200 media files / 20 000 entries; run records name at most 10 failed files
+- Exports: an unguessable, exclusively created partial file; a dangling symlink at the target is refused up front
+- FFmpeg: `-enable_drefs 0` for MOV/MP4, single-image output for thumbnails, proxies probed like sources
+- MCP: `jobs_cancel` only for jobs the session started (queued ones are dropped when it disconnects); one preview per
+  revision; the Apply prompt counts the changes it shows; beats report "in progress" instead of a false failure
+- AI: Ollama on another host needs consent like Claude; selection warnings cover tracks, captions and new clips; a
+  track rename shows in the diff; the card labels the model's/client's reasons as theirs
+- `reelforge serve` waits for running renders before closing the database
+- Releases: `pnpm install --frozen-lockfile` and `cargo --locked`; CI actions pinned by commit SHA; SECURITY.md
+  describes the actual path and MCP trust model
+
 ## 0.1.0-alpha.1 — 2026-10-30
 
 First alpha. macOS on Apple Silicon, **not signed or notarized** (see README → Install).

@@ -24,7 +24,7 @@ import {
   type Database,
   type ErrorCode,
 } from "@reelforge/core";
-import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, propose, providerFor } from "@reelforge/ai";
+import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor } from "@reelforge/ai";
 import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
 import { AnalysisRunner, createRenderJob, ensureProxy, ensureThumbnail, fontsDir, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { join } from "node:path";
@@ -333,7 +333,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         return send(res, 200, {
           providers: [
             { id: "anthropic", label: "Claude", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL, models: [ANTHROPIC_DEFAULT_MODEL, "claude-sonnet-5-5"] },
-            { id: "ollama", label: "Local (Ollama)", external: false, available: ollama.available, defaultModel: ollama.models[0] ?? null, models: ollama.models },
+            { id: "ollama", label: "Local (Ollama)", external: new OllamaProvider().external, available: ollama.available, defaultModel: ollama.models[0] ?? null, models: ollama.models },
           ],
         });
       },
@@ -554,9 +554,9 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         server,
         close: () =>
           new Promise((r, j) => {
-            runner.stop();
             analysisRunner.stop();
-            server.close((err) => (err ? j(err) : r()));
+            const renders = runner.stop();
+            server.close((err) => (err ? j(err) : renders.then(() => r())));
             // close() already drops idle sockets; also end in-flight ones so shutdown can't hang.
             server.closeAllConnections();
           }),

@@ -35,7 +35,9 @@ export function sourceInputArgs(path: string, inputOptions: string[] = []): stri
   const demuxer = DEMUXERS[extname(path).toLowerCase()];
   if (!demuxer) throw new ReelForgeError("VALIDATION_ERROR", "unsupported file type");
   // "file:" stops FFmpeg from reading protocol prefixes (concat:, http:…) out of a file name.
-  return ["-protocol_whitelist", "file", "-f", demuxer, ...inputOptions, "-i", `file:${path}`];
+  // mov: never follow external data references (alias/URL tracks) to other files; FFmpeg's default today, stated here.
+  const demuxerOptions = demuxer === "mov" ? ["-enable_drefs", "0"] : [];
+  return ["-protocol_whitelist", "file", "-f", demuxer, ...demuxerOptions, ...inputOptions, "-i", `file:${path}`];
 }
 
 /**

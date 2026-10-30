@@ -258,6 +258,54 @@ test("serve takes API keys over stdin into memory, and never reports them", asyn
   assert.equal(after.includes("sk-ant-test"), false, "the key itself never leaves the engine");
 });
 
+test("serve --token-stdin: the token arrives on stdin and no child process ever sees it", async (t) => {
+  const { spawn } = await import("node:child_process");
+  const { once } = await import("node:events");
+  const { writeFileSync, chmodSync, readFileSync, existsSync } = await import("node:fs");
+  const home = mkdtempSync(join(tmpdir(), "reelforge-token-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  // ffprobe stub: records the environment it was started with.
+  const stub = join(home, "ffprobe-stub");
+  writeFileSync(stub, `#!/bin/sh\nenv > "${home}/child-env-$$"\nexit 1\n`);
+  chmodSync(stub, 0o755);
+  writeFileSync(join(home, "clip.mp4"), "x");
+
+  for (const mode of ["stdin", "env"] as const) {
+    const token = `${mode}-token-${"x".repeat(40)}`;
+    const env: NodeJS.ProcessEnv = { ...process.env, REELFORGE_HOME: join(home, mode), REELFORGE_FFPROBE: stub };
+    if (mode === "env") env.REELFORGE_API_TOKEN = token;
+    const args = [new URL("../bin/reelforge.js", import.meta.url).pathname, "serve", ...(mode === "stdin" ? ["--token-stdin"] : [])];
+    const child = spawn(process.execPath, args, { env, stdio: ["pipe", "pipe", "inherit"] });
+    t.after(() => child.kill());
+    if (mode === "stdin") child.stdin!.write(JSON.stringify({ type: "token", token }) + "\n");
+    const [chunk] = (await once(child.stdout!, "data")) as [Buffer];
+    const ready = JSON.parse(chunk.toString().split("\n")[0]!);
+    assert.equal(ready.token, undefined, "a provided token is never echoed");
+    const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    const project = ((await (await fetch(`${ready.url}/v1/projects`, { method: "POST", headers: auth, body: JSON.stringify({ name: "T" }) })).json()) as { project?: { id: string } }).project;
+    assert.ok(project?.id, `${mode}: the token authenticates`);
+    await fetch(`${ready.url}/v1/projects/${project.id}/assets`, { method: "POST", headers: auth, body: JSON.stringify({ paths: [join(home, "clip.mp4")] }) });
+    const dumps = (await import("node:fs")).readdirSync(home).filter((f) => f.startsWith("child-env-"));
+    assert.ok(dumps.length > 0, `${mode}: ffprobe ran`);
+    for (const f of dumps) {
+      const childEnv = readFileSync(join(home, f), "utf8");
+      assert.ok(!childEnv.includes("REELFORGE_API_TOKEN") && !childEnv.includes(token), `${mode}: child inherited the token`);
+      rmSync(join(home, f));
+    }
+    child.kill();
+    assert.ok(existsSync(join(home, mode)));
+  }
+});
+
+test("serve --token-stdin exits if stdin closes before the token", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "reelforge-token-eof-"));
+  const r = spawnSync(process.execPath, [new URL("../bin/reelforge.js", import.meta.url).pathname, "serve", "--token-stdin"], { env: { ...process.env, REELFORGE_HOME: home }, input: "", timeout: 10_000 });
+  rmSync(home, { recursive: true, force: true });
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout.toString(), "", "never became ready");
+});
+
 test("ai from the CLI: propose (local), apply needs --yes, consent flags", async (t) => {
   const { createServer } = await import("node:http");
   let clipId = "";

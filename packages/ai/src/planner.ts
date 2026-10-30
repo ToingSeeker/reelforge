@@ -56,6 +56,9 @@ export async function propose(db: Database, projectId: string, provider: Planner
         const touched = plan.operations.flatMap((o) => ("clipId" in o ? [o.clipId] : "clipIds" in o ? o.clipIds : [])).filter((id): id is string => !!id);
         const outside = [...new Set(touched)].filter((id) => tl.clips.some((c) => c.id === id) && !selection.includes(id));
         if (outside.length) warnings.push(`Also changes ${outside.length} clip(s) outside your selection.`);
+        // Operations that aren't about a selected clip at all: new clips, tracks, captions.
+        const other = plan.operations.filter((o) => o.type === "clip.add" || o.type.startsWith("track.") || o.type.startsWith("caption"));
+        if (other.length) warnings.push(`Also makes ${other.length} change(s) beyond your selected clips (${[...new Set(other.map((o) => o.type))].join(", ")}).`);
       }
       try {
         return proposals.create(projectId, {

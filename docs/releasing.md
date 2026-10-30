@@ -3,9 +3,9 @@
 ## Build
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile   # exactly the reviewed lockfile; fails instead of re-resolving
 pnpm check
-pnpm release:mac
+pnpm release:mac                 # cargo runs with --locked for the same reason (needs ~/.cargo/bin on PATH)
 # → apps/desktop/src-tauri/target/release/bundle/dmg/ReelForge_<version>_aarch64.dmg
 ```
 
@@ -30,7 +30,15 @@ Verify a build like a user would: `REELFORGE_APP=/path/ReelForge.app scripts/e2e
 launchd's minimal PATH and exports through the real save panel.
 
 To bump the Node runtime: change `NODE_VERSION` and the checksum in `build-engine.mjs` from
-`https://nodejs.org/dist/v<version>/SHASUMS256.txt`.
+`https://nodejs.org/dist/v<version>/SHASUMS256.txt`. Check that file's signature first
+(`SHASUMS256.txt.sig`/`.asc`, against the Node release keys listed in the nodejs/node README), so the pin doesn't
+rest only on the site it was downloaded from.
+
+## Publishing
+
+Publish the DMG's SHA-256 next to it (`shasum -a 256 ReelForge_*.dmg`) in the release notes. Ad-hoc signed builds
+have no other integrity root a user can check; Developer ID signing + notarization (below) is the real fix for public
+releases.
 
 ## Signing and notarization
 

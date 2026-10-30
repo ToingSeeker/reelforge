@@ -67,9 +67,11 @@ export function ProposalCard(p: {
                   </li>
                 ))}
                 {x.explanations.some(Boolean) && (
+                  // The engine wrote the lines above; these reasons come from the model or client, so they're labelled.
                   <li className="rf-diff-why">
+                    <div className="rf-diff-why-label">{fromClient ? "The client's notes:" : "The AI's reasons:"}</div>
                     {x.explanations.filter(Boolean).map((w, i) => (
-                      <div key={i}>• {w}</div>
+                      <div key={i}>• “{w}”</div>
                     ))}
                   </li>
                 )}

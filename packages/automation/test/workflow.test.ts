@@ -188,3 +188,20 @@ test("glob detection sees a pattern carried by baseDir, as the runner does", () 
   assert.deepEqual(globImportSteps(spec, "/Users/*"), [{ index: 0, patterns: ["/Users/*/clip.mp4"] }]);
 });
 
+test("a glob stops past the import limit, and failures are listed by name only up to ten", async (t) => {
+  const s = db(t);
+  const many = join(dir, "many");
+  mkdirSync(many);
+  for (let i = 0; i < 205; i++) writeFileSync(join(many, `f${i}.mp4`), "");
+  const tooMany = await runWorkflow(s.db, { version: 1, name: "Many", project: { name: "M" }, steps: [{ import: { paths: ["many/*.mp4"] } }] }, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  assert.equal(tooMany.status, "failed");
+  assert.match(tooMany.error!, /matches more than 200 media files/);
+  assert.ok(!tooMany.error!.includes("f1.mp4"));
+
+  const broken = Array.from({ length: 15 }, (_, i) => join(many, `f${i}.mp4`)); // empty files: not readable media
+  const failed = await runWorkflow(s.db, { version: 1, name: "Broken", project: { name: "B" }, steps: [{ import: { paths: broken } }] }, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error!, /\(and 5 more\)$/);
+  assert.equal((failed.error!.match(/f\d+\.mp4:/g) ?? []).length, 10);
+});
+
