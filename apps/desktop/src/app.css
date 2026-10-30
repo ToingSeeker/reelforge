@@ -502,12 +502,14 @@ button:disabled {
   padding: 4px 16px 10px;
   background-image: radial-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px);
   background-size: 14px 14px;
+  /* The frame sizes itself from both sides of this box (cqw/cqh), so any format fits without stretching. */
+  container-type: size;
 }
 .rf-frame {
   position: relative;
-  height: 100%;
-  max-width: 100%;
-  max-height: 100%;
+  /* Largest box with the project's aspect ratio (--rf-aspect, set inline) that fits the monitor. */
+  width: min(100cqw, 100cqh * var(--rf-aspect, 0.5625));
+  aspect-ratio: var(--rf-aspect, 0.5625);
   background: #000;
   border: 1px solid var(--rf-border);
   border-radius: 2px;

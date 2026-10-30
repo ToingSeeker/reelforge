@@ -163,7 +163,7 @@ export function Preview(props: Props) {
         </div>
       </div>
       <div className="rf-monitor">
-        <div className="rf-frame" style={{ aspectRatio: `${s.width} / ${s.height}` }}>
+        <div className="rf-frame" style={{ "--rf-aspect": s.width / s.height } as React.CSSProperties}>
           {live ? (
             <canvas ref={canvas} className="rf-frame-poster" aria-label="Live preview" />
           ) : preview.url ? (

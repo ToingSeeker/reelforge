@@ -242,9 +242,10 @@ export function App() {
   const createProject = async (input: Parameters<Client["createProject"]>[0]) => {
     if (!client) return;
     const p = await client.createProject(input);
+    // Load the list first: selecting an id the list doesn't have yet gets "corrected" back to the first project.
+    await refresh();
     selectProject(p.id);
     setDialogOpen(false);
-    await refresh();
   };
 
   const renameProject = async (name: string) => {
@@ -368,8 +369,8 @@ export function App() {
     try {
       const p = await client.createProject({ name });
       const r = await client.importMedia(p.id, paths);
+      await refresh(); // before selecting, see createProject
       selectProject(p.id);
-      await refresh();
       const failed = r.failed.length ? ` · ${r.failed.length} failed: ${r.failed.map((f) => `${f.path.split("/").pop()} (${f.error.message})`).join("; ")}` : "";
       notify(r.failed.length ? "error" : "info", `New project “${name}” · ${r.imported.length} imported${r.skipped ? ` · ${r.skipped} non-media skipped` : ""}${failed}`);
     } catch (e) {
