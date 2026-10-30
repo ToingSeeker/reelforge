@@ -147,3 +147,23 @@ test("relink a moved file", async (t) => {
   const back = await relinkMedia(db, project.id, imported[0]!.id, moved, "cli");
   assert.equal(back.status, "online");
 });
+
+test("a playlist disguised as .mp4 is refused, not demuxed (no SSRF / local file reads)", async (t) => {
+  const { writeFileSync } = await import("node:fs");
+  const evil = join(f.dir, "disguised-playlist.mp4");
+  writeFileSync(evil, `#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\nfile:${f.portrait}\n#EXTINF:2.0,\nhttp://127.0.0.1:9/x.ts\n#EXT-X-ENDLIST\n`);
+  await assert.rejects(probe(evil), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR");
+  // ffconcat is auto-detected even by FFmpeg 8 and follows relative references to sibling files.
+  const concat = join(f.dir, "innocent.mp4");
+  writeFileSync(concat, "ffconcat version 1.0\nfile portrait.mp4\nduration 2\n");
+  await assert.rejects(probe(concat), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR");
+
+  // Even if a bad asset row existed, thumbnail generation must not follow the playlist.
+  const home = mkdtempSync(join(tmpdir(), "reelforge-ssrf-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const db = openDatabase(join(home, "db.sqlite"));
+  const project = new ProjectStore(db).create({ name: "S" }, "cli");
+  const real = await probe(f.portrait);
+  const { asset } = new AssetStore(db).add(project.id, resolveSource(concat), real, "cli");
+  await assert.rejects(ensureThumbnail(join(home, "cache"), asset), (e: unknown) => e instanceof ReelForgeError);
+});

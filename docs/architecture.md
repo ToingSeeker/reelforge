@@ -53,6 +53,9 @@ Batches are the unit AI proposals will use in M4: one proposal is one atomic, un
 - Source files are referenced by canonical absolute path. They are opened read-only by FFmpeg and never written.
 - Import validates each path (absolute, regular file, allowlisted extension, symlinks resolved) **before** FFmpeg runs,
   and FFmpeg gets `file:<path>` in an argument vector, so names like `concat:…` or `$(…)` are inert.
+- Every FFmpeg/ffprobe read forces the demuxer from the extension (`mov`, `jpeg_pipe`, `png_pipe`, `wav`, `mp3`) with
+  `-protocol_whitelist file`, and the probed `format_name` must match. Content sniffing would otherwise open a
+  "clip.mp4" that is really an ffconcat list or HLS playlist and follow it to other files or URLs.
 - Durations are stored in microseconds and converted to project frames on read (`floor`), so a clip can never reference
   a frame past the end of its source.
 - Thumbnails and waveforms are created on first request in `$REELFORGE_HOME/cache/thumbs`, at most two FFmpegs at a time,

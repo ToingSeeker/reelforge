@@ -15,6 +15,30 @@ export const SUPPORTED_EXTENSIONS: Record<string, AssetKind> = {
 };
 
 /**
+ * The demuxer each extension is opened with. FFmpeg otherwise sniffs the
+ * content, so a "clip.mp4" that is really an ffconcat list or HLS playlist
+ * would be followed to other local files or URLs. Image pipes (not image2)
+ * also avoid %d sequence patterns in file names.
+ */
+const DEMUXERS: Record<string, string> = {
+  ".mp4": "mov",
+  ".mov": "mov",
+  ".jpg": "jpeg_pipe",
+  ".jpeg": "jpeg_pipe",
+  ".png": "png_pipe",
+  ".wav": "wav",
+  ".mp3": "mp3",
+};
+
+/** Input arguments for any FFmpeg tool reading a source: forced demuxer, local files only. */
+export function sourceInputArgs(path: string): string[] {
+  const demuxer = DEMUXERS[extname(path).toLowerCase()];
+  if (!demuxer) throw new ReelForgeError("VALIDATION_ERROR", "unsupported file type");
+  // "file:" stops FFmpeg from reading protocol prefixes (concat:, http:…) out of a file name.
+  return ["-protocol_whitelist", "file", "-f", demuxer, "-i", `file:${path}`];
+}
+
+/**
  * Resolve a user-supplied path to the canonical file it names. Symlinks are
  * followed (so the stored path is the real file) and only regular files with
  * a supported extension are accepted.
@@ -123,17 +147,25 @@ export function interpretProbe(data: FfProbe, expected: AssetKind): AssetProbe {
 }
 
 export async function probeFile(file: AssetFile): Promise<AssetProbe> {
-  const expected = SUPPORTED_EXTENSIONS[extname(file.path).toLowerCase()];
+  const ext = extname(file.path).toLowerCase();
+  const expected = SUPPORTED_EXTENSIONS[ext];
   if (!expected) throw new ReelForgeError("VALIDATION_ERROR", "unsupported file type");
+  // ffprobe takes the input positionally; drop the "-i" from the shared input args.
+  const input = sourceInputArgs(file.path).filter((a) => a !== "-i");
   let out: string;
   try {
-    // "file:" stops FFmpeg from reading protocol prefixes (concat:, http:…) out of a file name.
-    ({ stdout: out } = await run(ffprobeBin(), ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", `file:${file.path}`], {
+    ({ stdout: out } = await run(ffprobeBin(), ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", ...input], {
       timeoutMs: 30_000,
     }));
   } catch (e) {
     if (e instanceof ReelForgeError) throw e;
     throw new ReelForgeError("VALIDATION_ERROR", `could not read media: ${ffmpegReason(e, file.path)}`);
   }
-  return interpretProbe(JSON.parse(out) as FfProbe, expected);
+  const data = JSON.parse(out) as FfProbe;
+  // Belt and braces: the forced demuxer must be the one that actually opened the file.
+  const formats = (data.format?.format_name ?? "").split(",");
+  if (!formats.includes(DEMUXERS[ext]!)) {
+    throw new ReelForgeError("VALIDATION_ERROR", `file content does not match its ${ext} extension`);
+  }
+  return interpretProbe(data, expected);
 }

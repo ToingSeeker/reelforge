@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { ReelForgeError, type Asset } from "@reelforge/core";
 import { ffmpegBin, ffmpegReason, limiter, run } from "./ffmpeg.ts";
+import { sourceInputArgs } from "./probe.ts";
 
 export interface Thumbnail {
   path: string;
@@ -19,19 +20,18 @@ export function thumbnailFile(cacheDir: string, asset: Asset): Thumbnail {
 }
 
 function args(asset: Asset, out: string): string[] {
-  const input = `file:${asset.sourcePath}`;
+  const input = sourceInputArgs(asset.sourcePath);
   const common = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"];
   if (asset.kind === "audio") {
     // Waveform strip in the music-track colour; also used as the clip background in the timeline.
-    return [...common, "-i", input, "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=960x120:colors=0x2bd47d", "-frames:v", "1", out];
+    return [...common, ...input, "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=960x120:colors=0x2bd47d", "-frames:v", "1", out];
   }
   // Poster frame 10% in (capped at 3s) so black lead-ins don't become the thumbnail.
   const seek = asset.kind === "video" && asset.durationUs ? Math.min(asset.durationUs * 0.1, 3_000_000) / 1_000_000 : 0;
   return [
     ...common,
     ...(seek > 0 ? ["-ss", seek.toFixed(3)] : []),
-    "-i",
-    input,
+    ...input,
     "-frames:v",
     "1",
     "-vf",
