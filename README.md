@@ -5,10 +5,10 @@
 
 ---
 
-> **Status: pre-alpha — milestone M0 (Foundation).** Projects, the shared
-> engine, the CLI, the local REST API and the desktop shell work. Media import,
-> the timeline editor, rendering and the AI Director are not built yet. See
-> [docs/milestones.md](docs/milestones.md).
+> **Status: pre-alpha, milestone M1 (Editing Core).** Projects, media import,
+> a multi-track timeline (move, trim, split, ripple delete, undo/redo) and the
+> desktop studio work. Playback/rendering (M2) and the AI Director (M4) are not
+> built yet. See [docs/milestones.md](docs/milestones.md).
 
 ReelForge turns raw footage into editable, reviewable vertical video. You can drive it
 from a desktop studio, a built-in AI Director, any MCP client (Claude, ChatGPT, Gemini CLI),
@@ -24,7 +24,7 @@ Full specification: [docs/PRD.md](docs/PRD.md) · UI reference: [docs/design/edi
 
 ## Quickstart
 
-Requirements: macOS on Apple Silicon, Node ≥ 24, pnpm 10, and Rust stable (for the desktop shell). FFmpeg is needed from M1.
+Requirements: macOS on Apple Silicon, Node ≥ 24, pnpm 10, FFmpeg (`brew install ffmpeg`), and Rust stable (for the desktop shell).
 
 ```sh
 pnpm install
@@ -37,6 +37,14 @@ pnpm cli project list
 pnpm cli project rename <id> --name "Final" --base-revision 1
 pnpm cli project history <id>
 
+# Media and timeline (times: frames, 2.5s, 00:00:03:00 or 00:03.10)
+pnpm cli media import <project> ~/Footage/*.mp4 ~/Music/track.wav
+pnpm cli clip add <project> --track V1 --asset <asset> --start 0 --duration 4s
+pnpm cli clip split <project> <clip> --at 2s
+pnpm cli clip delete <project> <clip> --ripple
+pnpm cli timeline undo <project>
+pnpm cli timeline get <project>
+
 # Desktop studio (starts the engine as a sidecar)
 pnpm desktop
 ```
@@ -48,7 +56,8 @@ Data lives in `~/Library/Application Support/ReelForge/reelforge.db`. Set `REELF
 ## Repository layout
 
 ```
-packages/core     editing core: schemas, rational timebase, SQLite store, revisions
+packages/core     editing core: schemas, rational timebase, timeline reducer, SQLite stores, undo
+packages/media    FFprobe/FFmpeg: import, probing, thumbnails and waveforms
 packages/server   local REST API (loopback only, bearer token, Host/Origin checks)
 packages/cli      `reelforge` JSON CLI, including `reelforge serve`
 apps/desktop      Tauri 2 + React studio; the Rust shell runs the engine as a sidecar

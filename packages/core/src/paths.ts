@@ -29,3 +29,8 @@ export function ensureHome(dir: string): string {
 export function resolveDbPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(ensureHome(resolveHome(env)), DB_FILENAME);
 }
+
+/** Derived, disposable data (thumbnails, later proxies). Safe to delete. */
+export function resolveCacheDir(env: NodeJS.ProcessEnv = process.env): string {
+  return ensureHome(join(resolveHome(env), "cache"));
+}

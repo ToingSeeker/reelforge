@@ -1,4 +1,4 @@
-import type { CreateProjectInput, EditOperation, Project } from "@reelforge/core/schema";
+import type { Asset, CreateProjectInput, EditOperation, Project, Timeline, TimelineOp } from "@reelforge/core/schema";
 
 // The desktop UI never touches SQLite: it talks to the same core through the
 // local REST sidecar that the Rust shell starts (or, in a plain browser during
@@ -65,6 +65,29 @@ export function createClient(info: ApiInfo) {
       request<{ project: Project }>("PATCH", `/v1/projects/${encodeURIComponent(id)}`, { name, baseRevision }).then((r) => r.project),
     history: (id: string) =>
       request<{ operations: EditOperation[] }>("GET", `/v1/projects/${encodeURIComponent(id)}/history`).then((r) => r.operations),
+    timeline: (id: string) => request<{ timeline: Timeline }>("GET", `/v1/projects/${encodeURIComponent(id)}/timeline`).then((r) => r.timeline),
+    apply: (id: string, baseRevision: number, operations: TimelineOp[]) =>
+      request<{ timeline: Timeline }>("POST", `/v1/projects/${encodeURIComponent(id)}/operations`, { baseRevision, operations }).then((r) => r.timeline),
+    undo: (id: string, baseRevision: number) =>
+      request<{ timeline: Timeline }>("POST", `/v1/projects/${encodeURIComponent(id)}/undo`, { baseRevision }).then((r) => r.timeline),
+    redo: (id: string, baseRevision: number) =>
+      request<{ timeline: Timeline }>("POST", `/v1/projects/${encodeURIComponent(id)}/redo`, { baseRevision }).then((r) => r.timeline),
+    importMedia: (id: string, paths: string[]) =>
+      request<{ imported: Asset[]; existing: Asset[]; failed: { path: string; error: { code: string; message: string } }[] }>(
+        "POST",
+        `/v1/projects/${encodeURIComponent(id)}/assets`,
+        { paths },
+      ),
+    relink: (id: string, assetId: string, path: string) =>
+      request<{ asset: Asset }>("POST", `/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/relink`, { path }).then((r) => r.asset),
+    /** Thumbnails need the bearer token, so they're fetched and handed to <img> as blob URLs. */
+    thumbnail: async (id: string, assetId: string): Promise<Blob> => {
+      const res = await fetch(`${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/thumbnail`, {
+        headers: { authorization: `Bearer ${info.token}` },
+      });
+      if (!res.ok) throw new ApiError(res.status, "THUMBNAIL", `thumbnail unavailable (${res.status})`);
+      return res.blob();
+    },
   };
 }
 

@@ -116,6 +116,7 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(Engine { state, child: Mutex::new(child) })
         .invoke_handler(tauri::generate_handler![api_info])
         .build(tauri::generate_context!())

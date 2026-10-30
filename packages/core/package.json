@@ -7,7 +7,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./schema": "./src/schema.ts",
-    "./timebase": "./src/timebase.ts"
+    "./timebase": "./src/timebase.ts",
+    "./timeline-ops": "./src/timeline-ops.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"

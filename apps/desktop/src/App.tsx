@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Project } from "@reelforge/core/schema";
-import { ApiError, createClient, resolveApiInfo, type Client } from "./api.ts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { Asset, Project, TimelineOp } from "@reelforge/core/schema";
+import { canPlace, clipEnd } from "@reelforge/core/timeline-ops";
+import { formatClock } from "@reelforge/core/timebase";
+import { createClient, resolveApiInfo, type Client } from "./api.ts";
+import { useEditor } from "./editor.ts";
+import { onFileDrop, pickMediaFiles } from "./native.ts";
 import { TopBar, type Workspace } from "./components/TopBar.tsx";
 import { LeftRail, type RailItem } from "./components/LeftRail.tsx";
 import { MediaLibrary } from "./components/MediaLibrary.tsx";
 import { Preview } from "./components/Preview.tsx";
 import { AIDirector } from "./components/AIDirector.tsx";
-import { Timeline } from "./components/Timeline.tsx";
+import { Timeline, type AssetDropHandler } from "./components/Timeline.tsx";
 import { NewProjectDialog } from "./components/NewProjectDialog.tsx";
 import { Welcome } from "./components/Welcome.tsx";
-import { Placeholder } from "./components/Placeholder.tsx";
+import { Placeholder, RailPlaceholder } from "./components/Placeholder.tsx";
+import { Icon } from "./icons.tsx";
 
 const CURRENT_KEY = "rf.currentProject";
 const POLL_MS = 2000;
@@ -29,6 +34,9 @@ function writePref(key: string, value: string) {
   }
 }
 
+const isTyping = (t: EventTarget | null) =>
+  t instanceof HTMLElement && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName));
+
 export function App() {
   const [client, setClient] = useState<Client | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
@@ -38,7 +46,15 @@ export function App() {
   const [workspace, setWorkspace] = useState<Workspace>("edit");
   const [rail, setRail] = useState<RailItem>("media");
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [toast, setToast] = useState<{ tone: "info" | "error"; text: string } | null>(null);
+  const [toast, setToast] = useState<{ tone: "info" | "error"; text: string; id: number } | null>(null);
+  const [selection, setSelection] = useState<Set<string>>(new Set());
+  const [playhead, setPlayhead] = useState(0);
+  const [importing, setImporting] = useState(false);
+  const [fileHover, setFileHover] = useState(false);
+  const [assetDrag, setAssetDrag] = useState<{ asset: Asset; x: number; y: number } | null>(null);
+  const dropHandler = useRef<AssetDropHandler | null>(null);
+
+  const notify = useCallback((tone: "info" | "error", text: string) => setToast({ tone, text, id: Date.now() }), []);
 
   useEffect(() => {
     resolveApiInfo()
@@ -72,11 +88,11 @@ export function App() {
 
   useEffect(() => {
     if (!toast) return;
-    const id = window.setTimeout(() => setToast(null), 4500);
+    const id = window.setTimeout(() => setToast(null), toast.tone === "error" ? 7000 : 3500);
     return () => window.clearTimeout(id);
   }, [toast]);
 
-  const current = useMemo(() => {
+  const listed = useMemo(() => {
     if (!projects?.length) return null;
     return projects.find((p) => p.id === currentId) ?? projects[0] ?? null;
   }, [projects, currentId]);
@@ -88,9 +104,36 @@ export function App() {
 
   // Pin the fallback choice; otherwise a project created from the CLI would
   // become "most recent" and silently take over this window.
+  const editor = useEditor(client, listed?.id ?? null, notify);
+  const tl = editor.timeline;
+  // The project list is polled; the timeline is updated by every edit. Whichever
+  // saw the later revision wins, so a rename right after an edit doesn't
+  // conflict with our own change.
+  const current = useMemo(
+    () => (listed && tl && tl.project.id === listed.id && tl.project.revision > listed.revision ? tl.project : listed),
+    [listed, tl],
+  );
+  const fps = current?.settings.fps ?? { num: 30, den: 1 };
+
   useEffect(() => {
-    if (current && current.id !== currentId) selectProject(current.id);
-  }, [current, currentId]);
+    setSelection(new Set());
+    setPlayhead(0);
+  }, [current?.id]);
+
+  useEffect(() => {
+    if (listed && listed.id !== currentId) selectProject(listed.id);
+  }, [listed, currentId]);
+
+  useEffect(() => {
+    if (listed) editor.syncRevision(listed.revision);
+  }, [listed?.revision]);
+
+  // Drop selections that no longer exist (undo, another client's edit).
+  useEffect(() => {
+    if (!tl) return;
+    const ids = new Set(tl.clips.map((c) => c.id));
+    setSelection((s) => (Array.from(s).every((id) => ids.has(id)) ? s : new Set(Array.from(s).filter((id) => ids.has(id)))));
+  }, [tl]);
 
   const createProject = async (input: Parameters<Client["createProject"]>[0]) => {
     if (!client) return;
@@ -105,14 +148,113 @@ export function App() {
     try {
       await client.renameProject(current.id, name, current.revision);
     } catch (e) {
-      if (e instanceof ApiError && e.code === "REVISION_CONFLICT") {
-        setToast({ tone: "error", text: "This project changed elsewhere, so your rename was not applied. Reloaded the latest version." });
-      } else {
-        setToast({ tone: "error", text: e instanceof Error ? e.message : String(e) });
-      }
+      notify("error", e instanceof Error ? e.message : String(e));
     }
     await refresh();
   };
+
+  const doImport = async (paths?: string[]) => {
+    const files = paths ?? (await pickMediaFiles());
+    if (!files.length) return;
+    setImporting(true);
+    await editor.importPaths(files);
+    setImporting(false);
+    void refresh();
+  };
+
+  const relink = async (asset: Asset) => {
+    const [path] = await pickMediaFiles({ multiple: false });
+    if (path) await editor.relink(asset, path);
+  };
+
+  const apply = (label: string, ops: TimelineOp[]) => void editor.apply(label, ops);
+
+  const appendAsset = (asset: Asset) => {
+    if (!tl) return;
+    const track =
+      tl.tracks.find((t) => !t.locked && t.kind === (asset.kind === "audio" ? "audio" : "video") && canPlace(asset, t.kind)) ??
+      tl.tracks.find((t) => !t.locked && canPlace(asset, t.kind));
+    if (!track) return notify("error", `No unlocked track can hold ${asset.filename}.`);
+    const end = tl.clips.filter((c) => c.trackId === track.id).reduce((m, c) => Math.max(m, clipEnd(c)), 0);
+    apply("Append clip", [{ type: "clip.add", trackId: track.id, assetId: asset.id, start: end }]);
+  };
+
+  const split = () => {
+    if (!tl) return;
+    const locked = new Set(tl.tracks.filter((t) => t.locked).map((t) => t.id));
+    const under = tl.clips.filter((c) => !locked.has(c.trackId) && c.start < playhead && playhead < clipEnd(c));
+    const targets = selection.size ? under.filter((c) => selection.has(c.id)) : under;
+    if (!targets.length) return notify("info", "Move the playhead inside a clip to split it.");
+    apply("Split", targets.map((c) => ({ type: "clip.split" as const, clipId: c.id, frame: playhead })));
+  };
+
+  const remove = (ripple: boolean) => {
+    if (!selection.size) return;
+    apply(ripple ? "Ripple delete" : "Delete", [{ type: "clip.delete", clipIds: Array.from(selection), ...(ripple ? { ripple } : {}) }]);
+    setSelection(new Set());
+  };
+
+  // Keyboard: ⌘Z / ⇧⌘Z, S split, ⌫ delete, ⇧⌫ ripple, ←/→ frame (⇧ = 1s), Home/End.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (isTyping(e.target) || dialogOpen || !tl) return;
+      const mod = e.metaKey || e.ctrlKey;
+      const second = Math.round(fps.num / fps.den);
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) tl.history.canRedo && void editor.redo();
+        else tl.history.canUndo && void editor.undo();
+      } else if (mod) {
+        return;
+      } else if (e.key === "s" || e.key === "S") {
+        e.preventDefault();
+        split();
+      } else if (e.key === "Backspace" || e.key === "Delete") {
+        e.preventDefault();
+        remove(e.shiftKey);
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault();
+        const d = (e.shiftKey ? second : 1) * (e.key === "ArrowLeft" ? -1 : 1);
+        setPlayhead((p) => Math.max(0, p + d));
+      } else if (e.key === "Home") {
+        setPlayhead(0);
+      } else if (e.key === "End") {
+        setPlayhead(tl.durationFrames);
+      } else if (e.key === "Escape") {
+        setSelection(new Set());
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  // Library → timeline drag (pointer-based so it behaves the same in every webview).
+  useEffect(() => {
+    if (!assetDrag) return;
+    const move = (e: PointerEvent) => setAssetDrag((d) => (d ? { ...d, x: e.clientX, y: e.clientY } : d));
+    const up = (e: PointerEvent) => {
+      const handled = dropHandler.current?.(assetDrag.asset, e.clientX, e.clientY);
+      if (handled === false && document.elementFromPoint(e.clientX, e.clientY)?.closest(".rf-timeline")) {
+        notify("error", `${assetDrag.asset.filename} can't go on that track.`);
+      }
+      setAssetDrag(null);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+  }, [assetDrag?.asset.id]);
+
+  // Files dropped from Finder import into the open project.
+  const importRef = useRef(doImport);
+  importRef.current = doImport;
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    void onFileDrop((paths) => void importRef.current(paths), setFileHover).then((f) => (off = f));
+    return () => off?.();
+  }, []);
 
   if (bootError) {
     return (
@@ -124,17 +266,22 @@ export function App() {
   }
 
   return (
-    <div className="rf-app">
+    <div className={`rf-app${assetDrag ? " is-dragging-asset" : ""}`}>
       <TopBar
         projects={projects ?? []}
         current={current}
         offline={offline}
         loading={projects === null}
+        busy={editor.busy}
         workspace={workspace}
         onWorkspace={setWorkspace}
         onSelectProject={selectProject}
         onNewProject={() => setDialogOpen(true)}
         onRename={renameProject}
+        canUndo={!!tl?.history.canUndo}
+        canRedo={!!tl?.history.canRedo}
+        onUndo={() => void editor.undo()}
+        onRedo={() => void editor.redo()}
       />
 
       {projects !== null && !current ? (
@@ -144,10 +291,39 @@ export function App() {
       ) : (
         <div className="rf-studio">
           <LeftRail active={rail} onChange={setRail} />
-          <MediaLibrary />
-          <Preview project={current} />
+          {rail === "media" ? (
+            <MediaLibrary
+              client={client}
+              projectId={current?.id ?? null}
+              fps={fps}
+              assets={tl?.assets ?? []}
+              importing={importing}
+              dropHover={fileHover}
+              onImport={() => void doImport()}
+              onAppend={appendAsset}
+              onRelink={(a) => void relink(a)}
+              onDragStart={(asset, e) => setAssetDrag({ asset, x: e.clientX, y: e.clientY })}
+            />
+          ) : (
+            <RailPlaceholder item={rail} />
+          )}
+          <Preview client={client} timeline={tl} playhead={playhead} onPlayhead={setPlayhead} />
           <AIDirector />
-          <Timeline project={current} />
+          <Timeline
+            client={client}
+            timeline={tl}
+            selection={selection}
+            onSelect={setSelection}
+            playhead={playhead}
+            onPlayhead={setPlayhead}
+            onApply={apply}
+            onSplit={split}
+            onDelete={remove}
+            registerDrop={(h) => {
+              dropHandler.current = h;
+            }}
+            assetDragging={assetDrag?.asset ?? null}
+          />
         </div>
       )}
 
@@ -156,13 +332,17 @@ export function App() {
           <>
             <span>{current.name}</span>
             <span className="rf-sep" />
-            <span>00:00.00</span>
+            <span>{formatClock(tl?.durationFrames ?? 0, fps)}</span>
             <span className="rf-sep" />
-            <span>0 clips</span>
+            <span>
+              {tl?.clips.length ?? 0} clip{tl?.clips.length === 1 ? "" : "s"}
+            </span>
+            <span className="rf-sep" />
+            <span>{tl?.assets.length ?? 0} media</span>
             <span className="rf-sep" />
             <span>rev {current.revision}</span>
             <span className="rf-statusbar-right">
-              {current.settings.width} × {current.settings.height} · {formatFpsLabel(current)} FPS
+              {current.settings.width} × {current.settings.height} · {fps.den === 1 ? fps.num : (fps.num / fps.den).toFixed(2)} FPS
             </span>
           </>
         ) : (
@@ -170,17 +350,21 @@ export function App() {
         )}
       </footer>
 
+      {assetDrag && (
+        <div className="rf-drag-ghost" style={{ left: assetDrag.x + 12, top: assetDrag.y + 12 }} aria-hidden="true">
+          {assetDrag.asset.filename}
+        </div>
+      )}
       {dialogOpen && <NewProjectDialog onCancel={() => setDialogOpen(false)} onCreate={createProject} />}
       {toast && (
-        <div className={`rf-toast rf-toast-${toast.tone}`} role="status">
+        <div key={toast.id} className={`rf-toast rf-toast-${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>
           {toast.text}
+          <button className="rf-icon-btn" onClick={() => setToast(null)} aria-label="Dismiss">
+            <Icon name="x" size={14} />
+          </button>
         </div>
       )}
     </div>
   );
 }
 
-function formatFpsLabel(p: Project): string {
-  const { num, den } = p.settings.fps;
-  return den === 1 ? String(num) : (num / den).toFixed(2);
-}

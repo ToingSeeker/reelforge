@@ -89,3 +89,54 @@ test("serve prints a ready line and exits on SIGTERM and on stdin EOF", async (t
   b.stdin!.end(); // parent went away
   assert.equal(await exitWithin(b, 3000), "exited");
 });
+
+test("M1 workflow from the CLI alone: import → add → split → trim → ripple delete → undo", async (t) => {
+  const run = harness(t);
+  const { fixtures } = await import("../../media/test/fixtures.ts");
+  const f = fixtures();
+  const id = (await run("project", "create", "--name", "CLI reel")).json.project.id;
+
+  const imp = await run("media", "import", id, f.portrait, f.landscape, f.wav, f.corrupt);
+  assert.equal(imp.code, 0);
+  assert.equal(imp.json.imported.length, 3);
+  assert.equal(imp.json.failed.length, 1);
+  const [portrait, landscape, wav] = imp.json.imported;
+
+  const a = await run("clip", "add", id, "--track", "V1", "--asset", portrait.id, "--start", "0");
+  assert.equal(a.code, 0, JSON.stringify(a.error));
+  const b = await run("clip", "add", id, "--track", "v1", "--asset", landscape.id, "--start", "2s", "--duration", "00:01.00");
+  assert.equal(b.code, 0, JSON.stringify(b.error));
+  await run("clip", "add", id, "--track", "A1", "--asset", wav.id, "--start", "0");
+
+  let tl = (await run("timeline", "get", id)).json.timeline;
+  const first = tl.clips.find((c: any) => c.assetId === portrait.id);
+  assert.equal(tl.durationFrames, 90);
+
+  const split = await run("clip", "split", id, first.id, "--at", "30");
+  assert.equal(split.code, 0);
+  const trim = await run("clip", "trim", id, first.id, "--edge", "start", "--at", "10");
+  assert.equal(trim.json.timeline.clips.find((c: any) => c.id === first.id).sourceIn, 10);
+
+  const del = await run("clip", "delete", id, first.id, "--ripple");
+  tl = del.json.timeline;
+  const v1 = tl.tracks.find((x: any) => x.kind === "video").id;
+  assert.deepEqual(tl.clips.filter((c: any) => c.trackId === v1).map((c: any) => c.start), [10, 40]);
+
+  const undo = await run("timeline", "undo", id);
+  assert.equal(undo.json.timeline.clips.filter((c: any) => c.trackId === v1).length, 3);
+
+  const overlap = await run("clip", "move", id, first.id, "--start", "35");
+  assert.equal(overlap.code, 2);
+  assert.match(overlap.error.message, /overlap/);
+  const badTrack = await run("clip", "add", id, "--track", "V9", "--asset", portrait.id, "--start", "0");
+  assert.match(badTrack.error.message, /have V1, V2|unknown track/);
+  const stale = await run("clip", "move", id, first.id, "--start", "200", "--base-revision", "1");
+  assert.equal(stale.code, 4);
+  const badTime = await run("clip", "split", id, first.id, "--at", "soon");
+  assert.equal(badTime.code, 2);
+
+  const ops = JSON.stringify([{ type: "track.update", trackId: v1, locked: true }]);
+  assert.equal((await run("timeline", "apply", id, "--ops", ops)).code, 0);
+  const locked = await run("clip", "move", id, first.id, "--start", "300");
+  assert.match(locked.error.message, /locked/);
+});

@@ -24,6 +24,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
+      - name: Install FFmpeg (media tests probe real files)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q ffmpeg; else brew install ffmpeg; fi
+          ffmpeg -version | head -1
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test

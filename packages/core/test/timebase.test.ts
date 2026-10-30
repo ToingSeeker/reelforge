@@ -56,3 +56,15 @@ test("timecode formatting", () => {
   assert.equal(formatClock(368, fps), "00:12.08");
   assert.equal(formatClock(900, fps), "00:30.00");
 });
+
+test("parseTime accepts frames, seconds, timecode and clock", async () => {
+  const { parseTime } = await import("../src/timebase.ts");
+  const fps = rational(30);
+  assert.equal(parseTime("90", fps), 90);
+  assert.equal(parseTime("2.5s", fps), 75);
+  assert.equal(parseTime("00:00:03:10", fps), 100);
+  assert.equal(parseTime("00:12.08", fps), 368);
+  assert.throws(() => parseTime("00:00:03:30", fps), RangeError);
+  assert.throws(() => parseTime("abc", fps), RangeError);
+  assert.equal(parseTime("1s", rational(30000, 1001)), 30);
+});

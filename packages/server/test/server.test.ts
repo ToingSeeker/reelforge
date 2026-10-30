@@ -6,13 +6,14 @@ import { join } from "node:path";
 import { request } from "node:http";
 import { openDatabase } from "@reelforge/core";
 import { startApiServer, type RunningServer } from "../src/index.ts";
+import { fixtures } from "../../media/test/fixtures.ts";
 
 const TOKEN = "t".repeat(48);
 
 async function boot(t: { after: (fn: () => unknown) => void }): Promise<RunningServer> {
   const dir = mkdtempSync(join(tmpdir(), "reelforge-server-"));
   const db = openDatabase(join(dir, "reelforge.db"));
-  const srv = await startApiServer({ db, token: TOKEN, allowedOrigins: ["http://localhost:5173"] });
+  const srv = await startApiServer({ db, token: TOKEN, allowedOrigins: ["http://localhost:5173"], cacheDir: join(dir, "cache") });
   t.after(async () => {
     await srv.close();
     db.close();
@@ -87,4 +88,50 @@ test("foreign origins and rebinding hosts are refused", async (t) => {
     req.end();
   });
   assert.equal(status, 403);
+});
+
+test("M1 over REST: import, edit, conflict, undo/redo, thumbnail", async (t) => {
+  const srv = await boot(t);
+  const f = fixtures();
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Reel" } })).json()) as any;
+
+  const imp = await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [f.portrait, f.mp3, f.corrupt] } });
+  assert.equal(imp.status, 201);
+  const result = (await imp.json()) as any;
+  assert.equal(result.imported.length, 2);
+  assert.equal(result.failed[0].error.code, "VALIDATION_ERROR");
+  assert.equal(result.failed[0].error.message.includes(f.dir), false, "FFmpeg errors don't echo local paths");
+
+  let tl = ((await (await call(srv, "GET", `/v1/projects/${project.id}/timeline`)).json()) as any).timeline;
+  const video = tl.tracks.find((x: any) => x.kind === "video");
+  const ops = (baseRevision: number, operations: unknown[]) => call(srv, "POST", `/v1/projects/${project.id}/operations`, { body: { baseRevision, operations } });
+
+  const added = await ops(tl.project.revision, [{ type: "clip.add", trackId: video.id, assetId: result.imported[0].id, start: 0 }]);
+  assert.equal(added.status, 200);
+  tl = ((await added.json()) as any).timeline;
+  assert.equal(tl.clips.length, 1);
+
+  const stale = await ops(tl.project.revision - 1, [{ type: "clip.move", clipId: tl.clips[0].id, start: 30 }]);
+  assert.equal(stale.status, 409);
+  const invalid = await ops(tl.project.revision, [{ type: "clip.move", clipId: tl.clips[0].id, start: -1 }]);
+  assert.equal(invalid.status, 400);
+
+  const undone = await call(srv, "POST", `/v1/projects/${project.id}/undo`, { body: { baseRevision: tl.project.revision } });
+  const u = ((await undone.json()) as any).timeline;
+  assert.equal(u.clips.length, 0);
+  assert.equal(u.history.canRedo, true);
+  const redone = ((await (await call(srv, "POST", `/v1/projects/${project.id}/redo`, { body: { baseRevision: u.project.revision } })).json()) as any).timeline;
+  assert.equal(redone.clips.length, 1);
+
+  const thumb = await call(srv, "GET", `/v1/projects/${project.id}/assets/${result.imported[0].id}/thumbnail`);
+  assert.equal(thumb.status, 200);
+  assert.equal(thumb.headers.get("content-type"), "image/jpeg");
+  assert.ok((await thumb.arrayBuffer()).byteLength > 500);
+  const wave = await call(srv, "GET", `/v1/projects/${project.id}/assets/${result.imported[1].id}/thumbnail`);
+  assert.equal(wave.headers.get("content-type"), "image/png");
+
+  const badBody = await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: "nope" } });
+  assert.equal(badBody.status, 400);
+  const foreignAsset = await call(srv, "GET", `/v1/projects/${project.id}/assets/00000000-0000-4000-8000-000000000000/thumbnail`);
+  assert.equal(foreignAsset.status, 404);
 });

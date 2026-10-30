@@ -35,6 +35,7 @@ export function migrate(db: Database, migrations: readonly Migration[] = MIGRATI
       const done = db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(m.version);
       if (done) return;
       db.exec(m.sql);
+      m.up?.(db);
       db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
         m.version,
         m.name,

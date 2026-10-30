@@ -131,3 +131,31 @@ export function formatClock(frames: number, fps: Rational): string {
   const minutes = Number(hh) * 60 + Number(mm);
   return `${sign}${String(minutes).padStart(2, "0")}:${ss}.${ff}`;
 }
+
+/** Exact microseconds → frames (used for probed media durations). */
+export function microsToFrames(micros: number, fps: Rational, rounding: Rounding = "floor"): number {
+  const n = BigInt(Math.round(micros)) * BigInt(fps.num);
+  const d = 1_000_000n * BigInt(fps.den);
+  return Number(signedDivRound(n, d, rounding));
+}
+
+/**
+ * Parse a user-facing time into project frames:
+ *   "90" (frames) · "3s" / "2.5s" (seconds) · "00:00:03:00" (timecode) · "00:03.10" (MM:SS.FF)
+ */
+export function parseTime(input: string, fps: Rational): number {
+  const s = input.trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  const sec = /^(\d+(?:\.\d+)?)s$/.exec(s);
+  if (sec) return secondsToFrames(Number(sec[1]), fps);
+  const base = nominalFps(fps);
+  const tc = /^(\d+):(\d{2}):(\d{2})[:;](\d{2})$/.exec(s);
+  const clock = /^(\d+):(\d{2})\.(\d{2})$/.exec(s);
+  const parts = tc ? tc.slice(1).map(Number) : clock ? [0, ...clock.slice(1).map(Number)] : null;
+  if (parts) {
+    const [hh, mm, ss, ff] = parts as [number, number, number, number];
+    if (mm > 59 || ss > 59 || ff >= base) throw new RangeError(`invalid time "${input}"`);
+    return ((hh * 60 + mm) * 60 + ss) * base + ff;
+  }
+  throw new RangeError(`invalid time "${input}" (use frames, 2.5s, HH:MM:SS:FF or MM:SS.FF)`);
+}

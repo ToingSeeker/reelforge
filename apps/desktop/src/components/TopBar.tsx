@@ -16,6 +16,11 @@ interface Props {
   current: Project | null;
   offline: boolean;
   loading: boolean;
+  busy: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
   workspace: Workspace;
   onWorkspace: (w: Workspace) => void;
   onSelectProject: (id: string) => void;
@@ -50,12 +55,12 @@ export function TopBar(p: Props) {
       </nav>
 
       <div className="rf-topbar-right">
-        <SaveStatus current={p.current} offline={p.offline} loading={p.loading} />
+        <SaveStatus current={p.current} offline={p.offline} loading={p.loading} busy={p.busy} />
         <div className="rf-btn-group">
-          <button className="rf-icon-btn" disabled title="Undo — arrives with the editing core (M1)" aria-label="Undo">
+          <button className="rf-icon-btn" disabled={!p.canUndo} onClick={p.onUndo} title="Undo (⌘Z)" aria-label="Undo">
             <Icon name="undo" />
           </button>
-          <button className="rf-icon-btn" disabled title="Redo — arrives with the editing core (M1)" aria-label="Redo">
+          <button className="rf-icon-btn" disabled={!p.canRedo} onClick={p.onRedo} title="Redo (⇧⌘Z)" aria-label="Redo">
             <Icon name="redo" />
           </button>
         </div>
@@ -67,7 +72,7 @@ export function TopBar(p: Props) {
   );
 }
 
-function SaveStatus({ current, offline, loading }: { current: Project | null; offline: boolean; loading: boolean }) {
+function SaveStatus({ current, offline, loading, busy }: { current: Project | null; offline: boolean; loading: boolean; busy: boolean }) {
   if (offline) {
     return (
       <span className="rf-save rf-save-offline" role="status">
@@ -76,6 +81,13 @@ function SaveStatus({ current, offline, loading }: { current: Project | null; of
     );
   }
   if (loading || !current) return <span className="rf-save" />;
+  if (busy) {
+    return (
+      <span className="rf-save" role="status">
+        <span className="rf-save-dot rf-save-dot-busy" /> Saving…
+      </span>
+    );
+  }
   return (
     <span className="rf-save" role="status" title={`Last committed ${new Date(current.updatedAt).toLocaleString()}`}>
       <span className="rf-save-dot">

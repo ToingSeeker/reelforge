@@ -3,6 +3,8 @@ export type ErrorCode =
   | "NOT_FOUND"
   | "REVISION_CONFLICT"
   | "UNAUTHORIZED"
+  /** A required local dependency (e.g. FFmpeg) is missing or failed. */
+  | "UNAVAILABLE"
   | "INTERNAL";
 
 /** Every failure that crosses a boundary (CLI, REST, MCP) is one of these. */

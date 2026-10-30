@@ -24,11 +24,36 @@ Known gaps carried forward:
 - Panels are not yet resizable or persisted (PRD §16).
 - The desktop app needs `node` on PATH; bundling the runtime is M6.
 
-## M1 — Editing Core (next)
+## M1 — Editing Core ✅ (exit criterion met)
 
-Import media (FFprobe metadata, asset references, missing-file detection + relink), tracks and clips tables,
-trim / split / move / ripple as revisioned operations, undo/redo from `edit_operations`, and timeline UI interactions.
+**Exit criterion:** editing state is stable and persists after restart. Verified:
+a timeline edited from the desktop UI and the CLI was snapshotted, the engine was stopped and restarted,
+and the timeline (tracks, clips, revision, undo history) came back byte-identical. Undo still worked after the restart.
 
-## M2–M6
+- [x] `@reelforge/media`: FFprobe metadata, rotation-aware dimensions, VFR flag, MVP extension allowlist (FR-008, FR-009)
+- [x] Import with per-file failures and actionable messages; duplicates and symlinks resolve to one asset (FR-013)
+- [x] Missing/changed source detection and relink that refuses different media (kind, streams, size, rate, duration) (FR-007)
+- [x] Thumbnails and audio waveforms generated on demand into the cache, never beside the source (FR-010, partial)
+- [x] Tracks: video, overlay, audio and caption, with mute/hide/lock (undoable)
+- [x] Clip operations: add, move (incl. across tracks), trim start/end, split, delete, ripple delete
+- [x] Invariants: no overlaps, source bounds, track compatibility, locked tracks; whole batch rejected on any failure (FR-015, FR-018)
+- [x] Linear undo/redo from stored row diffs; every step is a new revision (FR-016)
+- [x] REST + CLI for all of the above (`media`, `timeline`, `clip` commands; times in frames, seconds or timecode)
+- [x] Desktop: media grid, drag to timeline, double-click append, clip drag/trim with snapping, split/delete/ripple,
+      playhead and zoom, keyboard shortcuts, poster frame at the playhead, conflict reload
+- [x] 54 tests incl. real-FFmpeg fixtures (corrupt files, hostile file names, rotation, symlinks)
 
-Preview & Render → Media Intelligence → AI Director → MCP & Automation → Alpha Release. See the PRD.
+Known gaps carried forward:
+- Proxies and progressive cache (PRD FR-010) are M2. Thumbnails are generated per request, with a concurrency limit.
+- Transitions, gain/fades and clip transforms (PRD §8) are not built yet.
+- Not verified through UI automation: the native file dialog and Finder drag-and-drop (no screen access in CI or this environment).
+- Panels are still not resizable.
+
+## M2 — Preview & Render (next)
+
+Proxy engine, canonical render graph shared by preview and export, playback transport, FFmpeg render jobs
+(queued → rendering → muxing → completed, with cancel/retry and atomic output). Exit: a 30-second project renders to MP4 H.264/AAC.
+
+## M3–M6
+
+Media Intelligence → AI Director → MCP & Automation → Alpha Release. See the PRD.
