@@ -3,9 +3,9 @@
 // the file are approved by running it; an AI Director step still needs its
 // own explicit approval (--approve-ai), otherwise the run stops for review.
 
-import { existsSync, globSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, globSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import {
   ANALYSIS_KINDS,
@@ -31,7 +31,7 @@ import {
   type WorkflowRun,
   type WorkflowStepResult,
 } from "@reelforge/core";
-import { AnalysisRunner, createRenderJob, importMedia, RenderRunner } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, importMedia, RenderRunner, SUPPORTED_EXTENSIONS } from "@reelforge/media";
 import { ANTHROPIC_DEFAULT_MODEL, listOllamaModels, parseModelOutput, propose, providerFor } from "@reelforge/ai";
 
 const Time = z.union([z.number().int().nonnegative(), z.string().min(1)]);
@@ -127,6 +127,16 @@ export interface RunOptions {
    * the file (CLI, desktop). An AI client (MCP) that wrote the workflow must get the user's approval first.
    */
   timelineEditsApproved?: boolean;
+  /**
+   * Whether import steps may expand glob patterns. A glob reads directory listings, so an AI client (MCP)
+   * needs the user's approval first; false refuses them.
+   */
+  globsApproved?: boolean;
+  /**
+   * Create a missing export folder inside baseDir. Only for callers whose baseDir is the recipe file's own
+   * folder (CLI, desktop); an MCP client chooses its baseDir, so it never gets this.
+   */
+  createOutputDirs?: boolean;
   signal?: AbortSignal;
   /** Called with the run id as soon as the run is recorded (for callers that don't wait). */
   onStart?: (runId: string) => void;
@@ -137,14 +147,49 @@ function expandPath(p: string, baseDir: string): string {
   return isAbsolute(home) ? home : resolve(baseDir, home);
 }
 
-function expandGlobs(paths: string[], baseDir: string): string[] {
-  return paths.flatMap((p) => {
+/** Steps whose import paths contain glob patterns (they read directory listings). */
+export function globImportSteps(spec: WorkflowSpec): { index: number; patterns: string[] }[] {
+  return spec.steps.flatMap((s, index) => ("import" in s && s.import.paths.some(isGlob) ? [{ index, patterns: s.import.paths.filter(isGlob) }] : []));
+}
+
+const isGlob = (p: string) => /[*?[]/.test(p);
+
+/**
+ * Literal paths pass through (import reports their errors). A glob keeps only regular files with a
+ * supported extension, and other entries are counted, never named, so a broad pattern can't list a folder.
+ */
+function expandGlobs(paths: string[], baseDir: string, approved: boolean): { paths: string[]; skipped: number } {
+  let skipped = 0;
+  const out = paths.flatMap((p) => {
     const abs = expandPath(p, baseDir);
-    if (!/[*?[]/.test(abs)) return [abs];
-    const hits = globSync(abs).sort();
-    if (!hits.length) throw new ReelForgeError("VALIDATION_ERROR", `no files match ${p}`);
-    return hits;
+    if (!isGlob(abs)) return [abs];
+    if (!approved) throw new ReelForgeError("VALIDATION_ERROR", `the glob pattern ${p} needs the user's approval`);
+    const hits = globSync(abs).filter((h) => {
+      const media = extname(h).toLowerCase() in SUPPORTED_EXTENSIONS && isRegularFile(h);
+      if (!media) skipped++;
+      return media;
+    });
+    if (!hits.length) throw new ReelForgeError("VALIDATION_ERROR", `no media files match ${p}`);
+    return hits.sort();
   });
+  return { paths: out, skipped };
+}
+
+function isRegularFile(p: string) {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `dir` is `base` or inside it (after resolving symlinks of the existing part of `dir`). */
+function isInside(base: string, dir: string) {
+  let existing = dir;
+  while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+  const real = join(realpathSync(existing), relative(existing, dir));
+  const rel = relative(realpathSync(base), real);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 function findAsset(tl: Timeline, ref: string) {
@@ -255,9 +300,10 @@ export async function runWorkflow(db: Database, input: unknown, opts: RunOptions
       let detail = "";
       let result: Record<string, unknown> = {};
       if ("import" in step) {
-        const r = await importMedia(db, projectId, expandGlobs(step.import.paths, opts.baseDir), opts.actor);
+        const files = expandGlobs(step.import.paths, opts.baseDir, opts.globsApproved !== false);
+        const r = await importMedia(db, projectId, files.paths, opts.actor);
         if (!r.imported.length && !r.existing.length) throw new ReelForgeError("VALIDATION_ERROR", `nothing imported: ${r.failed.map((f) => `${f.path}: ${f.error.message}`).join("; ")}`);
-        detail = `${r.imported.length} imported${r.existing.length ? `, ${r.existing.length} already there` : ""}${r.failed.length ? `, ${r.failed.length} failed` : ""}`;
+        detail = `${r.imported.length} imported${r.existing.length ? `, ${r.existing.length} already there` : ""}${r.failed.length ? `, ${r.failed.length} failed` : ""}${files.skipped ? `, ${files.skipped} non-media entries skipped` : ""}`;
         result = { assetIds: [...r.imported, ...r.existing].map((a) => a.id), failed: r.failed };
       } else if ("analyze" in step) {
         const tl = timeline.get(projectId);
@@ -335,10 +381,10 @@ export async function runWorkflow(db: Database, input: unknown, opts: RunOptions
         result = { jobId: job.id, path: job.outputPath };
       } else if ("render" in step) {
         const out = expandPath(step.render.out, opts.baseDir);
-        // A recipe's own output folder (e.g. "out/") is created; folders outside the recipe's are not.
-        const rel = relative(resolve(opts.baseDir), dirname(out));
-        if (rel && !rel.startsWith("..") && !isAbsolute(rel)) mkdirSync(dirname(out), { recursive: true });
+        if (extname(out).toLowerCase() !== ".mp4") throw new ReelForgeError("VALIDATION_ERROR", "export path must end in .mp4");
         if (existsSync(out)) throw new ReelForgeError("VALIDATION_ERROR", `${out} already exists; exports never overwrite`);
+        // A recipe's own output folder (e.g. "out/") is created; folders outside the recipe's are not.
+        if (opts.createOutputDirs && !existsSync(dirname(out)) && isInside(opts.baseDir, dirname(out))) mkdirSync(dirname(out), { recursive: true });
         const job = await runRender(db, opts.cacheDir, projectId, "export", out);
         detail = `rendered ${job.outputPath}`;
         result = { jobId: job.id, path: job.outputPath };

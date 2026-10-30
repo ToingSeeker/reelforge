@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Security fixes from the first full audit (MCP clients are treated as possibly prompt-injected):
+
+- MCP `timeline_undo` now asks the user (elicitation) instead of undoing silently; applying a proposal warns when it
+  would make undone edits impossible to redo
+- MCP `workflows_run` asks before import steps with glob patterns; globs import only media files and never name the
+  other entries they saw
+- Workflow render steps create a missing output folder only for recipe files run by a person (CLI, desktop), never
+  for a folder an MCP client chose; the export path is checked first
+- AI Director shows proposals written by an MCP client as theirs (not as your message), opens the change list, and
+  hides Regenerate for them
+- The release app runs only its bundled engine: `REELFORGE_NODE`/`REELFORGE_CLI` work in development builds only,
+  and `NODE_*` variables (e.g. `NODE_OPTIONS`) are removed before the engine, which receives the API key, starts
+
 ## 0.1.0-alpha.1 — 2026-10-30
 
 First alpha. macOS on Apple Silicon, **not signed or notarized** (see README → Install).

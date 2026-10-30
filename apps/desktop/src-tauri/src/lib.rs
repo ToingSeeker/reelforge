@@ -118,17 +118,37 @@ fn bundled_engine_dir() -> Option<PathBuf> {
     dir.join("reelforge.mjs").is_file().then_some(dir)
 }
 
-fn engine_command() -> EngineCommand {
-    let bundled = if cfg!(debug_assertions) { None } else { bundled_engine_dir() };
-    let (node, cli, fonts) = match bundled {
-        Some(dir) => (dir.join("node").to_string_lossy().into_owned(), dir.join("reelforge.mjs"), Some(dir.join("fonts"))),
-        None => ("node".into(), PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/bin/reelforge.js"), None),
-    };
-    EngineCommand {
-        node: std::env::var("REELFORGE_NODE").unwrap_or(node),
-        cli: std::env::var("REELFORGE_CLI").map(PathBuf::from).unwrap_or(cli),
-        fonts,
+fn engine_command() -> Result<EngineCommand, String> {
+    let release = !cfg!(debug_assertions);
+    resolve_engine(
+        release,
+        if release { bundled_engine_dir() } else { None },
+        std::env::var("REELFORGE_NODE").ok(),
+        std::env::var("REELFORGE_CLI").ok(),
+    )
+}
+
+/// The engine receives the API key, so a release build runs only its own bundled engine: the
+/// REELFORGE_NODE / REELFORGE_CLI overrides (and `node` from PATH) are for development builds.
+fn resolve_engine(release: bool, bundled: Option<PathBuf>, node_override: Option<String>, cli_override: Option<String>) -> Result<EngineCommand, String> {
+    if release {
+        let dir = bundled.ok_or("the bundled ReelForge engine is missing from the app (Contents/Resources/engine); reinstall ReelForge")?;
+        return Ok(EngineCommand { node: dir.join("node").to_string_lossy().into_owned(), cli: dir.join("reelforge.mjs"), fonts: Some(dir.join("fonts")) });
     }
+    Ok(EngineCommand {
+        node: node_override.unwrap_or_else(|| "node".into()),
+        cli: cli_override.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/bin/reelforge.js")),
+        fonts: None,
+    })
+}
+
+/// Environment variables that make Node load other code (NODE_OPTIONS=--require …, NODE_PATH, …).
+/// A release build removes them before starting the engine; development builds keep them for debugging.
+fn node_vars_to_remove(release: bool, names: impl Iterator<Item = String>) -> Vec<String> {
+    if !release {
+        return Vec::new();
+    }
+    names.filter(|n| n.starts_with("NODE_")).collect()
 }
 
 /// Apps opened from Finder get launchd's PATH (/usr/bin:/bin:…), not the shell's, so FFmpeg and
@@ -145,9 +165,12 @@ fn engine_path() -> String {
 
 fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Option<ChildStdin>), String> {
     let token = random_token()?;
-    let EngineCommand { node, cli, fonts } = engine_command();
+    let EngineCommand { node, cli, fonts } = engine_command()?;
     let mut cmd = Command::new(&node);
     cmd.arg(&cli).arg("serve").env("PATH", engine_path());
+    for name in node_vars_to_remove(!cfg!(debug_assertions), std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
+        cmd.env_remove(name);
+    }
     if let Some(fonts) = fonts {
         // The bundle can't find assets relative to its own source tree.
         cmd.env("REELFORGE_FONTS", format!("{}/", fonts.display()));
@@ -224,4 +247,43 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle() -> Option<PathBuf> {
+        Some(PathBuf::from("/Applications/ReelForge.app/Contents/Resources/engine"))
+    }
+
+    #[test]
+    fn release_ignores_engine_overrides() {
+        let e = resolve_engine(true, bundle(), Some("/tmp/evil-node".into()), Some("/tmp/evil.mjs".into())).unwrap();
+        assert_eq!(e.node, "/Applications/ReelForge.app/Contents/Resources/engine/node");
+        assert_eq!(e.cli, PathBuf::from("/Applications/ReelForge.app/Contents/Resources/engine/reelforge.mjs"));
+    }
+
+    #[test]
+    fn release_without_bundle_refuses_instead_of_using_path_node() {
+        assert!(resolve_engine(true, None, None, None).is_err());
+        assert!(resolve_engine(true, None, Some("/tmp/evil-node".into()), None).is_err());
+    }
+
+    #[test]
+    fn debug_honours_overrides() {
+        let e = resolve_engine(false, None, Some("/opt/node".into()), Some("/src/cli.js".into())).unwrap();
+        assert_eq!(e.node, "/opt/node");
+        assert_eq!(e.cli, PathBuf::from("/src/cli.js"));
+        assert_eq!(resolve_engine(false, None, None, None).unwrap().node, "node");
+    }
+
+    #[test]
+    fn release_strips_node_environment() {
+        let names = ["NODE_OPTIONS", "NODE_PATH", "PATH", "HOME", "NODE_EXTRA_CA_CERTS"].map(String::from);
+        let mut removed = node_vars_to_remove(true, names.clone().into_iter());
+        removed.sort();
+        assert_eq!(removed, ["NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "NODE_PATH"]);
+        assert!(node_vars_to_remove(false, names.into_iter()).is_empty());
+    }
 }

@@ -393,7 +393,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         if (typeof b.path !== "string" || !b.path.startsWith("/")) throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"path": "/absolute/workflow.json"}');
         const { spec, baseDir } = readWorkflowFile(b.path);
         const runId = await new Promise<string>((resolve, reject) => {
-          runWorkflow(opts.db, spec, { cacheDir: opts.cacheDir, actor, baseDir, source: b.path as string, approveAi: b.approveAi === true, onStart: resolve }).catch(reject);
+          runWorkflow(opts.db, spec, { cacheDir: opts.cacheDir, actor, baseDir, source: b.path as string, approveAi: b.approveAi === true, createOutputDirs: true, onStart: resolve }).catch(reject);
         });
         return send(res, 202, { run: new WorkflowRunStore(opts.db).get(runId) });
       },

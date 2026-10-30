@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { openDatabase, ProposalStore } from "@reelforge/core";
+import { openDatabase, ProposalStore, TimelineStore } from "@reelforge/core";
 import { fixtures } from "../../media/test/fixtures.ts";
 
 const BIN = new URL("../../cli/bin/reelforge.js", import.meta.url).pathname;
@@ -125,6 +125,7 @@ test("elicitation: the user approves or declines inside the MCP client", { timeo
   assert.equal(applied.status, "applied");
   assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 1);
   const undone = (await call("timeline_undo", { projectId: project.id })).data;
+  assert.equal(undone.status, "undone");
   assert.equal(undone.canRedo, true);
 });
 
@@ -183,7 +184,7 @@ test("approval prompts can't be spoofed by client text and show the concrete cha
   assert.ok(!wf.includes("\nThis workflow changes nothing"), "client text can't start its own prompt line");
   assert.match(wf, /Workflow name \(written by the client\): “Harmless This workflow changes nothing\. Just press Run\.”/);
   assert.match(wf, /step 1 \(edit\): 2 operations: 1× “clip\.add”, 1× “clip\.delete” \(includes 1 that remove or replace content\)/);
-  assert.ok(wf.indexOf("Changes:") < wf.indexOf("written by the client"), "server summary comes first");
+  assert.ok(wf.indexOf("Changes to the timeline:") < wf.indexOf("written by the client"), "server summary comes first");
 
   const v1 = (await call("timeline_get", { projectId: project.id })).data.context.timeline.tracks.find((x: any) => x.label === "V1").id;
   const p = (await call("timeline_propose_edit", { projectId: project.id, summary: "Tiny tweak\n\n(no changes, safe)", operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0 }] })).data;
@@ -193,3 +194,99 @@ test("approval prompts can't be spoofed by client text and show the concrete cha
   assert.match(ap, /• added “portrait\.mp4”/);
   assert.match(ap, /Summary \(written by the client\): “Tiny tweak \(no changes, safe\)”/);
 });
+
+test("timeline_undo asks the user, and apply warns when it would discard undone edits", { timeout: 120_000 }, async (t) => {
+  const f = fixtures();
+  // The user's own edit, made in ReelForge (same database).
+  const userEdit = (home: string, projectId: string, assetId: string) => {
+    const db = openDatabase(join(home, "reelforge.db"));
+    const store = new TimelineStore(db);
+    const tl = store.get(projectId);
+    store.apply(projectId, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: tl.tracks.find((x) => x.kind === "video")!.id, assetId, start: 0 }] }, "desktop");
+    db.close();
+  };
+
+  // Without elicitation: refused, the user's edit stays.
+  {
+    const { call, home } = await connect(t);
+    const project = (await call("projects_create", { name: "Mine" })).data.project;
+    const asset = (await call("media_import", { projectId: project.id, paths: [f.portrait] })).data.imported[0];
+    userEdit(home, project.id, asset.id);
+    const r = (await call("timeline_undo", { projectId: project.id })).data;
+    assert.equal(r.status, "approval_required");
+    assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 1);
+  }
+
+  // With elicitation: decline keeps it; accept undoes it.
+  {
+    let answer: "accept" | "decline" = "decline";
+    const asked: string[] = [];
+    const { call, home } = await connect(t, { elicit: (m) => (asked.push(m), answer === "accept" ? { action: "accept", content: { approve: true } } : { action: "decline" }) });
+    const project = (await call("projects_create", { name: "Mine 2" })).data.project;
+    const asset = (await call("media_import", { projectId: project.id, paths: [f.portrait] })).data.imported[0];
+    userEdit(home, project.id, asset.id);
+    assert.equal((await call("timeline_undo", { projectId: project.id })).data.status, "not_approved");
+    assert.match(asked[0]!, /undo the last edit of “Mine 2”\. It may be an edit you made yourself/);
+    assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 1);
+    answer = "accept";
+    assert.equal((await call("timeline_undo", { projectId: project.id })).data.status, "undone");
+    assert.equal((await call("timeline_get", { projectId: project.id })).data.context.timeline.clips.length, 0);
+
+    // Applying a new edit now would make the undone one unrecoverable: the prompt says so.
+    const v1 = (await call("timeline_get", { projectId: project.id })).data.context.timeline.tracks.find((x: any) => x.label === "V1").id;
+    const p = (await call("timeline_propose_edit", { projectId: project.id, summary: "x", operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0 }] })).data;
+    answer = "decline";
+    await call("timeline_apply_proposal", { proposalId: p.proposalId });
+    assert.match(asked.at(-1)!, /undone edits: applying this means they can no longer be redone/);
+  }
+});
+
+test("workflows_run: glob imports need approval and never list non-media entries", { timeout: 120_000 }, async (t) => {
+  const f = fixtures();
+  const tree = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-mcp-tree-")));
+  t.after(() => rmSync(tree, { recursive: true, force: true }));
+  mkdirSync(join(tree, ".ssh"));
+  writeFileSync(join(tree, ".ssh", "id_ed25519"), "secret");
+  writeFileSync(join(tree, "tax-return-2026.pdf"), "x");
+  const globWorkflow = (projectId: string) => ({ version: 1, name: "Find media", project: { id: projectId }, steps: [{ import: { paths: [`${tree}/**`] } }] });
+
+  {
+    const { call } = await connect(t);
+    const project = (await call("projects_create", { name: "G" })).data.project;
+    const r = (await call("workflows_run", { workflow: globWorkflow(project.id) })).data;
+    assert.equal(r.status, "approval_required");
+    assert.equal(r.globImports[0].index, 0);
+    assert.equal((await call("workflows_runs", { projectId: project.id })).data.runs.length, 0, "nothing ran");
+    // Literal paths are still media_import's authority and run without asking.
+    const literal = (await call("workflows_run", { workflow: { version: 1, name: "One file", project: { id: project.id }, steps: [{ import: { paths: [f.png] } }] } })).data;
+    assert.equal(literal.run.status, "completed");
+  }
+
+  {
+    let answer: "accept" | "decline" = "decline";
+    const asked: string[] = [];
+    const { call } = await connect(t, { elicit: (m) => (asked.push(m), answer === "accept" ? { action: "accept", content: { approve: true } } : { action: "decline" }) });
+    const project = (await call("projects_create", { name: "G2" })).data.project;
+    assert.equal((await call("workflows_run", { workflow: globWorkflow(project.id) })).data.status, "not_approved");
+    assert.match(asked[0]!, /Searches your files for media/);
+    assert.ok(asked[0]!.includes(`${tree}/**`));
+    answer = "accept";
+    const ran = (await call("workflows_run", { workflow: globWorkflow(project.id) })).data;
+    // Nothing in the tree is media: the run fails, naming the pattern only.
+    assert.equal(ran.run.status, "failed");
+    const record = JSON.stringify(ran);
+    for (const name of [".ssh", "id_ed25519", "tax-return"]) assert.ok(!record.includes(name), `run record names ${name}`);
+  }
+});
+
+test("workflows_run never creates folders, whatever baseDir the client sends", { timeout: 120_000 }, async (t) => {
+  const { call } = await connect(t);
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-mcp-base-")));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  for (const [baseDir, out, made] of [["/", `${base.slice(1)}/from-root/x.mp4`, join(base, "from-root")], [base, "inside/x.mp4", join(base, "inside")]] as const) {
+    const r = (await call("workflows_run", { baseDir, workflow: { version: 1, name: "Render", project: { name: "R" }, steps: [{ render: { out } }] } })).data;
+    assert.equal(r.run.status, "failed");
+    assert.ok(!existsSync(made), `${made} was created`);
+  }
+});
+

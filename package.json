@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "pnpm -r --parallel typecheck",
-    "test": "node --test --test-reporter=spec \"packages/*/test/**/*.test.ts\"",
+    "test": "node --test --test-reporter=spec \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\"",
     "check": "pnpm typecheck && pnpm test",
     "cli": "node packages/cli/bin/reelforge.js",
     "desktop": "pnpm --filter @reelforge/desktop tauri dev",

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, ProposalStore, TimelineStore, WorkflowRunStore } from "@reelforge/core";
@@ -44,7 +44,7 @@ test("a recipe from folder to MP4: import (glob), beats, append, templated edit,
         { render: { out: `${outDir}/reel.mp4` } },
       ],
     },
-    { cacheDir: s.cacheDir, actor: "cli", baseDir: dir, source: "test.json" },
+    { cacheDir: s.cacheDir, actor: "cli", baseDir: dir, source: "test.json", createOutputDirs: true },
   );
   assert.equal(run.status, "completed", JSON.stringify(run.steps));
   assert.deepEqual(run.steps.map((x) => x.status), Array(7).fill("completed"));
@@ -130,3 +130,49 @@ test("timelineEditsApproved: false blocks every timeline-changing step in the ru
   assert.match(run.error!, /needs the user's approval/);
   assert.equal(new TimelineStore(s.db).get(run.projectId!).clips.length, 0);
 });
+
+test("a glob imports only media files and never names the other entries it saw", async (t) => {
+  const s = db(t);
+  const mixed = join(dir, "mixed");
+  mkdirSync(join(mixed, "private-folder"), { recursive: true });
+  execFileSync("cp", [join(dir, "footage", "a_red.mp4"), join(mixed, "clip.mp4")]);
+  writeFileSync(join(mixed, "id_rsa_secret.txt"), "not media");
+  mkdirSync(join(mixed, "folder.mp4")); // a directory with a media extension is still not a file
+  const spec = { version: 1, name: "Glob", project: { name: "G" }, steps: [{ import: { paths: ["mixed/*"] } }] };
+
+  const run = await runWorkflow(s.db, spec, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  assert.equal(run.status, "completed", JSON.stringify(run.steps));
+  assert.match(run.steps[0]!.detail!, /^1 imported, 3 non-media entries skipped$/);
+  const record = JSON.stringify(new WorkflowRunStore(s.db).get(run.id));
+  for (const name of ["id_rsa_secret", "private-folder", "folder.mp4"]) assert.ok(!record.includes(name), `run record names ${name}`);
+
+  // Unapproved (an MCP client without the user's yes): the glob is refused before anything is listed.
+  const refused = await runWorkflow(s.db, spec, { cacheDir: s.cacheDir, actor: "mcp", baseDir: dir, globsApproved: false });
+  assert.equal(refused.status, "failed");
+  assert.match(refused.error!, /glob pattern mixed\/\* needs the user's approval/);
+});
+
+test("a render step creates a missing folder only when asked, and only inside baseDir", async (t) => {
+  const s = db(t);
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-wf-base-")));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-wf-outside-")));
+  t.after(() => [base, outside].forEach((d) => rmSync(d, { recursive: true, force: true })));
+  symlinkSync(outside, join(base, "link"));
+  const render = (out: string, createOutputDirs?: boolean) =>
+    runWorkflow(s.db, { version: 1, name: "R", project: { name: "R" }, steps: [{ render: { out } }] }, { cacheDir: s.cacheDir, actor: "mcp", baseDir: base, ...(createOutputDirs ? { createOutputDirs } : {}) });
+
+  // MCP leaves createOutputDirs off: even a folder inside baseDir is not created.
+  await render("made-by-client/x.mp4");
+  assert.ok(!existsSync(join(base, "made-by-client")));
+  // With it on, nothing outside baseDir: not via ".." or through a symlink that points out.
+  await render("../escaped/x.mp4", true);
+  assert.ok(!existsSync(join(base, "..", "escaped")));
+  await render("link/through-symlink/x.mp4", true);
+  assert.ok(!existsSync(join(outside, "through-symlink")));
+  // The export path is checked before any folder is made.
+  await render("not-a-video/x.txt", true);
+  assert.ok(!existsSync(join(base, "not-a-video")));
+  await render("inside/x.mp4", true);
+  assert.ok(existsSync(join(base, "inside")));
+});
+

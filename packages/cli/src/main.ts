@@ -231,7 +231,7 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
       const db = openDatabase(resolveDbPath(env));
       try {
         const { spec, baseDir } = readWorkflowFile(resolve(io.cwd ?? process.cwd(), need(rest[0], "<file.json>")));
-        const run = await runWorkflow(db, spec, { cacheDir: resolveCacheDir(env), actor: "cli", baseDir, source: rest[0]!, approveAi: !!values["approve-ai"] });
+        const run = await runWorkflow(db, spec, { cacheDir: resolveCacheDir(env), actor: "cli", baseDir, source: rest[0]!, approveAi: !!values["approve-ai"], createOutputDirs: true });
         print({ run });
         return run.status === "completed" ? 0 : run.status === "waiting_approval" ? 0 : EXIT.INTERNAL;
       } finally {
