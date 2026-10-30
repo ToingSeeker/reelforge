@@ -1,6 +1,6 @@
 [package]
 name = "reelforge-desktop"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 description = "ReelForge desktop studio"
 license = "Apache-2.0"
 edition = "2021"

@@ -5,10 +5,10 @@
 
 ---
 
-> **Status: pre-alpha, milestone M5.** Multi-track editing with undo/redo, a
+> **Status: 0.1.0-alpha.1.** Multi-track editing with undo/redo, a
 > live preview, frame-exact MP4 export, local scene/beat/speech analysis,
 > animated captions, an **AI Director** (Claude or local Ollama), a local **MCP
-> server** for external AI clients, and **workflow recipes**. Alpha hardening (M6) is next. Transcription/captions
+> server** for external AI clients, and **workflow recipes**. See [CHANGELOG](CHANGELOG.md). Transcription/captions
 > (M3) and the AI Director (M4) are not built yet. See [docs/milestones.md](docs/milestones.md).
 
 ReelForge turns raw footage into editable, reviewable vertical video. You can drive it
@@ -73,6 +73,17 @@ Rename a project from the CLI while the desktop app is open and the window updat
 
 Data lives in `~/Library/Application Support/ReelForge/reelforge.db`. Set `REELFORGE_HOME` (or pass `--home`) to use another workspace.
 
+## Install (alpha, macOS Apple Silicon)
+
+1. Install the media tools: `brew install ffmpeg whisper-cpp`
+2. Open `ReelForge_0.1.0-alpha.1_aarch64.dmg` and drag ReelForge to Applications.
+3. Alpha builds are **not signed by Apple**, so macOS blocks the first open. Open it once, then go to
+   **System Settings → Privacy & Security** and press **Open Anyway** (or run
+   `xattr -dr com.apple.quarantine /Applications/ReelForge.app`). Only do this for a DMG you got from this project.
+4. For captions/transcripts, download the speech models once: `scripts/download-models.sh` (from this repository).
+
+Building it yourself: see [docs/releasing.md](docs/releasing.md).
+
 ## Use it from Claude, ChatGPT or Gemini CLI (MCP)
 
 ReelForge ships a local MCP server over stdio. External AI clients can create projects, import and analyse media,
@@ -80,8 +91,11 @@ read the timeline, propose edits and render. **Every timeline change is a propos
 (MCP elicitation), or you press Apply in ReelForge, or run `reelforge ai apply <id> --yes`.
 
 ```sh
-# Claude Code
+# Claude Code, from a source checkout
 claude mcp add reelforge -- node /path/to/reelforge/packages/cli/bin/reelforge.js mcp
+
+# Claude Code, using the installed app's own engine (no repository needed)
+claude mcp add reelforge -- /Applications/ReelForge.app/Contents/Resources/engine/node /Applications/ReelForge.app/Contents/Resources/engine/reelforge.mjs mcp
 ```
 
 Claude Desktop and other clients (`mcpServers` config):

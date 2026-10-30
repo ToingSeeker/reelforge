@@ -5,10 +5,17 @@
 # the webview, fills the native NSSavePanel, presses Save, then verifies the
 # rendered MP4. macOS only; the terminal needs Accessibility permission
 # (System Settings → Privacy & Security → Accessibility). Not run in CI.
+#
+# REELFORGE_APP=/path/ReelForge.app tests a release build instead: its bundled
+# engine, embedded UI, and launchd's minimal PATH (as when opened from Finder).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-APP="$ROOT/apps/desktop/src-tauri/target/debug/reelforge-desktop"
+if [ -n "${REELFORGE_APP:-}" ]; then
+  APP="$REELFORGE_APP/Contents/MacOS/reelforge-desktop"
+else
+  APP="$ROOT/apps/desktop/src-tauri/target/debug/reelforge-desktop"
+fi
 [ -x "$APP" ] || { echo "build the desktop app first: (cd apps/desktop/src-tauri && cargo build)"; exit 1; }
 
 WORK="$(mktemp -d)"
@@ -33,14 +40,18 @@ ASSET=$(rf media import "$PROJECT" "$WORK/red.mp4" | json 'v.imported[0].id')
 rf clip add "$PROJECT" --track V1 --asset "$ASSET" --start 0 --duration 1s >/dev/null
 
 # The debug build loads the UI from the Vite dev server.
-if ! curl -sf -o /dev/null http://localhost:5173; then
+if [ -z "${REELFORGE_APP:-}" ] && ! curl -sf -o /dev/null http://localhost:5173; then
   (cd "$ROOT/apps/desktop" && npx vite >/dev/null 2>&1) &
   disown $!
   VITE_STARTED=1
   for _ in $(seq 1 50); do curl -sf -o /dev/null http://localhost:5173 && break; sleep 0.2; done
 fi
 
-"$APP" >/dev/null 2>&1 &
+if [ -n "${REELFORGE_APP:-}" ]; then
+  env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin REELFORGE_HOME="$REELFORGE_HOME" "$APP" >/dev/null 2>&1 &
+else
+  "$APP" >/dev/null 2>&1 &
+fi
 APP_PID=$!
 disown "$APP_PID"
 sleep 6

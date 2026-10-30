@@ -11,3 +11,15 @@ dist/
 # Tauri / Rust
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
+
+# bundled engine (scripts/release/build-engine.mjs)
+apps/desktop/src-tauri/engine/
+
+# signing & notarization secrets: never commit (see docs/releasing.md)
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+AuthKey_*.p8

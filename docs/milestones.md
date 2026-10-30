@@ -189,6 +189,17 @@ Known gaps carried forward:
 - Remote MCP (HTTPS + OAuth) is P1.
 - Analysis jobs can't be cancelled yet (renders can).
 
-## M6
+## M6 — Alpha release (0.1.0-alpha.1, unsigned) 🚧
 
-Alpha release: security hardening, end-to-end testing, signing, packaging (bundled Node/engine), docs, license audit.
+- [x] Self-contained `.app`/`.dmg` (Apple Silicon, macOS 13+): esbuild one-file engine + official Node 24 runtime
+      (pinned, SHA-256 verified) + fonts in `Contents/Resources/engine`; release shell runs it, debug runs the monorepo
+- [x] Finder launches: shell appends Homebrew paths to the engine's PATH (verified with launchd's minimal PATH)
+- [x] Verified on the built DMG: signature valid (ad-hoc; Node keeps its own signature), UI loads, export through
+      the native save panel (`REELFORGE_APP=… scripts/e2e/native-export.sh`), MCP over the bundled engine
+- [x] Licence audit: `THIRD_PARTY_NOTICES.txt` (341 components) shipped in the app; build fails on a licence outside
+      the allowlist (5 MPL-2.0 crates from Tauri, file-level copyleft, source linked)
+- [x] Signing/notarization wired through environment variables only (docs/releasing.md); secret file patterns ignored
+- [x] Workflow `render` creates the recipe's own output folder
+- [ ] Developer ID signing + notarization (needs a Developer ID Application certificate; only Apple Development is
+      installed)
+- [ ] Security hardening pass, MCP compatibility matrix with real clients, Intel build, in-app model download

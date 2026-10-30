@@ -28,7 +28,7 @@ import { AnalysisRunner, createRenderJob, importMedia, RenderRunner } from "@ree
 import { ANTHROPIC_DEFAULT_MODEL, listOllamaModels, OPERATIONS_GUIDE, parseModelOutput, propose, providerFor } from "@reelforge/ai";
 import { parseWorkflow, quoteUntrusted, runWorkflow, timelineSteps } from "@reelforge/automation";
 
-export const SERVER_INFO = { name: "reelforge", version: "0.0.0" };
+export const SERVER_INFO = { name: "reelforge", version: "0.1.0-alpha.1" };
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 

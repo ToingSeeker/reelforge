@@ -39,7 +39,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 // Every command prints exactly one JSON document to stdout (errors go to
 // stderr as {"error": …}) so agents and scripts can parse the result.
 
-const VERSION = "0.0.0";
+const VERSION = "0.1.0-alpha.1";
 
 const EXIT: Record<ErrorCode, number> = {
   INTERNAL: 1,

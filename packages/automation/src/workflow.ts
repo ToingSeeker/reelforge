@@ -3,9 +3,9 @@
 // the file are approved by running it; an AI Director step still needs its
 // own explicit approval (--approve-ai), otherwise the run stops for review.
 
-import { existsSync, globSync, readFileSync, statSync } from "node:fs";
+import { existsSync, globSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import {
   ANALYSIS_KINDS,
@@ -335,6 +335,9 @@ export async function runWorkflow(db: Database, input: unknown, opts: RunOptions
         result = { jobId: job.id, path: job.outputPath };
       } else if ("render" in step) {
         const out = expandPath(step.render.out, opts.baseDir);
+        // A recipe's own output folder (e.g. "out/") is created; folders outside the recipe's are not.
+        const rel = relative(resolve(opts.baseDir), dirname(out));
+        if (rel && !rel.startsWith("..") && !isAbsolute(rel)) mkdirSync(dirname(out), { recursive: true });
         if (existsSync(out)) throw new ReelForgeError("VALIDATION_ERROR", `${out} already exists; exports never overwrite`);
         const job = await runRender(db, opts.cacheDir, projectId, "export", out);
         detail = `rendered ${job.outputPath}`;

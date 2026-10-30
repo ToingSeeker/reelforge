@@ -102,21 +102,56 @@ fn random_token() -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Dev layout: the CLI lives in the monorepo. Packaging a bundled Node runtime
-/// and engine is milestone M6; until then both can be overridden by env.
-fn engine_command() -> (String, PathBuf) {
-    let node = std::env::var("REELFORGE_NODE").unwrap_or_else(|_| "node".into());
-    let cli = std::env::var("REELFORGE_CLI").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/bin/reelforge.js")
-    });
-    (node, cli)
+/// Where the engine comes from. A release build runs the bundled one in
+/// ReelForge.app/Contents/Resources/engine (official Node runtime + one-file bundle, built by
+/// scripts/release/build-engine.mjs). A debug build runs the monorepo CLI on the developer's Node.
+/// REELFORGE_NODE / REELFORGE_CLI override either.
+struct EngineCommand {
+    node: String,
+    cli: PathBuf,
+    fonts: Option<PathBuf>,
+}
+
+fn bundled_engine_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.parent()?.join("Resources/engine");
+    dir.join("reelforge.mjs").is_file().then_some(dir)
+}
+
+fn engine_command() -> EngineCommand {
+    let bundled = if cfg!(debug_assertions) { None } else { bundled_engine_dir() };
+    let (node, cli, fonts) = match bundled {
+        Some(dir) => (dir.join("node").to_string_lossy().into_owned(), dir.join("reelforge.mjs"), Some(dir.join("fonts"))),
+        None => ("node".into(), PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/bin/reelforge.js"), None),
+    };
+    EngineCommand {
+        node: std::env::var("REELFORGE_NODE").unwrap_or(node),
+        cli: std::env::var("REELFORGE_CLI").map(PathBuf::from).unwrap_or(cli),
+        fonts,
+    }
+}
+
+/// Apps opened from Finder get launchd's PATH (/usr/bin:/bin:…), not the shell's, so FFmpeg and
+/// whisper.cpp from Homebrew wouldn't be found. Add the usual Homebrew locations after what we have.
+fn engine_path() -> String {
+    let mut parts: Vec<String> = std::env::var("PATH").unwrap_or_default().split(':').filter(|p| !p.is_empty()).map(String::from).collect();
+    for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        if !parts.iter().any(|p| p == extra) {
+            parts.push(extra.into());
+        }
+    }
+    parts.join(":")
 }
 
 fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Option<ChildStdin>), String> {
     let token = random_token()?;
-    let (node, cli) = engine_command();
+    let EngineCommand { node, cli, fonts } = engine_command();
     let mut cmd = Command::new(&node);
-    cmd.arg(&cli).arg("serve");
+    cmd.arg(&cli).arg("serve").env("PATH", engine_path());
+    if let Some(fonts) = fonts {
+        // The bundle can't find assets relative to its own source tree.
+        cmd.env("REELFORGE_FONTS", format!("{}/", fonts.display()));
+    }
     for origin in ALLOWED_ORIGINS {
         cmd.arg("--allow-origin").arg(origin);
     }

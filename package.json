@@ -1,7 +1,7 @@
 {
   "name": "reelforge",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0-alpha.1",
   "license": "Apache-2.0",
   "type": "module",
   "packageManager": "pnpm@10.33.2",
@@ -13,10 +13,12 @@
     "test": "node --test --test-reporter=spec \"packages/*/test/**/*.test.ts\"",
     "check": "pnpm typecheck && pnpm test",
     "cli": "node packages/cli/bin/reelforge.js",
-    "desktop": "pnpm --filter @reelforge/desktop tauri dev"
+    "desktop": "pnpm --filter @reelforge/desktop tauri dev",
+    "release:mac": "CI=true pnpm --filter @reelforge/desktop tauri build"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
+    "esbuild": "0.28.2",
     "typescript": "7.0.2"
   }
 }

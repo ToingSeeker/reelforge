@@ -24,8 +24,10 @@ function db(t: { after: (fn: () => void) => void }) {
 
 test("a recipe from folder to MP4: import (glob), beats, append, templated edit, render", async (t) => {
   const s = db(t);
-  const out = join(s.home, "out", "reel.mp4");
-  mkdirSync(join(s.home, "out"));
+  // The recipe's own output folder doesn't exist yet: the render step creates it.
+  const outDir = `renders-${process.pid}-${Date.now()}`;
+  const out = join(dir, outDir, "reel.mp4");
+  t.after(() => rmSync(join(dir, outDir), { recursive: true, force: true }));
   const run = await runWorkflow(
     s.db,
     {
@@ -39,7 +41,7 @@ test("a recipe from folder to MP4: import (glob), beats, append, templated edit,
         { append: { asset: "b_blue.mp4", track: "V1", duration: "1.5s", sourceIn: 15, props: { transitionIn: 10 } } },
         { append: { asset: "music.wav", track: "A1", duration: "2.5s" } },
         { edit: { operations: [{ type: "clip.update", clipId: "${clip:a_red.mp4}", props: { fadeIn: 10 } }, { type: "caption.add", trackId: "${track:C1}", start: "0.5s", duration: 30, text: "Hello" }] } },
-        { render: { out } },
+        { render: { out: `${outDir}/reel.mp4` } },
       ],
     },
     { cacheDir: s.cacheDir, actor: "cli", baseDir: dir, source: "test.json" },
