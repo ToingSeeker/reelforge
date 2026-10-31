@@ -6,6 +6,7 @@
 import { ReelForgeError } from "./errors.ts";
 import { resolveCaptionStyle, resolveClipProps, type Caption, type CaptionStyle, type ClipProps, type Timeline } from "./schema.ts";
 import type { Rational } from "./timebase.ts";
+import { planClipFx, type FxBakeSpec, type FxPiece } from "./fx-bake.ts";
 
 export interface PlanSource {
   assetId: string;
@@ -32,6 +33,8 @@ export interface PlanSegment {
   inH: number;
   /** Half-width of the dissolve out of this clip into the next one; 0 = cut. */
   outH: number;
+  /** Stretches where a baked AI-effects video (plan.fxBakes) replaces the source picture. */
+  fx?: FxPiece[];
 }
 
 /** Back-compat names used by the compiler and tests. */
@@ -51,6 +54,8 @@ export interface RenderPlan {
   /** Visible caption tracks, bottom first; drawn over all picture layers. */
   captions: { trackId: string; style: CaptionStyle; captions: Caption[] }[];
   sources: Record<string, PlanSource>;
+  /** AI-effect bakes the picture needs (fx-bake.ts); compile and preview look them up by key. */
+  fxBakes: FxBakeSpec[];
 }
 
 const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
@@ -223,6 +228,21 @@ export function buildRenderPlan(t: Timeline): RenderPlan {
     });
   }
 
+  // AI effects on video clips become bakes; the short side matches the frame's so they stay sharp.
+  const fxBakes = new Map<string, FxBakeSpec>();
+  const shortSide = Math.min(t.project.settings.width, t.project.settings.height);
+  for (const seg of layers.flat()) {
+    const asset = assets.get(seg.assetId)!;
+    if (asset.kind !== "video" || seg.props.aiEffects.length === 0) continue;
+    const mediaPath = (id: string) => {
+      const a = assets.get(id);
+      return a && a.status !== "missing" && (a.kind === "image" || a.kind === "video") ? a.sourcePath : undefined;
+    };
+    const { specs, pieces } = planClipFx({ ...seg, effects: seg.props.aiEffects }, asset, t.project.settings.fps, shortSide, mediaPath);
+    if (pieces.length) seg.fx = pieces;
+    for (const spec of specs) fxBakes.set(spec.key, spec);
+  }
+
   const sources: Record<string, PlanSource> = {};
   for (const id of used) {
     const a = assets.get(id)!;
@@ -247,5 +267,6 @@ export function buildRenderPlan(t: Timeline): RenderPlan {
       }))
       .filter((c) => c.captions.length > 0),
     sources,
+    fxBakes: [...fxBakes.values()],
   };
 }

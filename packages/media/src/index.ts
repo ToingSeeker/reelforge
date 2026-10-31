@@ -9,3 +9,4 @@ export { detectScenes } from "./analysis/scenes.ts";
 export { detectBeats, beatsFromSamples, onsetEnvelope, estimateTempo, trackBeats } from "./analysis/beats.ts";
 export { transcribe, extractSpeechAudio, MAX_TRANSCRIPT_SECONDS, interpretWhisper, whisperModelPath, vadModelPath, WHISPER_MODEL, VAD_MODEL } from "./analysis/transcribe.ts";
 export { rasterizeCaption, prepareCaptionOverlays, encodePng, loadFont, fontsDir } from "./captions.ts";
+export { FxBaker, bakeFx, bakePath, fxAvailable, fxEngineDir, fxPython, type BakeState } from "./fx/bake.ts";

@@ -7,6 +7,7 @@ import { compileRender, exportSettings, previewSettings } from "./compile.ts";
 import { ffmpegBin, ffprobeBin, run } from "./ffmpeg.ts";
 import { ensureProxy } from "./proxy.ts";
 import { prepareCaptionOverlays } from "./captions.ts";
+import { FxBaker } from "./fx/bake.ts";
 
 /**
  * Where an export may be written: an absolute .mp4 path in an existing
@@ -79,12 +80,16 @@ export class RenderRunner {
   readonly #concurrency: number;
   #stopped = false;
   readonly #idle: (() => void)[] = [];
+  readonly #fx: FxBaker;
+  readonly #ownsFx: boolean;
 
-  constructor(db: Database, opts: { cacheDir: string; concurrency?: number }) {
+  constructor(db: Database, opts: { cacheDir: string; concurrency?: number; fxBaker?: FxBaker }) {
     this.#db = db;
     this.#jobs = new JobStore(db);
     this.#cacheDir = opts.cacheDir;
     this.#concurrency = opts.concurrency ?? 1;
+    this.#fx = opts.fxBaker ?? new FxBaker(opts.cacheDir);
+    this.#ownsFx = !opts.fxBaker;
   }
 
   /** Fail jobs orphaned by a dead process, then pick up anything still queued. */
@@ -118,6 +123,7 @@ export class RenderRunner {
   /** Kill running renders; resolves once they have recorded their final state (close the database after). */
   stop(): Promise<void> {
     this.#stopped = true;
+    if (this.#ownsFx) this.#fx.stop();
     for (const r of this.#running.values()) {
       r.cancelled = true;
       r.child?.kill("SIGKILL");
@@ -164,6 +170,14 @@ export class RenderRunner {
         if (state.cancelled || !this.#jobs.advance(jobId, "analyzing", (++done / sources.length) * 0.05)) return;
       }
 
+      // AI effects: bake what isn't cached yet (shared with the live preview's bakes).
+      const fxInputs: Record<string, string> = {};
+      const bakes = plan.fxBakes ?? [];
+      for (const [k, spec] of bakes.entries()) {
+        fxInputs[spec.key] = await this.#fx.ensure(spec);
+        if (state.cancelled || !this.#jobs.advance(jobId, "analyzing", 0.05 + ((k + 1) / bakes.length) * 0.25)) return;
+      }
+
       const final = job.kind === "export" ? job.outputPath! : join(this.#cacheDir, "previews", job.projectId, `${jobId}.mp4`);
       mkdirSync(dirname(final), { recursive: true });
       // Unguessable name, created exclusively before FFmpeg opens it: nothing can be planted there first,
@@ -178,11 +192,12 @@ export class RenderRunner {
       const overlays = plan.captions.length ? prepareCaptionOverlays(plan, job.settings.width, job.settings.height, work) : [];
 
       // rendering
-      if (!this.#jobs.advance(jobId, "rendering", 0.05)) return;
+      const base = bakes.length ? 0.3 : 0.05;
+      if (!this.#jobs.advance(jobId, "rendering", base)) return;
       const totalUs = (plan.totalFrames * plan.fps.den * 1_000_000) / plan.fps.num;
-      await this.#ffmpeg(compileRender({ plan, settings: job.settings, inputs, output: tmp, overlays }), state, (outUs, end) => {
+      await this.#ffmpeg(compileRender({ plan, settings: job.settings, inputs, output: tmp, overlays, fxInputs }), state, (outUs, end) => {
         if (end) return this.#jobs.advance(jobId, "muxing", 0.99);
-        return this.#jobs.advance(jobId, "rendering", 0.05 + 0.93 * Math.min(1, outUs / totalUs));
+        return this.#jobs.advance(jobId, "rendering", base + (0.98 - base) * Math.min(1, outUs / totalUs));
       });
       if (state.cancelled || this.#jobs.isCancelled(jobId)) return;
 

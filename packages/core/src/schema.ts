@@ -1,6 +1,7 @@
 // Wire contracts shared by the core, the REST server, the CLI and the desktop
 // UI. Browser-safe: no node: imports here.
 import { z } from "zod";
+import { FX_NAMES } from "./fx-catalog.ts";
 
 export const PROJECT_SCHEMA_VERSION = 1;
 
@@ -146,6 +147,33 @@ export interface Track {
   hidden: boolean;
 }
 
+/** Plain text the engine draws: no control characters, bounded. */
+const FxText = z.string().max(400).regex(/^[^\u0000-\u001f\u007f]*$/, "no control characters");
+
+/**
+ * One AI effect (packages/fx-engine): a face-tracked graphic baked into the clip's picture.
+ * Times are in SOURCE frames (project rate), like sourceIn, so an effect stays on the words it
+ * was put on when the clip is moved, trimmed or split. Parts outside the clip don't play.
+ */
+export const AiFxSchema = z
+  .object({
+    fx: z.enum(FX_NAMES),
+    start: Frame,
+    end: Frame,
+    text: FxText.optional(),
+    color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+    /** Pictures for effects that show cards: asset ids from this project (never paths). */
+    images: z.array(z.uuid()).max(24).optional(),
+    /** The effect's other documented options (see FX_CATALOG keys). */
+    opts: z
+      .record(z.string().regex(/^[a-z][a-z_]{0,23}$/), z.union([z.number().finite(), FxText]))
+      .refine((o) => Object.keys(o).length <= 16 && !["fx", "start", "end", "text", "color", "images"].some((k) => k in o), "too many or reserved option keys")
+      .optional(),
+  })
+  .strict()
+  .refine((e) => e.end > e.start, "end must be after start");
+export type AiFx = z.infer<typeof AiFxSchema>;
+
 /**
  * Per-clip look and sound. Stored sparse (only what differs from the
  * defaults); `resolveClipProps` fills in the rest. Every value is a plain
@@ -187,6 +215,8 @@ export const ClipPropsSchema = z
     grayscale: z.number().min(0).max(1),
     sepia: z.number().min(0).max(1),
     grain: z.number().min(0).max(1),
+    /** AI effects (video clips), in the order the engine applies them. */
+    aiEffects: z.array(AiFxSchema).max(20),
   })
   .strict();
 export type ClipProps = z.infer<typeof ClipPropsSchema>;
@@ -217,6 +247,7 @@ export const DEFAULT_CLIP_PROPS: ClipProps = {
   grayscale: 0,
   sepia: 0,
   grain: 0,
+  aiEffects: [],
 };
 
 export function resolveClipProps(p: ClipPropsPatch | undefined): ClipProps {
@@ -227,7 +258,9 @@ export function resolveClipProps(p: ClipPropsPatch | undefined): ClipProps {
 export function sparseClipProps(p: ClipPropsPatch): ClipPropsPatch {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(p)) {
-    if (v !== undefined && v !== DEFAULT_CLIP_PROPS[k as keyof ClipProps]) out[k] = v;
+    if (v === undefined || v === DEFAULT_CLIP_PROPS[k as keyof ClipProps]) continue;
+    if (Array.isArray(v) && v.length === 0) continue;
+    out[k] = v;
   }
   return out as ClipPropsPatch;
 }

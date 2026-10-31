@@ -13,7 +13,8 @@
     "./caption-layout": "./src/caption-layout.ts",
     "./context": "./src/context.ts",
     "./captions": "./src/captions.ts",
-    "./effects": "./src/effects.ts"
+    "./effects": "./src/effects.ts",
+    "./fx-catalog": "./src/fx-catalog.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"

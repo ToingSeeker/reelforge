@@ -24,3 +24,5 @@ export const OPERATION_TYPES: string[] = _Ops.options.map((o) => (o.shape.type a
 export { ProposalStore, describeChanges, engineWarnings, type NewProposal } from "./proposals.ts";
 export { WorkflowRunStore } from "./workflow-runs.ts";
 export * from "./effects.ts";
+export * from "./fx-catalog.ts";
+export * from "./fx-bake.ts";

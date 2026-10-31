@@ -23,3 +23,7 @@ apps/desktop/src-tauri/engine/
 *.mobileprovision
 *.provisionprofile
 AuthKey_*.p8
+
+# AI effects engine: dev venv (scripts/setup-fx.sh)
+packages/fx-engine/.venv/
+packages/fx-engine/**/__pycache__/

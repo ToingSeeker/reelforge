@@ -8,6 +8,7 @@ import {
   ANALYSIS_KINDS,
   AssetStore,
   buildProjectContext,
+  buildRenderPlan,
   CAPTION_FONTS,
   captionsToSrt,
   isReelForgeError,
@@ -27,7 +28,21 @@ import {
 } from "@reelforge/core";
 import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor } from "@reelforge/ai";
 import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
-import { AnalysisRunner, createRenderJob, ensureProxy, ensureThumbnail, expandFolders, fontsDir, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import {
+  AnalysisRunner,
+  bakePath,
+  createRenderJob,
+  ensureProxy,
+  ensureThumbnail,
+  expandFolders,
+  fontsDir,
+  fxAvailable,
+  FxBaker,
+  importMedia,
+  relinkMedia,
+  RenderRunner,
+  retryRenderJob,
+} from "@reelforge/media";
 import { join } from "node:path";
 
 // Local REST API (PRD §15). Loopback only, bearer token always required,
@@ -164,7 +179,9 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
   const assets = new AssetStore(opts.db);
   const timeline = new TimelineStore(opts.db);
   const jobs = new JobStore(opts.db);
-  const runner = new RenderRunner(opts.db, { cacheDir: opts.cacheDir });
+  // One baker for AI effects, shared by the live preview and exports, so a bake runs once.
+  const fxBaker = new FxBaker(opts.cacheDir);
+  const runner = new RenderRunner(opts.db, { cacheDir: opts.cacheDir, fxBaker });
   runner.start();
   const analyses = new AnalysisStore(opts.db);
   const analysisRunner = new AnalysisRunner(opts.db, { cacheDir: opts.cacheDir });
@@ -175,6 +192,23 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     return queued;
   };
   const fontFiles = new Set<string>(Object.values(CAPTION_FONTS));
+  /** The current timeline's AI-effect bakes (none for an empty timeline). */
+  const fxBakesOf = (projectId: string) => {
+    const t = timeline.get(projectId);
+    if (t.durationFrames <= 0 || !t.clips.some((c) => c.props.aiEffects?.length)) return [];
+    try {
+      return buildRenderPlan(t).fxBakes;
+    } catch {
+      return []; // offline media: nothing can be baked until it is relinked
+    }
+  };
+  const fxStatus = (projectId: string) => ({
+    engine: fxAvailable(),
+    bakes: fxBakesOf(projectId).map((b) => {
+      const st = fxBaker.state(b.key);
+      return st?.state === "done" ? { key: b.key, state: "done" as const } : { key: b.key, ...(st ?? { state: "missing" as const }) };
+    }),
+  });
   const proposals = new ProposalStore(opts.db);
   const body = (req: IncomingMessage) => readJson(req) as Promise<never>;
   const pathsOf = (b: unknown): string[] => {
@@ -487,6 +521,28 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         return sendFile(req, res, job.outputPath, "video/mp4");
       },
     },
+    { method: "GET", pattern: re(`/v1/projects/${ID}/fx`), handle: ({ res, params: [id] }) => send(res, 200, fxStatus(id!)) },
+    {
+      // Start baking every AI effect the timeline uses that isn't cached yet; poll GET …/fx for progress.
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/fx/bake`),
+      handle: ({ res, params: [id] }) => {
+        if (fxAvailable().ok) for (const spec of fxBakesOf(id!)) void fxBaker.ensure(spec);
+        return send(res, 202, fxStatus(id!));
+      },
+    },
+    {
+      // A baked AI-effects video, only for a bake the project's timeline uses.
+      method: "GET",
+      media: true,
+      pattern: re(`/v1/projects/${ID}/fx/${ID}/media`),
+      handle: ({ req, res, params: [id, key] }) => {
+        if (!fxBakesOf(id!).some((b) => b.key === key) || fxBaker.state(key!)?.state !== "done") {
+          throw new ReelForgeError("NOT_FOUND", "that effect is not baked for this project");
+        }
+        return sendFile(req, res, bakePath(opts.cacheDir, key!), "video/mp4");
+      },
+    },
     {
       // What the live preview plays: the proxy for video, a ≤1280 px still for images, the file itself for audio.
       method: "GET",
@@ -587,6 +643,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         close: () =>
           new Promise((r, j) => {
             analysisRunner.stop();
+            fxBaker.stop();
             const renders = runner.stop();
             server.close((err) => (err ? j(err) : renders.then(() => r())));
             // close() already drops idle sockets; also end in-flight ones so shutdown can't hang.

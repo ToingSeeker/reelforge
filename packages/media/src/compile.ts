@@ -27,9 +27,11 @@ export interface CompileOptions {
   output: string;
   /** Pre-rendered caption tracks (PNG sequences we generated), composited on top. */
   overlays?: { pattern: string; startFrame: number; frames: number; y: number }[];
+  /** Baked AI-effect videos by key (plan.fxBakes); every key the plan uses must be here. */
+  fxInputs?: Record<string, string>;
 }
 
-export function compileRender({ plan, settings, inputs, output, overlays = [] }: CompileOptions): string[] {
+export function compileRender({ plan, settings, inputs, output, overlays = [], fxInputs = {} }: CompileOptions): string[] {
   const fps = `${plan.fps.num}/${plan.fps.den}`;
   const W = settings.width;
   const H = settings.height;
@@ -37,11 +39,14 @@ export function compileRender({ plan, settings, inputs, output, overlays = [] }:
   const args: string[] = ["-hide_banner", "-nostdin", "-loglevel", "error"];
   const filters: string[] = [];
   let n = 0;
+  const inputFile = (path: string, opts: string[]) => {
+    args.push(...sourceInputArgs(path, opts));
+    return n++;
+  };
   const input = (assetId: string, opts: string[]) => {
     const path = inputs[assetId];
     if (!path) throw new Error(`no input path for asset ${assetId}`);
-    args.push(...sourceInputArgs(path, opts));
-    return n++;
+    return inputFile(path, opts);
   };
 
   // Composite in RGB: each source is converted with its own colour matrix (scale reads the tags),
@@ -55,7 +60,37 @@ export function compileRender({ plan, settings, inputs, output, overlays = [] }:
       const p = seg.props;
       const still = plan.sources[seg.assetId]?.kind === "image";
       const len = seg.renderEnd - seg.renderStart;
-      const i = input(seg.assetId, still ? [] : ["-ss", sec(seg.renderSourceIn), "-t", sec(len + 1)]);
+      let from: string;
+      if (seg.fx?.length && !still) {
+        // AI effects: the source picture, with the baked stretches spliced in frame-exactly, as one stream.
+        from = `fx${v}`;
+        const bake = plan.fxBakes.find((b) => b.key === seg.fx![0]!.key)!;
+        const parts: { from: number; to: number; piece?: (typeof seg.fx)[number] }[] = [];
+        let at = seg.renderStart;
+        for (const piece of seg.fx) {
+          if (piece.from > at) parts.push({ from: at, to: piece.from });
+          parts.push({ from: piece.from, to: piece.to, piece });
+          at = piece.to;
+        }
+        if (at < seg.renderEnd) parts.push({ from: at, to: seg.renderEnd });
+        const labels = parts.map((part, k) => {
+          const plen = part.to - part.from;
+          let j: number;
+          if (part.piece) {
+            const path = fxInputs[part.piece.key];
+            if (!path) throw new Error(`AI effects for clip ${seg.clipId} are not baked yet`);
+            j = inputFile(path, ["-ss", sec(part.piece.bakeOffset), "-t", sec(plen + 1)]);
+          } else {
+            j = input(seg.assetId, ["-ss", sec(seg.renderSourceIn + (part.from - seg.renderStart)), "-t", sec(plen + 1)]);
+          }
+          // Same size, rate and format for every part, so concat joins them.
+          filters.push(`[${j}:v]scale=${bake.width}:${bake.height},setsar=1,fps=${fps},format=rgba,tpad=stop_mode=clone:stop_duration=0.5,trim=end_frame=${plen},setpts=PTS-STARTPTS[fx${v}p${k}]`);
+          return `[fx${v}p${k}]`;
+        });
+        filters.push(`${labels.join("")}concat=n=${labels.length}:v=1:a=0[${from}]`);
+      } else {
+        from = `${input(seg.assetId, still ? [] : ["-ss", sec(seg.renderSourceIn), "-t", sec(len + 1)])}:v`;
+      }
       const f: string[] = [];
       if (p.cropLeft || p.cropTop || p.cropRight || p.cropBottom) {
         f.push(`crop=w=iw*${1 - p.cropLeft - p.cropRight}:h=ih*${1 - p.cropTop - p.cropBottom}:x=iw*${p.cropLeft}:y=ih*${p.cropTop}`);
@@ -91,7 +126,7 @@ export function compileRender({ plan, settings, inputs, output, overlays = [] }:
       // One tick = one project frame, so the offset is an exact integer. Seconds would be
       // rounded (1/30 s × 30 = 0.99999 → frame 0) and land cuts a frame early.
       f.push(`settb=${plan.fps.den}/${plan.fps.num}`, `setpts=PTS-STARTPTS+${seg.renderStart}`);
-      filters.push(`[${i}:v]${f.join(",")}[v${v}]`);
+      filters.push(`[${from}]${f.join(",")}[v${v}]`);
       // Overlay's n counts output frames from 0 (the base starts at frame 0): the pan runs like positionAt().
       const span = Math.max(1, seg.duration - 1);
       const along = (from: number, to: number | null) => (to === null || to === from ? `${from}` : `(${from}+(${to - from})*clip((n-${seg.start})/${span},0,1))`);

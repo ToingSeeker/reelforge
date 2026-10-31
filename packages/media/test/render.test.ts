@@ -4,8 +4,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobStore, openDatabase, ProjectStore, TimelineStore, type Database, type TimelineOp } from "@reelforge/core";
-import { createRenderJob, importMedia, RenderRunner, retryRenderJob, validateExportPath } from "../src/index.ts";
+import { buildRenderPlan, JobStore, openDatabase, ProjectStore, TimelineStore, type Database, type TimelineOp } from "@reelforge/core";
+import { bakePath, createRenderJob, fxAvailable, importMedia, RenderRunner, retryRenderJob, validateExportPath } from "../src/index.ts";
 
 const ff = (args: string[]) => execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args]);
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-render-")));
@@ -376,4 +376,36 @@ test("effects: colour looks, vignette, blur, grain and pan render as the preview
   assert.ok(near(pixel(out, 12, 30, 144), [255, 0, 0]) && near(pixel(out, 12, 130, 144), [0, 0, 255]), "pan starts left");
   assert.ok(near(pixel(out, 22, 130, 144), [255, 0, 0]) && near(pixel(out, 22, 30, 144), [0, 0, 255]), "pan ends right");
   assert.ok(near(pixel(out, 17, 80, 144), [255, 0, 0]) && near(pixel(out, 17, 10, 144), [0, 0, 255]), "pan is halfway mid-clip");
+});
+
+test("AI effects: the baked stretch replaces the source picture frame-exactly, transforms still apply", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  // red clip at timeline 0–60 showing source from frame 15; effect on source frames 30–45 → timeline 15–30
+  s.edit([{ type: "clip.add", trackId: s.track("Video"), assetId: s.ids.red, start: 0, sourceIn: 15, duration: 60, props: { aiEffects: [{ fx: "moody", start: 30, end: 45 }] } }]);
+  const plan = buildRenderPlan(new TimelineStore(s.db).get(s.projectId));
+  assert.equal(plan.fxBakes.length, 1);
+  const spec = plan.fxBakes[0]!;
+  assert.deepEqual([spec.sourceFrom, spec.sourceTo, spec.width, spec.height], [15, 60, 284, 160]);
+  // Stand-in for the engine's output: a blue video of the stretch's length and size.
+  const fake = bakePath(join(s.home, "cache"), spec.key);
+  execFileSync("mkdir", ["-p", join(s.home, "cache", "fx")]);
+  ff(["-f", "lavfi", "-i", `color=c=blue:s=${spec.width}x${spec.height}:r=30:d=1.5`, "-c:v", "libx264", "-pix_fmt", "yuv420p", fake]);
+  const out = join(s.home, "fx.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  assert.equal(colour(out, 14), "red");
+  assert.equal(colour(out, 15), "blue", "the bake starts on the effect's first frame");
+  assert.equal(colour(out, 29), "blue");
+  assert.equal(colour(out, 30), "red", "and ends on its last");
+  assert.equal(colour(out, 59), "red");
+});
+
+test("AI effects: the real engine bakes a stretch and the export uses it", { skip: !fxAvailable().ok && "AI effects engine not set up (scripts/setup-fx.sh)" }, async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  s.edit([{ type: "clip.add", trackId: s.track("Video"), assetId: s.ids.red, start: 0, duration: 60, props: { aiEffects: [{ fx: "moody", start: 15, end: 45, opts: { grade: "bw" } }] } }]);
+  const out = join(s.home, "fx-real.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  assert.equal(colour(out, 5), "red");
+  const [r, g, b] = rgbAt(out, 30);
+  assert.ok(Math.abs(r - g) < 25 && Math.abs(g - b) < 25, `black & white grade inside the effect: rgb(${r},${g},${b})`);
+  assert.equal(colour(out, 55), "red");
 });
