@@ -122,6 +122,8 @@ struct EngineCommand {
     node: String,
     cli: PathBuf,
     fonts: Option<PathBuf>,
+    /// The bundled AI effects engine (fx.py + its own Python), release builds only.
+    fx: Option<PathBuf>,
 }
 
 fn bundled_engine_dir() -> Option<PathBuf> {
@@ -145,12 +147,18 @@ fn engine_command() -> Result<EngineCommand, String> {
 fn resolve_engine(release: bool, bundled: Option<PathBuf>, node_override: Option<String>, cli_override: Option<String>) -> Result<EngineCommand, String> {
     if release {
         let dir = bundled.ok_or("the bundled ReelForge engine is missing from the app (Contents/Resources/engine); reinstall ReelForge")?;
-        return Ok(EngineCommand { node: dir.join("node").to_string_lossy().into_owned(), cli: dir.join("reelforge.mjs"), fonts: Some(dir.join("fonts")) });
+        return Ok(EngineCommand {
+            node: dir.join("node").to_string_lossy().into_owned(),
+            cli: dir.join("reelforge.mjs"),
+            fonts: Some(dir.join("fonts")),
+            fx: Some(dir.join("fx")),
+        });
     }
     Ok(EngineCommand {
         node: node_override.unwrap_or_else(|| "node".into()),
         cli: cli_override.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/bin/reelforge.js")),
         fonts: None,
+        fx: None,
     })
 }
 
@@ -160,7 +168,8 @@ fn node_vars_to_remove(release: bool, names: impl Iterator<Item = String>) -> Ve
     if !release {
         return Vec::new();
     }
-    names.filter(|n| n.starts_with("NODE_")).collect()
+    // Also the AI effects Python override: a release runs only the Python it ships.
+    names.filter(|n| n.starts_with("NODE_") || n == "REELFORGE_FX_PYTHON").collect()
 }
 
 /// Apps opened from Finder get launchd's PATH (/usr/bin:/bin:…), not the shell's, so FFmpeg and
@@ -177,7 +186,7 @@ fn engine_path() -> String {
 
 fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Option<ChildStdin>), String> {
     let token = random_token()?;
-    let EngineCommand { node, cli, fonts } = engine_command()?;
+    let EngineCommand { node, cli, fonts, fx } = engine_command()?;
     let mut cmd = Command::new(&node);
     // The token goes over stdin, not the environment, which FFmpeg/whisper children would inherit.
     cmd.arg(&cli).arg("serve").arg("--token-stdin").env("PATH", engine_path()).env_remove("REELFORGE_API_TOKEN");
@@ -187,6 +196,9 @@ fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Opt
     if let Some(fonts) = fonts {
         // The bundle can't find assets relative to its own source tree.
         cmd.env("REELFORGE_FONTS", format!("{}/", fonts.display()));
+    }
+    if let Some(fx) = fx {
+        cmd.env("REELFORGE_FX_DIR", fx);
     }
     for origin in allowed_origins(!cfg!(debug_assertions)) {
         cmd.arg("--allow-origin").arg(origin);
@@ -278,6 +290,7 @@ mod tests {
         let e = resolve_engine(true, bundle(), Some("/tmp/evil-node".into()), Some("/tmp/evil.mjs".into())).unwrap();
         assert_eq!(e.node, "/Applications/ReelForge.app/Contents/Resources/engine/node");
         assert_eq!(e.cli, PathBuf::from("/Applications/ReelForge.app/Contents/Resources/engine/reelforge.mjs"));
+        assert_eq!(e.fx, Some(PathBuf::from("/Applications/ReelForge.app/Contents/Resources/engine/fx")));
     }
 
     #[test]
@@ -303,10 +316,11 @@ mod tests {
 
     #[test]
     fn release_strips_node_environment() {
-        let names = ["NODE_OPTIONS", "NODE_PATH", "PATH", "HOME", "NODE_EXTRA_CA_CERTS"].map(String::from);
+        let names = ["NODE_OPTIONS", "NODE_PATH", "PATH", "HOME", "NODE_EXTRA_CA_CERTS", "REELFORGE_FX_PYTHON", "REELFORGE_FX_DIR"].map(String::from);
         let mut removed = node_vars_to_remove(true, names.clone().into_iter());
         removed.sort();
-        assert_eq!(removed, ["NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "NODE_PATH"]);
+        // REELFORGE_FX_DIR is not removed: the shell overwrites it with the bundled engine.
+        assert_eq!(removed, ["NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "NODE_PATH", "REELFORGE_FX_PYTHON"]);
         assert!(node_vars_to_remove(false, names.into_iter()).is_empty());
     }
 }

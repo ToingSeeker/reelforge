@@ -17,6 +17,7 @@ pnpm release:mac                 # cargo runs with --locked for the same reason 
 | `reelforge.mjs` | the CLI/engine as one esbuild bundle (`serve`, `mcp`, …) |
 | `node` | the official Node.js runtime from nodejs.org, pinned version + SHA-256 (not Homebrew's, which links Homebrew libraries) |
 | `fonts/` | the OFL caption fonts |
+| `fx/` | the AI effects engine (`packages/fx-engine`) with its own CPython 3.12 (python-build-standalone, pinned SHA-256) and the wheels in `requirements-macos-arm64.lock` (`pip --require-hashes`, binary only); the shell points the engine at it with `REELFORGE_FX_DIR` and drops any inherited `REELFORGE_FX_PYTHON` |
 | `THIRD_PARTY_NOTICES.txt` | licences of every shipped JS package, Rust crate, Node and the fonts; the build fails on a licence outside the allowlist |
 
 A release build of the shell runs that engine; a debug build runs the monorepo CLI on your own Node. Apps opened

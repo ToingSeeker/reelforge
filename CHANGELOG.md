@@ -8,7 +8,9 @@
   text, colour and options, or ask the AI Director ("kasih spotlight waktu aku bilang angka"): it now sees each
   word's timing. Effects are stored in source time, so they stay on their words when a clip moves or is trimmed.
   The engine bakes only the seconds an effect covers, in the background; the preview shows the clip without the
-  effect until its bake is ready (status at the bottom of the frame) and exports wait for it.
+  effect until its bake is ready (status at the bottom of the frame) and exports wait for it. The app bundles the
+  engine's own Python (CPython 3.12 + OpenCV + MediaPipe, every download hash-checked), so the DMG grows from
+  ~42 MB to ~207 MB.
 - **Fix:** the AI Director's structured output only allowed the older clip settings, so blur, pans and other new
   props it proposed were silently dropped. A test now keeps that schema equal to the clip settings.
 - **Effects tab.** One-click camera moves (zoom in/out, slow push, pan left/right, Ken Burns) and picture looks

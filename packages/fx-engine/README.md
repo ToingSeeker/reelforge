@@ -21,10 +21,17 @@ Picture options (`images`) only take project assets; the engine gets a folder of
 ## Setup
 
 - Development: `scripts/setup-fx.sh` (Python 3.11/3.12 venv in `.venv/`, pinned `requirements.txt`).
-- Release: the desktop build bundles a Python runtime with these packages (`scripts/release/build-engine.mjs`).
+- Release: the desktop build bundles python-build-standalone CPython 3.12 (SHA-256 pinned) and installs the
+  wheels in `requirements-macos-arm64.lock` with `pip --require-hashes --only-binary=:all:`
+  (`scripts/release/build-engine.mjs`). About 450 MB in the app, ~165 MB of the DMG.
 
 ## Updating
 
 Copy the new `scripts/fx.py`, `models/` and `fonts/` from upstream, keep this README's commit current, bump
 `FX_ENGINE_VERSION` in `packages/core/src/fx-bake.ts` (cached bakes are redone) and run the tests: one checks
 that the catalogue in core still matches the effects `fx.py` defines.
+
+To change a Python package version: edit `requirements.txt`, rerun `scripts/setup-fx.sh`, then regenerate the
+lock from `pip download --no-deps --only-binary=:all: --platform macosx_11_0_arm64 --python-version 3.12` and
+check each wheel's SHA-256 against PyPI's published digest. MediaPipe imports matplotlib at load, which is why
+it and its dependencies are listed.
