@@ -6,7 +6,9 @@
 import { activeLayers, audioGain, pictureAlpha, placement, type PlanSegment, type RenderPlan } from "@reelforge/core/render-plan";
 import { activeWordAt, layoutCaption, type CaptionLayout } from "@reelforge/core/caption-layout";
 import { CAPTION_FONTS, type Caption, type CaptionFont, type CaptionStyle } from "@reelforge/core/schema";
+import { hasPictureEffects } from "@reelforge/core/effects";
 import opentype, { type Font } from "opentype.js";
+import { EffectsGL } from "./effects-gl.ts";
 
 export interface CompositorSources {
   mediaUrl: (assetId: string) => string;
@@ -31,6 +33,7 @@ export class Compositor {
   #drawToken = 0;
   #fonts = new Map<CaptionFont, Font | Promise<void>>();
   #layouts = new Map<string, CaptionLayout>();
+  #effects: EffectsGL | null | undefined; // undefined = not tried yet
   onFrame: ((frame: number) => void) | null = null;
   onEnded: (() => void) | null = null;
 
@@ -250,7 +253,13 @@ export class Compositor {
       ctx.globalAlpha = alpha;
       ctx.translate(p.cx, p.cy);
       ctx.rotate(p.rotation);
-      ctx.drawImage(src, p.sx, p.sy, p.sw, p.sh, -p.dw / 2, -p.dh / 2, p.dw, p.dh);
+      if (hasPictureEffects(seg.props) && (this.#effects ??= EffectsGL.create())) {
+        // Effects work on the fitted picture in canvas pixels; the zoom then scales the result.
+        const fx = this.#effects.render(src as TexImageSource, { ...p, srcW: sw, srcH: sh }, p.fw * k, p.fh * k, seg.props, cw, frame - seg.renderStart);
+        ctx.drawImage(fx, -p.dw / 2, -p.dh / 2, p.dw, p.dh);
+      } else {
+        ctx.drawImage(src, p.sx, p.sy, p.sw, p.sh, -p.dw / 2, -p.dh / 2, p.dw, p.dh);
+      }
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;

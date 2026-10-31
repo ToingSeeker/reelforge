@@ -2,7 +2,7 @@
 // from integer frames (video) or integer samples (audio), so the output has
 // exactly plan.totalFrames frames and segment boundaries land on frame edges.
 
-import type { RenderPlan, RenderSettings } from "@reelforge/core";
+import { blurSigma, colorMatrix, grainNoise, sharpenAmount, vignetteAngle, type ClipProps, type RenderPlan, type RenderSettings } from "@reelforge/core";
 import { sourceInputArgs } from "./probe.ts";
 
 export const AUDIO_RATE = 48_000;
@@ -68,6 +68,8 @@ export function compileRender({ plan, settings, inputs, output, overlays = [] }:
       f.push("setsar=1", `fps=${fps}`, "format=rgba");
       // Exactly `len` frames (clip + dissolve handles), padding with the last frame if the source runs short.
       f.push(`tpad=stop_mode=clone:stop_duration=${still ? sec(len) : "0.5"}`, `trim=end_frame=${len}`);
+      // After tpad/trim so a still gets fresh grain every frame.
+      f.push(...effectFilters(p, W));
       const animated = p.scaleEnd !== null && p.scaleEnd !== p.scale;
       if (animated) {
         // n counts frames from renderStart; the zoom runs across the clip itself (same as scaleAt()).
@@ -90,9 +92,13 @@ export function compileRender({ plan, settings, inputs, output, overlays = [] }:
       // rounded (1/30 s × 30 = 0.99999 → frame 0) and land cuts a frame early.
       f.push(`settb=${plan.fps.den}/${plan.fps.num}`, `setpts=PTS-STARTPTS+${seg.renderStart}`);
       filters.push(`[${i}:v]${f.join(",")}[v${v}]`);
-      const x = `(main_w-overlay_w)/2+${p.x}*main_w`;
-      const y = `(main_h-overlay_h)/2+${p.y}*main_h`;
-      filters.push(`[${composite}][v${v}]overlay=x='${x}':y='${y}':eval=${animated || p.rotation ? "frame" : "init"}:eof_action=pass:repeatlast=0:format=rgb[c${v}]`);
+      // Overlay's n counts output frames from 0 (the base starts at frame 0): the pan runs like positionAt().
+      const span = Math.max(1, seg.duration - 1);
+      const along = (from: number, to: number | null) => (to === null || to === from ? `${from}` : `(${from}+(${to - from})*clip((n-${seg.start})/${span},0,1))`);
+      const panned = (p.xEnd !== null && p.xEnd !== p.x) || (p.yEnd !== null && p.yEnd !== p.y);
+      const x = `(main_w-overlay_w)/2+${along(p.x, p.xEnd)}*main_w`;
+      const y = `(main_h-overlay_h)/2+${along(p.y, p.yEnd)}*main_h`;
+      filters.push(`[${composite}][v${v}]overlay=x='${x}':y='${y}':eval=${animated || panned || p.rotation ? "frame" : "init"}:eof_action=pass:repeatlast=0:format=rgb[c${v}]`);
       composite = `c${v}`;
       v++;
     }
@@ -187,6 +193,32 @@ export function compileRender({ plan, settings, inputs, output, overlays = [] }:
     output,
   );
   return args;
+}
+
+/**
+ * The clip's picture effects as filters on the fitted RGBA picture, in the order the preview shader
+ * applies them: colour, blur, sharpen, vignette, grain. W is the output frame width in pixels.
+ */
+export function effectFilters(p: ClipProps, W: number): string[] {
+  const f: string[] = [];
+  const m = colorMatrix(p);
+  if (m) {
+    const ch = ["r", "g", "b"];
+    f.push(`colorchannelmixer=${m.map((x, i) => `${ch[Math.floor(i / 3)]}${ch[i % 3]}=${x}`).join(":")}`);
+  }
+  const sigma = blurSigma(p, W);
+  // Alpha stays as is: blurring it would fade the picture's own edges.
+  if (sigma >= 0.1) f.push(`gblur=sigma=${sigma.toFixed(3)}:steps=6:planes=7`);
+  const a = Math.round(sharpenAmount(p) * 100);
+  if (a > 0) {
+    const k = `0 -${a} 0 -${a} ${100 + 4 * a} -${a} 0 -${a} 0`;
+    f.push("format=gbrap", `convolution=${[0, 1, 2].map((i) => `${i}m='${k}':${i}rdiv=0.01`).join(":")}`, "format=rgba");
+  }
+  const angle = vignetteAngle(p);
+  if (angle > 0) f.push("format=gbrap", `vignette=angle=${angle}:dither=0`, "format=rgba");
+  const g = grainNoise(p);
+  if (g.strength > 0) f.push("format=yuva444p", `noise=c0s=${g.strength}:c0f=t+u`, "format=rgba");
+  return f;
 }
 
 /** Export defaults (PRD §13): H.264 / AAC MP4 at the project size and rate. */

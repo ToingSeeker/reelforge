@@ -91,12 +91,22 @@ export function scaleAt(seg: PlanSegment, frame: number): number {
   return p.scale + (p.scaleEnd - p.scale) * t;
 }
 
+/** Centre offset (fractions of the frame) at a frame: linear from x/y to xEnd/yEnd across the clip, like scaleAt. */
+export function positionAt(seg: PlanSegment, frame: number): { x: number; y: number } {
+  const p = seg.props;
+  const t = seg.duration <= 1 ? 0 : clamp01((frame - seg.start) / (seg.duration - 1));
+  return { x: p.xEnd === null ? p.x : p.x + (p.xEnd - p.x) * t, y: p.yEnd === null ? p.y : p.y + (p.yEnd - p.y) * t };
+}
+
 export interface Placement {
   /** Region of the source image to draw (source pixels). */
   sx: number;
   sy: number;
   sw: number;
   sh: number;
+  /** Size of the fitted picture before zoom: where effects are applied. */
+  fw: number;
+  fh: number;
   /** Size on the output frame before rotation, and the centre point. */
   dw: number;
   dh: number;
@@ -134,7 +144,8 @@ export function placement(seg: PlanSegment, frame: number, srcW: number, srcH: n
     dh = sh * k;
   }
   const s = scaleAt(seg, frame);
-  return { sx, sy, sw, sh, dw: dw * s, dh: dh * s, cx: W / 2 + p.x * W, cy: H / 2 + p.y * H, rotation: (p.rotation * Math.PI) / 180 };
+  const pos = positionAt(seg, frame);
+  return { sx, sy, sw, sh, fw: dw, fh: dh, dw: dw * s, dh: dh * s, cx: W / 2 + pos.x * W, cy: H / 2 + pos.y * H, rotation: (p.rotation * Math.PI) / 180 };
 }
 
 /** Active picture segments at a frame, bottom layer first. Used by the live preview. */

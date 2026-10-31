@@ -170,7 +170,9 @@ export function Inspector({ timeline, clip, onDraft, onCommit }: Props) {
           </label>
           {zoomOn && field({ ...pct(5, 400, "scaleEnd", "Zoom to"), to: (v) => Math.round((v ?? value.scale) * 1000) / 10 })}
           {field(pct(-100, 100, "x", "Position X"))}
+          {value.xEnd !== null && field({ ...pct(-100, 100, "xEnd", "Pan to X"), to: (v) => Math.round((v ?? value.x) * 1000) / 10 })}
           {field(pct(-100, 100, "y", "Position Y"))}
+          {value.yEnd !== null && field({ ...pct(-100, 100, "yEnd", "Pan to Y"), to: (v) => Math.round((v ?? value.y) * 1000) / 10 })}
           {field(same("rotation", "Rotation", -180, 180, 1, "°"))}
           {field(pct(0, 100, "opacity", "Opacity"))}
           <h3>Crop</h3>

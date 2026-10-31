@@ -17,6 +17,8 @@ ff(["-f", "lavfi", "-i", "color=c=red:s=640x360:r=25:d=3", "-f", "lavfi", "-i", 
 ff(["-f", "lavfi", "-i", "color=c=blue:s=360x640:r=30:d=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", src("blue.mov")]);
 ff(["-f", "lavfi", "-i", "color=c=0x00ff00:s=200x200", "-frames:v", "1", src("green.png")]);
 ff(["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=3", src("tone.wav")]);
+// Left half white, right half black: an edge for blur to soften.
+ff(["-f", "lavfi", "-i", "color=c=white:s=80x160,pad=160:160:0:0:black", "-frames:v", "1", src("split.png")]);
 
 function rgbAt(file: string, frame: number): [number, number, number] {
   const out = execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", file, "-vf", `select=eq(n\\,${frame}),scale=1:1`, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
@@ -339,3 +341,39 @@ test("the partial render file has an unguessable name and is created exclusively
   assert.ok(existsSync(out));
 });
 
+
+test("effects: colour looks, vignette, blur, grain and pan render as the preview computes them", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  const { imported } = await importMedia(s.db, s.projectId, [src("split.png")], "cli");
+  const split = imported[0]!.id;
+  const V = s.track("Video");
+  s.edit([
+    { type: "clip.add", trackId: V, assetId: s.ids.red, start: 0, duration: 2, props: { grayscale: 1 } },
+    { type: "clip.add", trackId: V, assetId: s.ids.red, start: 2, duration: 2, props: { sepia: 1 } },
+    { type: "clip.add", trackId: V, assetId: s.ids.red, start: 4, duration: 2, props: { vignette: 1 } },
+    { type: "clip.add", trackId: V, assetId: split, start: 6, duration: 2, props: { fit: "contain", blur: 0.5 } },
+    { type: "clip.add", trackId: V, assetId: s.ids.red, start: 8, duration: 4, props: { grain: 1 } },
+    // half-size red layer panning from left (x −0.25) to right (x +0.25) over frames 12–22 on blue
+    { type: "clip.add", trackId: V, assetId: s.ids.blue, start: 12, duration: 11 },
+    { type: "clip.add", trackId: s.track("Overlays"), assetId: s.ids.red, start: 12, duration: 11, props: { scale: 0.5, x: -0.25, xEnd: 0.25 } },
+  ]);
+  const out = join(s.home, "effects.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  // BT.709 luma of pure red, then the sepia matrix's first column (×255)
+  assert.ok(near(pixel(out, 0, 80, 144), [54, 54, 54], 8), `grayscale ${pixel(out, 0, 80, 144)}`);
+  assert.ok(near(pixel(out, 2, 80, 144), [100, 89, 69], 8), `sepia ${pixel(out, 2, 80, 144)}`);
+  // vignette angle π/2.5: the centre stays red, a corner is darkened by cos(π/2.5 × ~0.97)⁴ ≈ 0.01
+  assert.ok(near(pixel(out, 4, 80, 144), [255, 0, 0]), "vignette centre");
+  assert.ok(pixel(out, 4, 2, 2)[0] < 40, `vignette corner ${pixel(out, 4, 2, 2)}`);
+  // blur: the white/black edge in the middle of the fitted 160×160 square turns grey, far from it stays put
+  const edge = pixel(out, 6, 80, 144)[0];
+  assert.ok(edge > 70 && edge < 190, `blur edge ${edge}`);
+  assert.ok(pixel(out, 6, 10, 144)[0] > 200 && pixel(out, 6, 150, 144)[0] < 50, "blur keeps the far sides");
+  // grain moves every frame
+  const g = [8, 9, 10, 11].map((f) => pixel(out, f, 40, 100).join());
+  assert.ok(new Set(g).size > 1, `grain is still: ${g}`);
+  // pan: the 80-wide layer is centred at 40 on frame 12, at 120 on frame 22
+  assert.ok(near(pixel(out, 12, 30, 144), [255, 0, 0]) && near(pixel(out, 12, 130, 144), [0, 0, 255]), "pan starts left");
+  assert.ok(near(pixel(out, 22, 130, 144), [255, 0, 0]) && near(pixel(out, 22, 30, 144), [0, 0, 255]), "pan ends right");
+  assert.ok(near(pixel(out, 17, 80, 144), [255, 0, 0]) && near(pixel(out, 17, 10, 144), [0, 0, 255]), "pan is halfway mid-clip");
+});

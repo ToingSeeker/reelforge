@@ -73,7 +73,8 @@ Usage:
   reelforge clip split <project> <clip> --at <t>
   reelforge clip delete <project> <clip>... [--ripple]
   reelforge clip set <project> <clip> --props '{"opacity":0.5,"fadeIn":15,"transitionIn":10,"gainDb":-6}'
-                   (also on clip add; fields: fit scale scaleEnd x y rotation opacity crop* fadeIn fadeOut transitionIn gainDb)
+                   (also on clip add; fields: fit scale scaleEnd x y xEnd yEnd rotation opacity crop* fadeIn fadeOut transitionIn gainDb
+                    blur sharpen vignette grayscale sepia grain)
 
   reelforge media analyze <project> <asset> [--kinds scenes,beats,transcript] [--language auto|id|en…]
   reelforge media analysis <project> <asset>

@@ -12,7 +12,8 @@
     "./render-plan": "./src/render-plan.ts",
     "./caption-layout": "./src/caption-layout.ts",
     "./context": "./src/context.ts",
-    "./captions": "./src/captions.ts"
+    "./captions": "./src/captions.ts",
+    "./effects": "./src/effects.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"

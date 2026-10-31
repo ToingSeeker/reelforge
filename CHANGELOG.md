@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Effects tab.** One-click camera moves (zoom in/out, slow push, pan left/right, Ken Burns) and picture looks
+  (blur, sharpen, vignette, black & white, sepia, film grain) per video or image clip, each with an amount slider and
+  one undo step per change. Looks are plain clip settings (`blur`, `sharpen`, `vignette`, `grayscale`, `sepia`,
+  `grain`, 0–1) and pans add `xEnd`/`yEnd`, so the AI Director, CLI and MCP can use them too. The export applies them
+  with FFmpeg filters and the live preview with a WebGL pass using the same parameters; measured on a textured clip,
+  preview vs export stays within the proxy's own difference. Blur makes that clip's export about 2× slower.
 - **Captions land on the speech.** With voice detection on, whisper.cpp returns each word about 0.25 s early
   while the sentence itself is placed right, so generated captions led the voice. Words are now slid back onto their
   sentence. Already-generated captions keep the old timing: generate them again.

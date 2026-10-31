@@ -162,6 +162,9 @@ export const ClipPropsSchema = z
     /** Centre offset as a fraction of the frame width / height. */
     x: z.number().min(-2).max(2),
     y: z.number().min(-2).max(2),
+    /** If set, the position animates linearly from x / y to these over the clip (pan). */
+    xEnd: z.number().min(-2).max(2).nullable(),
+    yEnd: z.number().min(-2).max(2).nullable(),
     /** Degrees, clockwise. */
     rotation: z.number().min(-360).max(360),
     opacity: z.number().min(0).max(1),
@@ -177,6 +180,13 @@ export const ClipPropsSchema = z
     transitionIn: z.number().int().min(0).max(MAX_FRAME),
     /** Audio gain in dB (audio clips, and video clips that have sound). */
     gainDb: z.number().min(-60).max(12),
+    // Picture effects, each 0 (off) to 1 (strongest); see effects.ts for what each one does.
+    blur: z.number().min(0).max(1),
+    sharpen: z.number().min(0).max(1),
+    vignette: z.number().min(0).max(1),
+    grayscale: z.number().min(0).max(1),
+    sepia: z.number().min(0).max(1),
+    grain: z.number().min(0).max(1),
   })
   .strict();
 export type ClipProps = z.infer<typeof ClipPropsSchema>;
@@ -189,6 +199,8 @@ export const DEFAULT_CLIP_PROPS: ClipProps = {
   scaleEnd: null,
   x: 0,
   y: 0,
+  xEnd: null,
+  yEnd: null,
   rotation: 0,
   opacity: 1,
   cropLeft: 0,
@@ -199,6 +211,12 @@ export const DEFAULT_CLIP_PROPS: ClipProps = {
   fadeOut: 0,
   transitionIn: 0,
   gainDb: 0,
+  blur: 0,
+  sharpen: 0,
+  vignette: 0,
+  grayscale: 0,
+  sepia: 0,
+  grain: 0,
 };
 
 export function resolveClipProps(p: ClipPropsPatch | undefined): ClipProps {

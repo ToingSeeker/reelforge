@@ -25,6 +25,7 @@ import { Timeline, type AssetDropHandler } from "./components/Timeline.tsx";
 import { NewProjectDialog } from "./components/NewProjectDialog.tsx";
 import { Welcome } from "./components/Welcome.tsx";
 import { RailPlaceholder } from "./components/Placeholder.tsx";
+import { EffectsPanel } from "./components/EffectsPanel.tsx";
 import { Icon } from "./icons.tsx";
 
 const CURRENT_KEY = "rf.currentProject";
@@ -478,6 +479,13 @@ export function App() {
                 writePref("rf.snapBeats", v ? "1" : "0");
               }}
               onAnalyze={(a, kinds) => void analyses.analyze(a.id, kinds)}
+            />
+          ) : rail === "effects" && tl ? (
+            <EffectsPanel
+              timeline={tl}
+              clip={selectedClip}
+              onDraft={(props) => setDraft(props && selectedClip ? { clipId: selectedClip.id, props } : null)}
+              onCommit={(props, label) => selectedClip && apply(label, [{ type: "clip.update", clipId: selectedClip.id, props }])}
             />
           ) : (
             <RailPlaceholder item={rail} />
