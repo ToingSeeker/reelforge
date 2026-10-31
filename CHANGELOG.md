@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Captions land on the speech.** With voice detection on, whisper.cpp returns each word about 0.25 s early
+  while the sentence itself is placed right, so generated captions led the voice. Words are now slid back onto their
+  sentence. Already-generated captions keep the old timing: generate them again.
 - **Videos play their own sound**, like in other editors: a clip on V1/V2 is heard without copying it to an audio
   track. Picture tracks get a speaker toggle (the eye still hides only the picture), video clips get a Gain control,
   and the Inspector warns when the same media plays twice (e.g. a copy made earlier on A2)

@@ -58,6 +58,22 @@ test("generateCaptions maps words through the clip (trim + position) and groups 
   assert.ok(first.start + first.duration <= caps[1]!.start);
 });
 
+test("words whisper puts before their segment (voice detection on) are slid back onto the speech", (t) => {
+  const s = setup(t);
+  const tl = s.apply([{ type: "clip.add", trackId: s.voice, assetId: s.asset.id, start: 0, sourceIn: 0, duration: 300 }]);
+  // Measured on a real clip: the segment starts at 5.16 s, where the voice is, but its words come back 0.26 s early.
+  const early: TranscriptResult = {
+    language: "id",
+    text: "Code pertama, pahami angka.",
+    segments: [{ startUs: 5_160_000, endUs: 6_840_000, text: "Code pertama, pahami angka.", words: [w("Code", 4900, 4900), w("pertama,", 4910, 5500), w("pahami", 5500, 5740), w("angka.", 5740, 5940)] }],
+  };
+  const caps = generateCaptions(tl, new Map([[s.asset.id, early]]), { maxWords: 2 });
+  assert.equal(caps[0]!.start, 155); // 5.16 s × 30, not 147 (4.90 s)
+  assert.equal(caps[1]!.start, 173); // "pahami" 5.50 + 0.26 s
+  // A segment whose words already start inside it is left alone.
+  assert.equal(generateCaptions(tl, new Map([[s.asset.id, transcript]]))[0]!.start, 0);
+});
+
 test("captions are undoable timeline edits; text edits re-spread word timings; overlaps and wrong tracks are refused", (t) => {
   const s = setup(t);
   let tl = s.apply([{ type: "captions.replace", trackId: s.cc, captions: [{ start: 0, duration: 30, text: "Every cup" }, { start: 30, duration: 30, text: "tells a story" }] }]);

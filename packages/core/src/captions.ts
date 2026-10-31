@@ -56,9 +56,12 @@ export function generateCaptions(
     const tr = transcripts.get(clip.assetId);
     if (!tr) continue;
     for (const seg of tr.segments) {
+      // With voice detection on, whisper.cpp places a segment correctly but its words ~0.25 s early
+      // (measured against the waveform). A word can't start before its segment, so slide them back.
+      const lead = Math.max(0, seg.startUs - (seg.words[0]?.startUs ?? seg.startUs));
       for (const w of seg.words) {
-        const s = microsToFrames(w.startUs, fps, "nearest");
-        const e = Math.max(s + 1, microsToFrames(w.endUs, fps, "nearest"));
+        const s = microsToFrames(w.startUs + lead, fps, "nearest");
+        const e = Math.max(s + 1, microsToFrames(w.endUs + lead, fps, "nearest"));
         // Keep words whose middle survives the trim.
         const mid = (s + e) / 2;
         if (mid < clip.sourceIn || mid >= clip.sourceIn + clip.duration) continue;
