@@ -484,6 +484,7 @@ export function App() {
             <EffectsPanel
               timeline={tl}
               clip={selectedClip}
+              playhead={playhead}
               onDraft={(props) => setDraft(props && selectedClip ? { clipId: selectedClip.id, props } : null)}
               onCommit={(props, label) => selectedClip && apply(label, [{ type: "clip.update", clipId: selectedClip.id, props }])}
             />

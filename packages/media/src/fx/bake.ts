@@ -158,7 +158,9 @@ function runEngine(
       o.signal?.removeEventListener("abort", abort);
       if (o.signal?.aborted) return reject(new Error("cancelled"));
       if (code === 0) return resolve();
-      const last = tail.split("\n").map((l) => l.trim()).filter(Boolean).slice(-2).join(" | ");
+      // The first Python exception is the real one; MediaPipe often adds a noisy one at interpreter exit.
+      const lines = tail.split("\n").map((l) => l.trim()).filter(Boolean);
+      const last = lines.find((l) => /^[A-Za-z_.]*(Error|Exception)\b.*:/.test(l) && !l.includes("'NoneType' object is not callable")) ?? lines.slice(-2).join(" | ");
       reject(new ReelForgeError("INTERNAL", `the effects engine failed (exit ${code}): ${last}`));
     });
   });
@@ -176,6 +178,7 @@ export class FxBaker {
   readonly #states = new Map<string, BakeState>();
   readonly #pending = new Map<string, Promise<string>>();
   readonly #specs = new Map<string, FxBakeSpec>();
+  readonly #owners = new Map<string, string>(); // queued key → project that asked
   #queue: string[] = [];
   #current: { key: string; ctl: AbortController } | null = null;
   #stopped = false;
@@ -193,7 +196,7 @@ export class FxBaker {
   }
 
   /** Queue a bake (or return the one in flight). Resolves with the baked file. */
-  ensure(spec: FxBakeSpec): Promise<string> {
+  ensure(spec: FxBakeSpec, owner = ""): Promise<string> {
     const done = this.state(spec.key);
     if (done?.state === "done") return Promise.resolve(done.path);
     const inflight = this.#pending.get(spec.key);
@@ -203,6 +206,7 @@ export class FxBaker {
     p.catch(() => {}); // callers that only queue don't await
     this.#pending.set(spec.key, p);
     this.#specs.set(spec.key, spec);
+    this.#owners.set(spec.key, owner);
     this.#states.set(spec.key, { state: "queued", progress: 0 });
     this.#queue.push(spec.key);
     void this.#pump();
@@ -233,9 +237,27 @@ export class FxBaker {
       this.#pending.delete(key);
       this.#resolvers.delete(key);
       this.#specs.delete(key);
+      this.#owners.delete(key);
       this.#current = null;
       void this.#pump();
     }
+  }
+
+  /**
+   * Drop bakes a project queued that its timeline no longer uses (an effect edited again before
+   * its bake started). The running one finishes: it may be wanted again after an undo.
+   */
+  retain(owner: string, keys: ReadonlySet<string>): void {
+    this.#queue = this.#queue.filter((key) => {
+      if (this.#owners.get(key) !== owner || keys.has(key)) return true;
+      this.#resolvers.get(key)?.reject(new Error("no longer needed"));
+      this.#pending.delete(key);
+      this.#resolvers.delete(key);
+      this.#specs.delete(key);
+      this.#owners.delete(key);
+      this.#states.delete(key);
+      return false;
+    });
   }
 
   /** Kill the running bake and drop the queue (server shutdown). */

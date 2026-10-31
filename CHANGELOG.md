@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **AI effects: 45 face-tracked effects** from the engine behind HELIX's Effects Studio (claude-video-effects
+  by Vibha Ramprakash, MIT): spotlight, a giant word behind your head, lean-in, LED sign, checklists, glass
+  widgets, liquid-glass graphs, phone fans and more. Add them in Effects → AI effects at the playhead, edit timing,
+  text, colour and options, or ask the AI Director ("kasih spotlight waktu aku bilang angka"): it now sees each
+  word's timing. Effects are stored in source time, so they stay on their words when a clip moves or is trimmed.
+  The engine bakes only the seconds an effect covers, in the background; the preview shows the clip without the
+  effect until its bake is ready (status at the bottom of the frame) and exports wait for it.
+- **Fix:** the AI Director's structured output only allowed the older clip settings, so blur, pans and other new
+  props it proposed were silently dropped. A test now keeps that schema equal to the clip settings.
 - **Effects tab.** One-click camera moves (zoom in/out, slow push, pan left/right, Ken Burns) and picture looks
   (blur, sharpen, vignette, black & white, sepia, film grain) per video or image clip, each with an amount slider and
   one undo step per change. Looks are plain clip settings (`blur`, `sharpen`, `vignette`, `grayscale`, `sepia`,

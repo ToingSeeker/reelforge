@@ -2148,3 +2148,132 @@ button:disabled {
 .rf-fx-row {
   grid-template-columns: 92px minmax(0, 1fr) 40px;
 }
+.rf-frame-badge-fx {
+  top: auto;
+  bottom: 10px;
+}
+.rf-frame-badge-fx.is-failed {
+  background: var(--rf-danger);
+  color: #fff;
+}
+
+/* AI effects (face-tracked, baked by the effects engine) */
+.rf-aifx-list,
+.rf-aifx-catalog {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+}
+.rf-aifx-item {
+  border: 1px solid var(--rf-border);
+  border-radius: var(--rf-radius);
+  background: var(--rf-surface);
+}
+.rf-aifx-item.is-open {
+  border-color: var(--rf-primary);
+}
+.rf-aifx-row,
+.rf-aifx-add {
+  display: grid;
+  width: 100%;
+  gap: 2px 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--rf-radius);
+  background: none;
+  color: var(--rf-text);
+  text-align: left;
+  cursor: pointer;
+}
+.rf-aifx-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+.rf-aifx-add {
+  border: 1px solid var(--rf-border);
+  background: var(--rf-surface);
+}
+.rf-aifx-add:hover:not(:disabled),
+.rf-aifx-row:hover {
+  background: var(--rf-surface-2);
+}
+.rf-aifx-add:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.rf-aifx-name {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rf-aifx-time {
+  color: var(--rf-text-3);
+  font-family: var(--rf-font-mono);
+  font-size: 11px;
+}
+.rf-aifx-about {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--rf-text-3);
+  font-size: 11px;
+  line-height: 1.35;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.rf-aifx-browse {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.rf-aifx-filter {
+  grid-template-columns: repeat(4, 1fr);
+  margin: 0;
+}
+.rf-aifx-catalog {
+  max-height: 320px;
+  overflow-y: auto;
+}
+.rf-aifx-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 8px 8px;
+}
+.rf-aifx-edit .rf-hint {
+  margin: 2px 0 4px;
+  font-size: 11px;
+}
+.rf-aifx-field {
+  grid-template-columns: 62px minmax(0, 1fr) auto;
+}
+.rf-aifx-images {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 120px;
+  overflow-y: auto;
+  margin: 4px 0;
+  padding: 4px 6px;
+  border: 1px solid var(--rf-border);
+  border-radius: var(--rf-radius-sm);
+  font-size: 11px;
+}
+.rf-aifx-images legend {
+  padding: 0 4px;
+  color: var(--rf-text-3);
+}
+.rf-aifx-remove {
+  align-self: flex-start;
+  color: var(--rf-danger);
+}
+.rf-btn-xs {
+  height: 22px;
+  padding: 0 6px;
+  font-size: 11px;
+}

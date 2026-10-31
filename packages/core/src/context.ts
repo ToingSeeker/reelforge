@@ -5,9 +5,11 @@
 import type { Analysis, BeatsResult, ScenesResult, Timeline, TranscriptResult } from "./schema.ts";
 import { trackLabels } from "./schema.ts";
 import { microsToFrames } from "./timebase.ts";
+import { wordLeadUs } from "./captions.ts";
 
 const MAX_BEATS = 600;
 const MAX_CUTS = 300;
+const MAX_WORDS = 1500;
 
 export interface ProjectContext {
   schema: "reelforge.project-context/1";
@@ -38,6 +40,19 @@ export interface ProjectContext {
 }
 
 const round = (x: number) => Math.round(x * 1000) / 1000;
+
+/** Word timings as compact "1.23 word" lines (segment-aligned, see captions.ts), capped. */
+function transcriptWords(tr: TranscriptResult, max: number): string {
+  const out: string[] = [];
+  for (const seg of tr.segments) {
+    const lead = wordLeadUs(seg);
+    for (const w of seg.words) {
+      if (out.length >= max) return out.join("\n") + "\n…";
+      if (w.text.trim()) out.push(`${Math.round((w.startUs + lead) / 10_000) / 100} ${w.text.trim()}`);
+    }
+  }
+  return out.join("\n");
+}
 
 export function buildProjectContext(t: Timeline, analyses: ReadonlyMap<string, Analysis[]>, operations: readonly string[]): ProjectContext {
   const { fps } = t.project.settings;
@@ -87,7 +102,13 @@ export function buildProjectContext(t: Timeline, analyses: ReadonlyMap<string, A
                   state: transcript.state,
                   stale: transcript.stale,
                   ...(tr
-                    ? { language: tr.language, text: tr.text, segments: tr.segments.map((s) => ({ startSeconds: usToSec(s.startUs), endSeconds: usToSec(s.endUs), text: s.text })) }
+                    ? {
+                        language: tr.language,
+                        text: tr.text,
+                        segments: tr.segments.map((s) => ({ startSeconds: usToSec(s.startUs), endSeconds: usToSec(s.endUs), text: s.text })),
+                        // "seconds word" pairs, for landing AI effects on a word; aligned like the captions are.
+                        words: transcriptWords(tr, MAX_WORDS),
+                      }
                     : {}),
                 },
               }

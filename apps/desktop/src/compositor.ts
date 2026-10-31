@@ -12,6 +12,8 @@ import { EffectsGL } from "./effects-gl.ts";
 
 export interface CompositorSources {
   mediaUrl: (assetId: string) => string;
+  /** A baked AI-effects video (plan.fxBakes key). */
+  fxUrl: (key: string) => string;
   fontUrl: (file: string) => string;
 }
 
@@ -34,6 +36,7 @@ export class Compositor {
   #fonts = new Map<CaptionFont, Font | Promise<void>>();
   #layouts = new Map<string, CaptionLayout>();
   #effects: EffectsGL | null | undefined; // undefined = not tried yet
+  #fxReady = new Set<string>(); // baked AI-effect keys we can play
   onFrame: ((frame: number) => void) | null = null;
   onEnded: (() => void) | null = null;
 
@@ -53,8 +56,8 @@ export class Compositor {
       this.#canvas.width = size.width;
       this.#canvas.height = size.height;
     }
-    // Drop media for clips that no longer exist.
-    const live = new Set(plan?.layers.flat().map((s) => s.clipId) ?? []);
+    // Drop media for clips (and baked effect stretches) that no longer exist.
+    const live = new Set(plan?.layers.flat().flatMap((s) => [s.clipId, ...(s.fx ?? []).map((p) => `${s.clipId}#${p.key}`)]) ?? []);
     for (const [id, v] of this.#videos) if (!live.has(id)) this.#release(id, v);
     if (plan) for (const seg of plan.audio) void this.#buffer(seg.assetId);
     if (this.#playing) {
@@ -69,6 +72,13 @@ export class Compositor {
     }
   }
 
+  /** Baked AI effects that are ready: their stretches play the baked video instead of the source. */
+  setFxReady(keys: ReadonlySet<string>) {
+    if (keys.size === this.#fxReady.size && [...keys].every((k) => this.#fxReady.has(k))) return;
+    this.#fxReady = new Set(keys);
+    if (!this.#playing) this.seek(this.#frame);
+  }
+
   /** Show exactly `frame` (paused). */
   seek(frame: number) {
     this.#frame = frame;
@@ -76,9 +86,10 @@ export class Compositor {
     const token = ++this.#drawToken;
     const waits: Promise<void>[] = [];
     for (const seg of this.#active(frame)) {
-      const v = this.#videoFor(seg);
-      if (!v) continue;
-      const t = this.#sourceTime(seg, frame);
+      const src = this.#pick(seg, frame);
+      const v = src && this.#video(src.id, src.url);
+      if (!v || !src) continue;
+      const t = src.time;
       if (Math.abs(v.currentTime - t) > 0.5 / this.fps || v.readyState < 2) {
         v.currentTime = t;
         waits.push(new Promise((r) => v.addEventListener("seeked", () => r(), { once: true })));
@@ -147,23 +158,33 @@ export class Compositor {
     return this.#plan ? activeLayers(this.#plan, frame) : [];
   }
 
-  #sourceTime(seg: PlanSegment, frame: number): number {
-    // Middle of the frame, so the decoder lands on it rather than the one before.
-    return (seg.renderSourceIn + (frame - seg.renderStart) + 0.5) / this.fps;
+  /**
+   * Which video element shows a video segment at a frame, and at what time: the baked AI-effects
+   * file inside a ready baked stretch, else the source proxy. Times aim at the middle of the frame,
+   * so the decoder lands on it rather than the one before.
+   */
+  #pick(seg: PlanSegment, frame: number): { id: string; url: string; time: number } | null {
+    if (this.#plan?.sources[seg.assetId]?.kind !== "video") return null;
+    const piece = seg.fx?.find((p) => p.from <= frame && frame < p.to && this.#fxReady.has(p.key));
+    if (piece) return { id: `${seg.clipId}#${piece.key}`, url: this.#sources.fxUrl(piece.key), time: (piece.bakeOffset + (frame - piece.from) + 0.5) / this.fps };
+    return this.#sourcePick(seg, frame);
   }
 
-  #videoFor(seg: PlanSegment): HTMLVideoElement | null {
-    if (this.#plan?.sources[seg.assetId]?.kind !== "video") return null;
-    let v = this.#videos.get(seg.clipId);
+  #sourcePick(seg: PlanSegment, frame: number) {
+    return { id: seg.clipId, url: this.#sources.mediaUrl(seg.assetId), time: (seg.renderSourceIn + (frame - seg.renderStart) + 0.5) / this.fps };
+  }
+
+  #video(id: string, url: string): HTMLVideoElement {
+    let v = this.#videos.get(id);
     if (!v) {
       v = document.createElement("video");
       v.crossOrigin = "anonymous";
       v.muted = true; // sound comes from WebAudio, which follows the plan's audio tracks
       v.playsInline = true;
       v.preload = "auto";
-      v.src = this.#sources.mediaUrl(seg.assetId);
+      v.src = url;
       v.addEventListener("loadeddata", () => !this.#playing && this.#draw(this.#frame));
-      this.#videos.set(seg.clipId, v);
+      this.#videos.set(id, v);
     }
     return v;
   }
@@ -194,15 +215,18 @@ export class Compositor {
     for (const layer of this.#plan.layers) {
       for (const seg of layer) {
         const near = seg.renderStart - PRELOAD_FRAMES <= frame && frame < seg.renderEnd + KEEP_FRAMES;
-        const existing = this.#videos.get(seg.clipId);
         if (near) {
-          const v = this.#videoFor(seg);
-          if (v && frame < seg.renderStart && v.paused && Math.abs(v.currentTime - this.#sourceTime(seg, seg.renderStart)) > 0.5 / this.fps) {
-            v.currentTime = this.#sourceTime(seg, seg.renderStart);
+          // The source from where the clip starts, and each ready baked stretch from where it starts.
+          const starts = [Math.max(frame, seg.renderStart), ...(seg.fx ?? []).filter((p) => this.#fxReady.has(p.key) && p.from > frame - KEEP_FRAMES).map((p) => p.from)];
+          for (const at of starts) {
+            const src = this.#pick(seg, at);
+            if (!src) continue;
+            const v = this.#video(src.id, src.url);
+            if (frame < at && v.paused && Math.abs(v.currentTime - src.time) > 0.5 / this.fps) v.currentTime = src.time;
           }
           if (this.#plan.sources[seg.assetId]?.kind === "image") this.#imageFor(seg.assetId);
-        } else if (existing) {
-          this.#release(seg.clipId, existing);
+        } else {
+          for (const [id, v] of this.#videos) if (id === seg.clipId || id.startsWith(`${seg.clipId}#`)) this.#release(id, v);
         }
       }
     }
@@ -211,12 +235,16 @@ export class Compositor {
   #syncVideos(frame: number) {
     const active = new Set<string>();
     for (const seg of this.#active(frame)) {
-      const v = this.#videoFor(seg);
-      if (!v) continue;
-      active.add(seg.clipId);
-      const t = this.#sourceTime(seg, frame);
-      if (Math.abs(v.currentTime - t) > DRIFT_FRAMES / this.fps) v.currentTime = t;
-      if (v.paused) void v.play().catch(() => {});
+      const src = this.#pick(seg, frame);
+      if (!src) continue;
+      // Inside a baked stretch the source keeps playing too, so it is ready the moment the stretch ends.
+      const both = src.id === seg.clipId ? [src] : [src, this.#sourcePick(seg, frame)];
+      for (const s of both) {
+        const v = this.#video(s.id, s.url);
+        active.add(s.id);
+        if (Math.abs(v.currentTime - s.time) > DRIFT_FRAMES / this.fps) v.currentTime = s.time;
+        if (v.paused) void v.play().catch(() => {});
+      }
     }
     for (const [id, v] of this.#videos) if (!active.has(id) && !v.paused) v.pause();
     if (frame % 10 === 0) this.#prepare(frame);
@@ -241,7 +269,13 @@ export class Compositor {
       let sw = 0;
       let sh = 0;
       if (kind === "video") {
-        const v = this.#videos.get(seg.clipId);
+        const pick = this.#pick(seg, frame);
+        let v = pick ? this.#videos.get(pick.id) : undefined;
+        // Whichever of the source and the baked stretch is still loading, show the other rather than a gap.
+        if (pick && (!v || v.readyState < 2)) {
+          const other = pick.id !== seg.clipId ? this.#videos.get(seg.clipId) : [...this.#videos.entries()].find(([id]) => id.startsWith(`${seg.clipId}#`))?.[1];
+          if (other && other.readyState >= 2) v = other;
+        }
         if (v && v.readyState >= 2) [src, sw, sh] = [v, v.videoWidth, v.videoHeight];
       } else if (kind === "image") {
         const img = this.#imageFor(seg.assetId);

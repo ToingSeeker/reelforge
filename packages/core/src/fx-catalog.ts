@@ -122,6 +122,99 @@ export const FX_ALIASES: Readonly<Record<string, string>> = {
   "widgets": "glass-widgets"
 };
 
+/**
+ * Options each effect reads as numbers (fx.py calls float()/int() on them): anything else makes
+ * the engine fail mid-bake, so the schema refuses it up front. Read off fx.py; a test keeps it so.
+ */
+export const FX_NUMERIC_OPTIONS: Readonly<Record<string, readonly string[]>> = {
+  "noise": [
+    "size"
+  ],
+  "locked-on": [
+    "zoom"
+  ],
+  "orbit": [
+    "count",
+    "size",
+    "speed"
+  ],
+  "lean-in": [
+    "speed",
+    "zoom"
+  ],
+  "spotlight": [
+    "push"
+  ],
+  "pause-point": [
+    "label_x"
+  ],
+  "shortcut-rain": [
+    "count"
+  ],
+  "reject-stamp": [
+    "angle"
+  ],
+  "countdown-flip": [
+    "from"
+  ],
+  "rabbit-hole": [
+    "ratio",
+    "speed",
+    "spin"
+  ],
+  "scribble": [
+    "dark"
+  ],
+  "split-headline": [
+    "height",
+    "push"
+  ],
+  "headline-box": [
+    "zoom"
+  ],
+  "profile-wall": [
+    "count"
+  ],
+  "broll-split": [
+    "pick"
+  ],
+  "dot-reveal": [
+    "cell"
+  ],
+  "headline-wall": [
+    "count",
+    "gap"
+  ],
+  "checklist": [
+    "dark"
+  ],
+  "carousel-spin": [
+    "count",
+    "size",
+    "turns"
+  ],
+  "apple-toggles": [
+    "overlap",
+    "zoom"
+  ],
+  "led-sign": [
+    "push"
+  ],
+  "slow-push": [
+    "blur",
+    "lines_y",
+    "push",
+    "right_y",
+    "zoom"
+  ],
+  "over-the-shoulder-zoom": [
+    "zoom"
+  ],
+  "messages": [
+    "y"
+  ]
+};
+
 export function fxInfo(name: string): FxInfo | undefined {
   const n = name.toLowerCase().replace(/^\//, "");
   return FX_CATALOG.find((f) => f.fx === (FX_ALIASES[n] ?? n));

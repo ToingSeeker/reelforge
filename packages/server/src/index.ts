@@ -527,7 +527,11 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       method: "POST",
       pattern: re(`/v1/projects/${ID}/fx/bake`),
       handle: ({ res, params: [id] }) => {
-        if (fxAvailable().ok) for (const spec of fxBakesOf(id!)) void fxBaker.ensure(spec);
+        if (fxAvailable().ok) {
+          const specs = fxBakesOf(id!);
+          fxBaker.retain(id!, new Set(specs.map((b) => b.key)));
+          for (const spec of specs) void fxBaker.ensure(spec, id!);
+        }
         return send(res, 202, fxStatus(id!));
       },
     },

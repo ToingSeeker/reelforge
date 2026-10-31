@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Timeline } from "@reelforge/core/schema";
 import { aspectRatioLabel } from "@reelforge/core/schema";
-import { buildRenderPlan } from "@reelforge/core/render-plan";
+import { buildRenderPlan, type RenderPlan } from "@reelforge/core/render-plan";
 import { Compositor } from "../compositor.ts";
 import { formatClock } from "@reelforge/core/timebase";
-import type { Client } from "../api.ts";
+import type { Client, FxStatus } from "../api.ts";
 import { useThumbnail } from "../editor.ts";
 import type { PreviewState } from "../render.ts";
 import { Icon } from "../icons.tsx";
@@ -53,7 +53,11 @@ export function Preview(props: Props) {
 
   useEffect(() => {
     if (!live || !canvas.current || !client || !projectId) return;
-    const c = new Compositor(canvas.current, { mediaUrl: (assetId) => client.mediaUrl(projectId, assetId), fontUrl: (file) => client.fontUrl(file) });
+    const c = new Compositor(canvas.current, {
+      mediaUrl: (assetId) => client.mediaUrl(projectId, assetId),
+      fxUrl: (key) => client.fxUrl(projectId, key),
+      fontUrl: (file) => client.fontUrl(file),
+    });
     comp.current = c;
     return () => {
       c.dispose();
@@ -64,6 +68,11 @@ export function Preview(props: Props) {
   useEffect(() => {
     comp.current?.setPlan(plan.plan, size);
   }, [plan, size, live, client, projectId]);
+
+  const fx = useFxBakes(client, projectId, plan.plan);
+  useEffect(() => {
+    comp.current?.setFxReady(fx.ready);
+  }, [fx.ready, live, plan]);
 
   useEffect(() => {
     const c = comp.current;
@@ -180,6 +189,11 @@ export function Preview(props: Props) {
           ) : null}
           <div className="rf-safe-area" aria-hidden="true" />
           {badge && <span className="rf-frame-badge" role="status">{badge}</span>}
+          {live && fx.note && (
+            <span className={`rf-frame-badge rf-frame-badge-fx${fx.failed ? " is-failed" : ""}`} role="status" title={fx.detail ?? undefined}>
+              {fx.note}
+            </span>
+          )}
           {!live && !preview.url && !top && (
             <div className="rf-frame-empty">
               <Icon name="play" size={28} />
@@ -251,4 +265,48 @@ export function Preview(props: Props) {
       </div>
     </section>
   );
+}
+
+/**
+ * AI effects in the plan are baked by the engine; ask for the missing ones and poll until they are
+ * ready. Until then the preview shows the clip without them (the export waits for the bake itself).
+ */
+function useFxBakes(client: Client | null, projectId: string | null, plan: RenderPlan | null) {
+  const keys = useMemo(() => (plan?.fxBakes ?? []).map((b) => b.key).sort().join(","), [plan]);
+  const [status, setStatus] = useState<FxStatus | null>(null);
+  useEffect(() => {
+    setStatus(null);
+    if (!client || !projectId || !keys) return;
+    let stop = false;
+    let timer = 0;
+    const poll = async (first: boolean) => {
+      try {
+        const st = first ? await client.bakeFx(projectId) : await client.fxStatus(projectId);
+        if (stop) return;
+        setStatus(st);
+        if (st.engine.ok && st.bakes.some((b) => b.state === "queued" || b.state === "running" || b.state === "missing")) timer = window.setTimeout(() => void poll(false), 1500);
+      } catch {
+        if (!stop) timer = window.setTimeout(() => void poll(false), 4000);
+      }
+    };
+    void poll(true);
+    return () => {
+      stop = true;
+      clearTimeout(timer);
+    };
+  }, [client, projectId, keys]);
+  return useMemo(() => {
+    const wanted = new Set(keys ? keys.split(",") : []);
+    const bakes = (status?.bakes ?? []).filter((b) => wanted.has(b.key));
+    const ready = new Set(bakes.filter((b) => b.state === "done").map((b) => b.key));
+    if (!wanted.size || !status) return { ready, note: null, detail: null, failed: false };
+    if (!status.engine.ok) return { ready, note: "AI effects unavailable", detail: status.engine.reason, failed: true };
+    const failed = bakes.find((b) => b.state === "failed");
+    if (failed && failed.state === "failed") return { ready, note: "AI effect failed to bake", detail: failed.error, failed: true };
+    const left = bakes.filter((b) => b.state !== "done");
+    if (!left.length) return { ready, note: null, detail: null, failed: false };
+    const running = left.find((b) => b.state === "running");
+    const pct = running && running.state === "running" ? ` ${Math.round(running.progress * 100)}%` : "";
+    return { ready, note: `Baking AI effects${pct} · ${bakes.length - left.length}/${bakes.length}`, detail: null, failed: false };
+  }, [status, keys]);
 }

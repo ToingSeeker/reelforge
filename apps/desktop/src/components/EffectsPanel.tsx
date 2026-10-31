@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import type { Clip, ClipProps, ClipPropsPatch, Timeline } from "@reelforge/core/schema";
 import { resolveClipProps } from "@reelforge/core/schema";
 import { MOTION_PRESETS, motionPatch, motionPresetOf, PICTURE_EFFECTS, type PictureEffect } from "@reelforge/core/effects";
+import { AiEffects } from "./AiEffects.tsx";
 
 interface Props {
   timeline: Timeline;
   clip: Clip | null;
+  playhead: number;
   /** Live, uncommitted values while a slider is dragged (drives the live preview). */
   onDraft: (patch: ClipPropsPatch | null) => void;
   /** One undo step per finished change. */
@@ -13,7 +15,7 @@ interface Props {
 }
 
 /** Motion presets and picture effects for the selected video or image clip. */
-export function EffectsPanel({ timeline, clip, onDraft, onCommit }: Props) {
+export function EffectsPanel({ timeline, clip, playhead, onDraft, onCommit }: Props) {
   const track = clip ? timeline.tracks.find((t) => t.id === clip.trackId) : undefined;
   const visual = !!track && (track.kind === "video" || track.kind === "overlay");
   const committed = resolveClipProps(clip?.props);
@@ -134,6 +136,10 @@ export function EffectsPanel({ timeline, clip, onDraft, onCommit }: Props) {
           ))}
           <p className="rf-hint">Effects apply to this clip only, in the preview and in the export.</p>
         </section>
+
+        {timeline.assets.find((a) => a.id === clip.assetId)?.kind === "video" && (
+          <AiEffects timeline={timeline} clip={clip} playhead={playhead} locked={locked} onCommit={(aiEffects, label) => commit({ aiEffects }, label)} />
+        )}
       </div>
     </section>
   );

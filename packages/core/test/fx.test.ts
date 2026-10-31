@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AiFxSchema, ClipPropsPatchSchema, FX_CATALOG, FX_ENGINE_VERSION, fxBakeSize, fxInfo, planClipFx, sparseClipProps, stableHash } from "../src/index.ts";
+import { AiFxSchema, ClipPropsPatchSchema, FX_CATALOG, FX_NUMERIC_OPTIONS, FX_ENGINE_VERSION, fxBakeSize, fxInfo, planClipFx, sparseClipProps, stableHash } from "../src/index.ts";
 
 const fps = { num: 30, den: 1 };
 const asset = { id: "a1", sourcePath: "/m/talk.mp4", sizeBytes: 1000, durationFrames: 900, width: 1080, height: 1920 };
@@ -12,6 +12,14 @@ test("the catalogue lists exactly the effects fx.py defines", () => {
   const defined = [...src.matchAll(/@effect\('([^']+)'/g)].map((m) => m[1]);
   assert.equal(FX_CATALOG.length, 45);
   assert.deepEqual([...FX_CATALOG.map((f) => f.fx)].sort(), [...defined].sort());
+  // Numeric options, read the same way the engine reads them.
+  const parts = src.split(/\n@effect\('([^']+)'/);
+  const numeric: Record<string, string[]> = {};
+  for (let i = 1; i < parts.length; i += 2) {
+    const keys = [...new Set([...parts[i + 1]!.matchAll(/(?:float|int)\(\s*e\.o\.get\('([a-z_]+)'/g)].map((m) => m[1]!))].sort();
+    if (keys.length) numeric[parts[i]!] = keys;
+  }
+  assert.deepEqual(FX_NUMERIC_OPTIONS, numeric);
   assert.equal(fxInfo("glitter")?.fx, "spotlight");
   assert.equal(fxInfo("/stamp")?.fx, "reject-stamp");
   assert.match(FX_ENGINE_VERSION, /c97d01b/);
@@ -25,6 +33,8 @@ test("AI effects validate: known effect, end after start, no reserved or unbound
   assert.ok(!AiFxSchema.safeParse({ ...ok, opts: { images: "/etc" } }).success, "images only as asset ids");
   assert.ok(!AiFxSchema.safeParse({ ...ok, images: ["/Users/me/Pictures"] }).success);
   assert.ok(!AiFxSchema.safeParse({ ...ok, text: "a\u0000b" }).success);
+  assert.ok(!AiFxSchema.safeParse({ fx: "lean-in", start: 0, end: 60, opts: { speed: "fast" } }).success, "numeric options must be numbers");
+  assert.ok(AiFxSchema.safeParse({ fx: "lean-in", start: 0, end: 60, opts: { speed: 0.3 } }).success);
   assert.ok(ClipPropsPatchSchema.safeParse({ aiEffects: [ok] }).success);
   assert.deepEqual(sparseClipProps({ aiEffects: [] }), {}, "no effects is the default and isn't stored");
 });

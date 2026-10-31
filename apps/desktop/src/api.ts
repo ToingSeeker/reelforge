@@ -5,6 +5,12 @@ import type { ProjectContext } from "@reelforge/core/context";
 // local REST sidecar that the Rust shell starts (or, in a plain browser during
 // development, one you start yourself with `reelforge serve`).
 
+/** AI-effect bakes the timeline needs (GET/POST /v1/projects/:id/fx). */
+export interface FxStatus {
+  engine: { ok: true } | { ok: false; reason: string };
+  bakes: ({ key: string; state: "done" | "missing" | "queued" } | { key: string; state: "running"; progress: number } | { key: string; state: "failed"; error: string })[];
+}
+
 export interface ApiInfo {
   url: string;
   token: string;
@@ -63,6 +69,7 @@ export function createClient(info: ApiInfo) {
   return {
     /** Streamable URLs for media elements (which can't send an Authorization header). */
     mediaUrl: (id: string, assetId: string) => `${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/media?${q}`,
+    fxUrl: (id: string, key: string) => `${info.url}/v1/projects/${encodeURIComponent(id)}/fx/${encodeURIComponent(key)}/media?${q}`,
     thumbnailUrl: (id: string, assetId: string) => `${info.url}/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/thumbnail?${q}`,
     outputUrl: (jobId: string) => `${info.url}/v1/jobs/${encodeURIComponent(jobId)}/output?${q}`,
     fontUrl: (file: string) => `${info.url}/v1/fonts/${encodeURIComponent(file)}?${q}`,
@@ -120,6 +127,8 @@ export function createClient(info: ApiInfo) {
       ),
     relink: (id: string, assetId: string, path: string) =>
       request<{ asset: Asset }>("POST", `/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/relink`, { path }).then((r) => r.asset),
+    fxStatus: (id: string) => request<FxStatus>("GET", `/v1/projects/${encodeURIComponent(id)}/fx`),
+    bakeFx: (id: string) => request<FxStatus>("POST", `/v1/projects/${encodeURIComponent(id)}/fx/bake`),
     previewJob: (id: string) => request<{ job: RenderJob }>("POST", `/v1/projects/${encodeURIComponent(id)}/preview-jobs`).then((r) => r.job),
     exportJob: (id: string, outputPath: string) =>
       request<{ job: RenderJob }>("POST", `/v1/projects/${encodeURIComponent(id)}/render-jobs`, { outputPath }).then((r) => r.job),

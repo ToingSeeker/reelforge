@@ -2,7 +2,7 @@
 // formats, which structured-output engines handle unevenly); the engine then
 // validates every operation against the real schema and by a dry run.
 
-import { CAPTION_FONTS, TimelineOpSchema, type TimelineOp } from "@reelforge/core";
+import { CAPTION_FONTS, FX_NAMES, TimelineOpSchema, type TimelineOp } from "@reelforge/core";
 import { z } from "zod";
 
 const str = { type: "string" };
@@ -13,12 +13,24 @@ const obj = (properties: Record<string, unknown>, required: string[]) => ({ type
 const op = (type: string, properties: Record<string, unknown>, required: string[]) =>
   obj({ type: { type: "string", enum: [type] }, why: str, ...properties }, ["type", "why", ...required]);
 
+// Structured-output engines want closed objects, so an effect's free-form options travel as
+// [{key, value}] pairs and become the opts record in parseModelOutput.
+const AIFX = obj(
+  {
+    fx: { type: "string", enum: FX_NAMES },
+    start: int, end: int, text: str, color: str,
+    opts: { type: "array", items: obj({ key: str, value: str }, ["key", "value"]) },
+  },
+  ["fx", "start", "end"],
+);
 const PROPS = obj(
   {
     fit: { type: "string", enum: ["cover", "contain"] },
-    scale: num, scaleEnd: num, x: num, y: num, rotation: num, opacity: num,
+    scale: num, scaleEnd: num, x: num, y: num, xEnd: num, yEnd: num, rotation: num, opacity: num,
     cropLeft: num, cropTop: num, cropRight: num, cropBottom: num,
     fadeIn: int, fadeOut: int, transitionIn: int, gainDb: num,
+    blur: num, sharpen: num, vignette: num, grayscale: num, sepia: num, grain: num,
+    aiEffects: { type: "array", items: AIFX },
   },
   [],
 );
@@ -71,6 +83,25 @@ export interface ParsedPlan {
   errors: string[];
 }
 
+/** AI-effect options written as [{key, value}] pairs → the {key: value} record the schema expects (numbers as numbers). */
+function optsPairs(props: unknown): unknown {
+  const p = props as { aiEffects?: unknown } | null;
+  if (!p || typeof p !== "object" || !Array.isArray(p.aiEffects)) return props;
+  return {
+    ...p,
+    aiEffects: p.aiEffects.map((e: unknown) => {
+      const fx = e as { opts?: unknown } | null;
+      if (!fx || typeof fx !== "object" || !Array.isArray(fx.opts)) return e;
+      const opts: Record<string, unknown> = {};
+      for (const pair of fx.opts as { key?: unknown; value?: unknown }[]) {
+        if (typeof pair?.key !== "string") continue;
+        opts[pair.key] = typeof pair.value === "string" && /^-?\d+(\.\d+)?$/.test(pair.value) ? Number(pair.value) : pair.value;
+      }
+      return { ...fx, opts };
+    }),
+  };
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
@@ -105,7 +136,7 @@ export function parseModelOutput(text: string, newId: () => string = () => crypt
     const { why, ...rest } = o as Record<string, unknown> & { why?: unknown };
     const mapped: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(rest)) {
-      mapped[k] = idFields.has(k) ? mapId(v) : listFields.has(k) && Array.isArray(v) ? v.map(mapId) : v;
+      mapped[k] = idFields.has(k) ? mapId(v) : listFields.has(k) && Array.isArray(v) ? v.map(mapId) : k === "props" ? optsPairs(v) : v;
     }
     const r = TimelineOpSchema.safeParse(mapped);
     if (!r.success) {

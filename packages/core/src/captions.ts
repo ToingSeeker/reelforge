@@ -34,6 +34,15 @@ interface TimedWord {
  * trim are dropped, then words are grouped into short captions, breaking at
  * sentence punctuation, long pauses and the word/character limits.
  */
+/**
+ * With voice detection on, whisper.cpp places a segment correctly but its words ~0.25 s early
+ * (measured against the waveform). A word can't start before its segment: this is how far to
+ * slide a segment's words back (0 when they already start inside it).
+ */
+export function wordLeadUs(seg: TranscriptResult["segments"][number]): number {
+  return Math.max(0, seg.startUs - (seg.words[0]?.startUs ?? seg.startUs));
+}
+
 /** Tracks whose clips are heard: unmuted audio tracks and unmuted video/overlay tracks (videos play their own sound). */
 export function soundTracks(timeline: Pick<Timeline, "tracks">) {
   return timeline.tracks.filter((t) => t.kind !== "caption" && !t.muted);
@@ -56,9 +65,7 @@ export function generateCaptions(
     const tr = transcripts.get(clip.assetId);
     if (!tr) continue;
     for (const seg of tr.segments) {
-      // With voice detection on, whisper.cpp places a segment correctly but its words ~0.25 s early
-      // (measured against the waveform). A word can't start before its segment, so slide them back.
-      const lead = Math.max(0, seg.startUs - (seg.words[0]?.startUs ?? seg.startUs));
+      const lead = wordLeadUs(seg);
       for (const w of seg.words) {
         const s = microsToFrames(w.startUs + lead, fps, "nearest");
         const e = Math.max(s + 1, microsToFrames(w.endUs + lead, fps, "nearest"));

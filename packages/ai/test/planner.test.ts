@@ -198,3 +198,32 @@ test("Ollama on another host counts as external and needs consent", async (t) =>
   await assert.rejects(propose(s.db, s.p.id, new OllamaProvider(), { instruction: "x", model: "m" }), (e: unknown) => e instanceof ReelForgeError && e.code === "CONSENT_REQUIRED");
 });
 
+
+test("model output: new clip props and AI effects survive parsing; opts pairs become a record", async () => {
+  const { parseModelOutput, MODEL_OUTPUT_SCHEMA } = await import("../src/index.ts");
+  const clipId = "57f54d86-a887-43fb-8adc-dff5b5d1b95d";
+  const plan = parseModelOutput(
+    JSON.stringify({
+      summary: "s",
+      warnings: [],
+      operations: [
+        { type: "clip.update", why: "w", clipId, props: { blur: 0.3, xEnd: -0.1, aiEffects: [{ fx: "lean-in", start: 300, end: 360, opts: [{ key: "zoom", value: "1.6" }] }, { fx: "backdrop-word", start: 30, end: 90, text: "RAHASIA", opts: [{ key: "font", value: "serif" }] }] } },
+      ],
+    }),
+  );
+  assert.deepEqual(plan.errors, []);
+  const op = plan.operations[0] as { props: Record<string, unknown> };
+  assert.equal(op.props.blur, 0.3);
+  assert.deepEqual(op.props.aiEffects, [
+    { fx: "lean-in", start: 300, end: 360, opts: { zoom: 1.6 } },
+    { fx: "backdrop-word", start: 30, end: 90, text: "RAHASIA", opts: { font: "serif" } },
+  ]);
+  // A word where the engine wants a number goes back to the model instead of failing the bake later.
+  const bad = parseModelOutput(JSON.stringify({ summary: "", warnings: [], operations: [{ type: "clip.update", why: "", clipId, props: { aiEffects: [{ fx: "lean-in", start: 0, end: 60, opts: [{ key: "speed", value: "fast" }] }] } }] }));
+  assert.match(bad.errors.join(), /speed.*must be a number/);
+  // The structured-output schema offers every clip prop the engine takes, so engines that enforce it can't drop them.
+  const ops = (MODEL_OUTPUT_SCHEMA.properties as { operations: { items: { anyOf: { properties: { props?: { properties: Record<string, unknown> } } }[] } } }).operations;
+  const props = ops.items.anyOf[1]!.properties.props!.properties;
+  const { DEFAULT_CLIP_PROPS } = await import("@reelforge/core");
+  assert.deepEqual(Object.keys(props).sort(), Object.keys(DEFAULT_CLIP_PROPS).sort());
+});
