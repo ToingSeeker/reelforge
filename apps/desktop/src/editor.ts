@@ -67,6 +67,11 @@ export function useEditor(client: Client | null, projectId: string | null, notif
     (label: string, ops: TimelineOp[]) => run(label, (t) => client!.apply(t.project.id, t.project.revision, ops)),
     [client, run],
   );
+  /** Like apply, but the operations are built from the timeline as it is when the edit runs (throw to cancel with a message). */
+  const applyBuilt = useCallback(
+    (label: string, build: (t: Timeline) => TimelineOp[]) => run(label, (t) => client!.apply(t.project.id, t.project.revision, build(t))),
+    [client, run],
+  );
   const undo = useCallback(() => run("Undo", (t) => client!.undo(t.project.id, t.project.revision)), [client, run]);
   const redo = useCallback(() => run("Redo", (t) => client!.redo(t.project.id, t.project.revision)), [client, run]);
 
@@ -110,7 +115,7 @@ export function useEditor(client: Client | null, projectId: string | null, notif
     [reload],
   );
 
-  return { timeline, busy, apply, undo, redo, importPaths, relink, reload, syncRevision };
+  return { timeline, busy, apply, applyBuilt, undo, redo, importPaths, relink, reload, syncRevision };
 }
 
 export type Editor = ReturnType<typeof useEditor>;

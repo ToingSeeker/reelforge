@@ -10,3 +10,4 @@ export { detectBeats, beatsFromSamples, onsetEnvelope, estimateTempo, trackBeats
 export { transcribe, extractSpeechAudio, MAX_TRANSCRIPT_SECONDS, interpretWhisper, whisperModelPath, vadModelPath, WHISPER_MODEL, VAD_MODEL } from "./analysis/transcribe.ts";
 export { rasterizeCaption, prepareCaptionOverlays, encodePng, loadFont, fontsDir } from "./captions.ts";
 export { FxBaker, bakeFx, bakePath, fxAvailable, fxEngineDir, fxPython, type BakeState } from "./fx/bake.ts";
+export { MotionRenderer, renderMotion, motionAvailable, motionDir, motionOutputPath, type MotionState } from "./motion.ts";

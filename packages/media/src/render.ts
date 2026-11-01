@@ -166,7 +166,8 @@ export class RenderRunner {
       const sources = Object.values(plan.sources);
       let done = 0;
       for (const s of sources) {
-        inputs[s.assetId] = job.settings.useProxies && s.kind === "video" ? await ensureProxy(this.#db, this.#cacheDir, s.assetId, s.path) : s.path;
+        // Alpha sources always read the original: their proxy is packed for the browser, not for FFmpeg.
+        inputs[s.assetId] = job.settings.useProxies && s.kind === "video" && !s.alpha ? await ensureProxy(this.#db, this.#cacheDir, s.assetId, s.path) : s.path;
         if (state.cancelled || !this.#jobs.advance(jobId, "analyzing", (++done / sources.length) * 0.05)) return;
       }
 

@@ -11,7 +11,11 @@ import {
   buildRenderPlan,
   CAPTION_FONTS,
   captionsToSrt,
+  CreateMotionInputSchema,
   isReelForgeError,
+  MotionGraphicStore,
+  motionRenderSpec,
+  parse,
   JobStore,
   OPERATION_TYPES,
   ProposalStore,
@@ -39,11 +43,13 @@ import {
   fxAvailable,
   FxBaker,
   importMedia,
+  motionAvailable,
+  MotionRenderer,
   relinkMedia,
   RenderRunner,
   retryRenderJob,
 } from "@reelforge/media";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 // Local REST API (PRD §15). Loopback only, bearer token always required,
 // Host/Origin checked so a web page can't reach it via DNS rebinding.
@@ -57,6 +63,8 @@ export interface ApiServerOptions {
   allowedOrigins?: readonly string[];
   /** Where derived files (thumbnails) are cached. */
   cacheDir: string;
+  /** Files the engine makes that projects reference (motion graphics); not disposable. Default: next to the cache. */
+  generatedDir?: string;
   /** Optional access log (method, path, status, origin). Never logs headers or bodies. */
   log?: (line: string) => void;
 }
@@ -209,6 +217,22 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       return st?.state === "done" ? { key: b.key, state: "done" as const } : { key: b.key, ...(st ?? { state: "missing" as const }) };
     }),
   });
+  // Motion graphics: one Remotion render at a time; finished files are imported as assets once.
+  const motion = new MotionRenderer({ generatedDir: opts.generatedDir ?? join(dirname(opts.cacheDir), "generated"), cacheDir: opts.cacheDir });
+  const motionGraphics = new MotionGraphicStore(opts.db);
+  const motionImports = new Map<string, Promise<string>>(); // `${projectId}:${key}` → asset id
+  const motionErrors = new Map<string, string>(); // same slots: why the last attempt failed
+  const motionStatus = (projectId: string, key: string) => {
+    const st = motion.state(key);
+    const assetId = motionGraphics.list(projectId).find((g) => g.renderKey === key)?.assetId;
+    if (assetId) return { key, state: "done" as const, asset: assets.get(projectId, assetId) };
+    const error = motionErrors.get(`${projectId}:${key}`);
+    if (error && !motionImports.has(`${projectId}:${key}`)) return { key, state: "failed" as const, error };
+    if (!st) return { key, state: "missing" as const };
+    // The file exists but its import hasn't landed yet: still working, from the caller's view.
+    if (st.state === "done") return { key, state: "running" as const, progress: 1 };
+    return { key, ...st };
+  };
   const proposals = new ProposalStore(opts.db);
   const body = (req: IncomingMessage) => readJson(req) as Promise<never>;
   const pathsOf = (b: unknown): string[] => {
@@ -536,6 +560,45 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       },
     },
     {
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/motion`),
+      handle: ({ res, params: [id] }) => send(res, 200, { engine: motionAvailable(), graphics: motionGraphics.list(id!) }),
+    },
+    {
+      // Render a motion graphic and import it as an asset; poll GET …/motion/:key until it's done.
+      method: "POST",
+      pattern: re(`/v1/projects/${ID}/motion`),
+      handle: async ({ req, res, params: [id], actor }) => {
+        const input = parse(CreateMotionInputSchema, await readJson(req));
+        const project = projects.get(id!);
+        const avail = motionAvailable();
+        if (!avail.ok) throw new ReelForgeError("UNAVAILABLE", avail.reason);
+        const spec = motionRenderSpec(input, project.settings);
+        const slot = `${project.id}:${spec.key}`;
+        if (!motionImports.has(slot) && !motionGraphics.list(project.id).some((g) => g.renderKey === spec.key)) {
+          const job = motion.ensure(spec).then(async (path) => {
+            const result = await importMedia(opts.db, project.id, [path], actor);
+            const asset = result.imported[0] ?? result.existing[0];
+            if (!asset) throw new Error(result.failed[0]?.error.message ?? "could not import the rendered graphic");
+            motionGraphics.record(project.id, asset.id, spec, input.durationFrames);
+            return asset.id;
+          });
+          job.catch((e: unknown) => motionErrors.set(slot, e instanceof Error ? e.message : String(e))).finally(() => motionImports.delete(slot));
+          motionErrors.delete(slot);
+          motionImports.set(slot, job);
+        }
+        return send(res, 202, { motion: motionStatus(project.id, spec.key) });
+      },
+    },
+    {
+      method: "GET",
+      pattern: re(`/v1/projects/${ID}/motion/${ID}`),
+      handle: ({ res, params: [id, key] }) => {
+        if (!/^[0-9a-f]{16}$/.test(key!)) throw new ReelForgeError("VALIDATION_ERROR", "invalid motion key");
+        return send(res, 200, { motion: motionStatus(projects.get(id!).id, key!) });
+      },
+    },
+    {
       // A baked AI-effects video, only for a bake the project's timeline uses.
       method: "GET",
       media: true,
@@ -559,8 +622,8 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
           const ext = asset.sourcePath.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav";
           return sendFile(req, res, asset.sourcePath, ext);
         }
-        const path = await ensureProxy(opts.db, opts.cacheDir, asset.id, asset.sourcePath, asset.kind);
-        return sendFile(req, res, path, asset.kind === "image" ? "image/jpeg" : "video/mp4");
+        const path = await ensureProxy(opts.db, opts.cacheDir, asset.id, asset.sourcePath, asset.kind, asset.hasAlpha);
+        return sendFile(req, res, path, asset.kind === "image" ? (path.endsWith(".png") ? "image/png" : "image/jpeg") : "video/mp4");
       },
     },
     {
@@ -648,6 +711,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
           new Promise((r, j) => {
             analysisRunner.stop();
             fxBaker.stop();
+            motion.stop();
             const renders = runner.stop();
             server.close((err) => (err ? j(err) : renders.then(() => r())));
             // close() already drops idle sockets; also end in-flight ones so shutdown can't hang.

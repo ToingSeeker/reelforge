@@ -2277,3 +2277,71 @@ button:disabled {
   padding: 0 6px;
   font-size: 11px;
 }
+
+/* Templates panel: motion graphics (Remotion). */
+.rf-motion-stage {
+  width: 100%;
+  margin: 0 auto 8px;
+  overflow: hidden;
+  border: 1px solid var(--rf-border-strong);
+  border-radius: var(--rf-radius-lg);
+  /* Checkerboard: where the graphic is transparent the footage will show. */
+  background-color: #2a2d33;
+  background-image:
+    linear-gradient(45deg, #3a3e46 25%, transparent 25%),
+    linear-gradient(-45deg, #3a3e46 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #3a3e46 75%),
+    linear-gradient(-45deg, transparent 75%, #3a3e46 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+.rf-motion-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.rf-motion-color {
+  width: 100%;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--rf-border-strong);
+  border-radius: var(--rf-radius);
+  background: var(--rf-bg);
+  cursor: pointer;
+}
+.rf-motion-warn {
+  color: var(--rf-danger, #e5484d);
+}
+.rf-motion-bar {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--rf-border-strong);
+}
+.rf-motion-bar > div {
+  height: 100%;
+  background: var(--rf-primary);
+  transition: width 0.3s ease;
+}
+.rf-motion-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rf-motion-list li {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: space-between;
+}
+.rf-motion-list li > .rf-btn-ghost {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -1,5 +1,4 @@
 const RAIL_COPY: Record<string, { title: string; milestone: string }> = {
-  templates: { title: "Templates", milestone: "Automation templates · M5" },
   transitions: { title: "Transitions", milestone: "Basic dissolve · after M2" },
   color: { title: "Color", milestone: "Adjustments & LUTs · after M2" },
 };

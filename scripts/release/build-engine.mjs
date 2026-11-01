@@ -5,6 +5,8 @@
 //   fonts/         the OFL caption fonts
 //   fx/            the AI effects engine (packages/fx-engine) with its own Python: a standalone
 //                  CPython build (SHA-256 verified) and the pinned wheels (pip --require-hashes)
+//   motion/        the motion-graphics renderer: Remotion, a prebuilt bundle, Chrome Headless Shell
+//                  (build-motion.mjs)
 // Usage: node scripts/release/build-engine.mjs
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
@@ -14,6 +16,7 @@ import { arch } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { thirdPartyNotices } from "./third-party-notices.mjs";
+import { buildMotion } from "./build-motion.mjs";
 
 const NODE_VERSION = "24.22.2";
 // From https://nodejs.org/dist/v24.22.2/SHASUMS256.txt
@@ -118,6 +121,9 @@ execFileSync(py, ["-I", "-m", "compileall", "-q", "-j", "0", "--invalidation-mod
 execFileSync(py, ["-I", "-c", "import mediapipe, cv2, numpy, PIL; from mediapipe.tasks.python import vision"], { stdio: "inherit" });
 const pyLicence = readFileSync(join(fxOut, "python/lib/python3.12/LICENSE.txt"), "utf8");
 
+// 4b. Motion graphics renderer (Remotion), smoke-tested with the shipped Node.
+const motion = await buildMotion(root, out, join(out, "node"));
+
 // 5. Licences of everything shipped.
 const fontsDir = join(root, "assets/fonts");
 const notices = thirdPartyNotices(root, [
@@ -129,6 +135,7 @@ const notices = thirdPartyNotices(root, [
   ...readdirSync(join(fxSrc, "fonts"))
     .filter((f) => f.endsWith(".txt"))
     .map((f) => ({ name: `AI effects font (${f.replace(/^(OFL|LICENSE)-|\.txt$/g, "")})`, licence: f.startsWith("OFL") ? "OFL-1.1" : "Apache-2.0", text: readFileSync(join(fxSrc, "fonts", f), "utf8").trim() })),
+  { name: "Chrome Headless Shell (Remotion's build, motion graphics)", licence: "BSD-3-Clause (Chromium) and the components listed in its licence", text: motion.chromeLicence },
   { name: `CPython ${PYTHON_BUILD} (python-build-standalone)`, licence: "PSF-2.0 (and the bundled components listed in its licence)", text: pyLicence.trim() },
   ...readFileSync(lock, "utf8")
     .split("\n")

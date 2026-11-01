@@ -12,16 +12,31 @@ export const PROXY_MAX = 960;
 const PROXY_VERSION = 2;
 
 /**
- * Low-resolution stand-in for a video source, used by preview renders.
- * Short GOP for fast seeking; rebuilt when the source changes or the cache is cleared.
+ * Alpha video proxies are "packed": the colour picture on top, its alpha as grey below, in one
+ * ordinary H.264 file of twice the height. Browsers don't agree on any video codec with alpha
+ * (WKWebView: HEVC only; Chromium: VP9 only), so the live preview unpacks it in a shader.
  */
-export function ensureProxy(db: Database, cacheDir: string, assetId: string, sourcePath: string, kind: "video" | "image" = "video"): Promise<string> {
+export const PACKED_ALPHA = "packed-alpha-v1";
+
+/**
+ * Low-resolution stand-in for a video source, used by the live preview. Short GOP for fast
+ * seeking; rebuilt when the source changes or the cache is cleared. Pictures with an alpha
+ * channel keep it: a PNG for stills, a packed proxy for video (see PACKED_ALPHA).
+ */
+export function ensureProxy(
+  db: Database,
+  cacheDir: string,
+  assetId: string,
+  sourcePath: string,
+  kind: "video" | "image" = "video",
+  alpha = false,
+): Promise<string> {
   const size = statSync(sourcePath).size;
   const row = db.prepare("SELECT path, source_size FROM proxies WHERE asset_id = ?").get(assetId) as
     | { path: string; source_size: number }
     | undefined;
-  const ext = kind === "image" ? "jpg" : "mp4";
-  const out = join(cacheDir, "proxies", `${assetId}-${size}-v${PROXY_VERSION}.${ext}`);
+  const ext = kind === "image" ? (alpha ? "png" : "jpg") : "mp4";
+  const out = join(cacheDir, "proxies", `${assetId}-${size}-v${PROXY_VERSION}${alpha ? "-a" : ""}.${ext}`);
   if (row && row.path === out && row.source_size === size && existsSync(out)) return Promise.resolve(out);
 
   const key = `${assetId}:${size}`;
@@ -33,15 +48,36 @@ export function ensureProxy(db: Database, cacheDir: string, assetId: string, sou
     const tmp = `${out}.${process.pid}.tmp.${ext}`;
     try {
       const common = ["-hide_banner", "-nostdin", "-loglevel", "error", "-y", ...sourceInputArgs(sourcePath)];
+      // Same BT.709 conversion + tags as the export, so the browser decodes the proxy to the colours the render produces.
+      const fit = `scale=${PROXY_MAX}:${PROXY_MAX}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
+      const to709 = "scale=out_color_matrix=bt709:out_range=tv,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv";
       await run(
         ffmpegBin(),
         kind === "image"
-          ? // Stills: one ≤1280 px JPEG, enough for a 1080-wide frame at preview size.
-            [...common, "-frames:v", "1", "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2", "-q:v", "3", "-update", "1", "-f", "image2", `file:${tmp}`]
+          ? // Stills: one ≤1280 px picture, enough for a 1080-wide frame at preview size; PNG keeps transparency.
+            [
+              ...common, "-frames:v", "1",
+              "-vf", `scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2${alpha ? ",format=rgba" : ""}`,
+              ...(alpha ? ["-c:v", "png"] : ["-q:v", "3"]), "-update", "1", "-f", "image2", `file:${tmp}`,
+            ]
+          : alpha
+          ? [
+              ...common,
+              // Colour on top, alpha below (full-range grey squeezed into TV range so the browser's
+              // decode stretches it back to 0–255). Unpacked by the preview's AlphaUnpack shader.
+              "-filter_complex",
+              `[0:v]${fit},format=yuva444p,split[c][a];[c]${to709},format=yuv420p[top];` +
+                `[a]alphaextract,scale=in_range=pc:out_range=tv,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv[bottom];` +
+                `[top][bottom]vstack[v]`,
+              "-map", "[v]", "-map", "0:a?",
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", "15", "-pix_fmt", "yuv420p", ...BT709_TAGS,
+              "-c:a", "aac", "-b:a", "128k",
+              "-metadata:s:v:0", `comment=${PACKED_ALPHA}`,
+              "-movflags", "+faststart", "-f", "mp4", `file:${tmp}`,
+            ]
           : [
               ...common,
-              // Same BT.709 conversion + tags as the export, so the browser decodes the proxy to the colours the render produces.
-              "-vf", `scale=${PROXY_MAX}:${PROXY_MAX}:force_original_aspect_ratio=decrease:force_divisible_by=2:out_color_matrix=bt709:out_range=tv,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv`,
+              "-vf", `${fit}:out_color_matrix=bt709:out_range=tv,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv`,
               // Short GOP: the live preview seeks a lot.
               "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-g", "15", "-pix_fmt", "yuv420p", ...BT709_TAGS,
               "-c:a", "aac", "-b:a", "128k",

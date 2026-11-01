@@ -9,6 +9,7 @@ import { CAPTION_FONTS, type Caption, type CaptionFont, type CaptionStyle } from
 import { hasPictureEffects } from "@reelforge/core/effects";
 import opentype, { type Font } from "opentype.js";
 import { EffectsGL } from "./effects-gl.ts";
+import { AlphaUnpack } from "./alpha-unpack.ts";
 
 export interface CompositorSources {
   mediaUrl: (assetId: string) => string;
@@ -36,6 +37,7 @@ export class Compositor {
   #fonts = new Map<CaptionFont, Font | Promise<void>>();
   #layouts = new Map<string, CaptionLayout>();
   #effects: EffectsGL | null | undefined; // undefined = not tried yet
+  #unpack: AlphaUnpack | null | undefined; // packed-alpha proxies (motion graphics)
   #fxReady = new Set<string>(); // baked AI-effect keys we can play
   onFrame: ((frame: number) => void) | null = null;
   onEnded: (() => void) | null = null;
@@ -276,7 +278,16 @@ export class Compositor {
           const other = pick.id !== seg.clipId ? this.#videos.get(seg.clipId) : [...this.#videos.entries()].find(([id]) => id.startsWith(`${seg.clipId}#`))?.[1];
           if (other && other.readyState >= 2) v = other;
         }
-        if (v && v.readyState >= 2) [src, sw, sh] = [v, v.videoWidth, v.videoHeight];
+        if (v && v.readyState >= 2) {
+          // A transparent source's proxy is packed (colour over alpha); a baked AI-effects stretch is not.
+          const packed = plan.sources[seg.assetId]?.alpha && v === this.#videos.get(seg.clipId);
+          if (packed) {
+            const unpacked = (this.#unpack ??= AlphaUnpack.create())?.render(v);
+            if (unpacked) [src, sw, sh] = [unpacked, unpacked.width, unpacked.height];
+          } else {
+            [src, sw, sh] = [v, v.videoWidth, v.videoHeight];
+          }
+        }
       } else if (kind === "image") {
         const img = this.#imageFor(seg.assetId);
         if (img.complete && img.naturalWidth) [src, sw, sh] = [img, img.naturalWidth, img.naturalHeight];

@@ -9,6 +9,12 @@ import { dirname, join } from "node:path";
 const ALLOWED = /^(MIT|MIT-0|ISC|0BSD|Apache-2\.0|BSD-2-Clause|BSD-3-Clause|Unlicense|Zlib|CC0-1\.0|Unicode-3\.0|MPL-2\.0|OFL-1\.1)$/;
 // MPL-2.0 is file-level copyleft: fine to ship in binaries; the notice below points to the source.
 
+// Remotion (motion graphics) is source-available under the Remotion License, not an OSI licence:
+// free for individuals and companies of up to 3 people, a paid company licence beyond that. Shipping
+// it in the app was a deliberate product decision (README → "Motion graphics and the Remotion
+// License"). Excepted by package name, so no other non-allowlisted licence can ride along.
+const REMOTION = /^(remotion|@remotion\/[a-z0-9-]+)$/;
+
 function licenceOk(expr) {
   // "A OR B": one acceptable option is enough; "A AND B": all must be acceptable.
   const norm = expr.replace(/\//g, " OR ").replace(/[()]/g, " ");
@@ -29,8 +35,9 @@ export function thirdPartyNotices(root, extra) {
   for (const [licence, pkgs] of Object.entries(js)) {
     for (const p of pkgs) {
       if (p.name.startsWith("@reelforge/")) continue;
-      if (!licenceOk(licence)) bad.push(`${p.name} (${licence})`);
-      entries.push({ name: `${p.name} ${p.versions.join(", ")}`, licence, text: licenceText(p.paths?.[0]) });
+      const remotion = REMOTION.test(p.name);
+      if (!remotion && !licenceOk(licence)) bad.push(`${p.name} (${licence})`);
+      entries.push({ name: `${p.name} ${p.versions.join(", ")}`, licence: remotion ? "Remotion License (source-available; company licence required for organisations over 3 people)" : licence, text: licenceText(p.paths?.[0]) });
     }
   }
 

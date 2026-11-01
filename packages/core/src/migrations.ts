@@ -296,5 +296,28 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE ai_proposals ADD COLUMN requested_by TEXT NOT NULL DEFAULT 'user' CHECK (requested_by IN ('user', 'mcp'));
     `,
   },
+  {
+    version: 9,
+    name: "motion_graphics",
+    sql: `
+      -- Pictures with transparency preview through an alpha-aware proxy. Assets imported before
+      -- this read 0 until relinked; that only affects the preview, never the export.
+      ALTER TABLE assets ADD COLUMN has_alpha INTEGER NOT NULL DEFAULT 0 CHECK (has_alpha IN (0, 1));
+
+      -- Motion graphics (Remotion templates) the engine rendered into an asset: what made the file,
+      -- so the desktop can show and re-edit the template instead of an anonymous .mov.
+      CREATE TABLE motion_graphics (
+        asset_id        TEXT PRIMARY KEY REFERENCES assets (id) ON DELETE CASCADE,
+        project_id      TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+        render_key      TEXT NOT NULL,
+        template        TEXT NOT NULL,
+        props           TEXT NOT NULL CHECK (json_valid(props)),
+        duration_frames INTEGER NOT NULL CHECK (duration_frames > 0),
+        created_at      TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX motion_graphics_project ON motion_graphics (project_id, created_at);
+    `,
+  },
 ];
 

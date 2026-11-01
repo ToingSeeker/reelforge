@@ -26,6 +26,7 @@ export function fakeMedia(dir: string, name: string, probe: Partial<AssetProbe> 
       vfr: false,
       hasVideo: true,
       hasAudio: true,
+      hasAlpha: false,
       videoCodec: "h264",
       audioCodec: "aac",
       sampleRate: 48000,

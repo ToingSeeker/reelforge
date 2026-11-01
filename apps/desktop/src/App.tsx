@@ -11,6 +11,7 @@ import { useExports, usePreview } from "./render.ts";
 import { RenderQueue } from "./components/RenderQueue.tsx";
 import { CaptionsPanel } from "./components/CaptionsPanel.tsx";
 import { AudioPanel } from "./components/AudioPanel.tsx";
+import { MotionPanel } from "./components/MotionPanel.tsx";
 import { analysisOf, useAnalyses } from "./analyses.ts";
 import { beatsOnTimeline } from "@reelforge/core/context";
 import { microsToFrames } from "@reelforge/core/timebase";
@@ -285,6 +286,23 @@ export function App() {
     apply("Append clip", [{ type: "clip.add", trackId: track.id, assetId: asset.id, start: end }]);
   };
 
+  /**
+   * A finished motion graphic: at the playhead, on the topmost unlocked overlay track with room for it.
+   * Its import bumped the revision, so reload first and pick the track from the timeline the edit runs on.
+   */
+  const placeMotion = async (asset: Asset, durationFrames: number) => {
+    const at = playhead;
+    await editor.reload();
+    void editor.applyBuilt("Add motion graphic", (t) => {
+      const free = (trackId: string) => !t.clips.some((c) => c.trackId === trackId && c.start < at + durationFrames && at < clipEnd(c));
+      const byTop = [...t.tracks].sort((a, b) => a.position - b.position);
+      const track =
+        byTop.find((x) => !x.locked && x.kind === "overlay" && free(x.id)) ?? byTop.find((x) => !x.locked && x.kind === "video" && free(x.id));
+      if (!track) throw new Error("The graphic is in Media, but every picture track is busy at the playhead. Move the playhead or drag it where you want it.");
+      return [{ type: "clip.add", trackId: track.id, assetId: asset.id, start: at, duration: durationFrames }];
+    });
+  };
+
   const split = () => {
     if (!tl) return;
     const locked = new Set(tl.tracks.filter((t) => t.locked).map((t) => t.id));
@@ -480,6 +498,8 @@ export function App() {
               }}
               onAnalyze={(a, kinds) => void analyses.analyze(a.id, kinds)}
             />
+          ) : rail === "templates" && tl && client ? (
+            <MotionPanel client={client} timeline={tl} notify={notify} onPlace={placeMotion} />
           ) : rail === "effects" && tl ? (
             <EffectsPanel
               timeline={tl}

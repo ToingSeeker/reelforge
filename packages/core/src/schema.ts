@@ -124,6 +124,8 @@ export interface Asset {
   vfr: boolean;
   hasVideo: boolean;
   hasAudio: boolean;
+  /** The picture has an alpha channel (ProRes 4444, PNG with transparency, motion graphics). */
+  hasAlpha: boolean;
   videoCodec: string | null;
   audioCodec: string | null;
   sampleRate: number | null;
@@ -364,6 +366,7 @@ export interface AssetProbe {
   vfr: boolean;
   hasVideo: boolean;
   hasAudio: boolean;
+  hasAlpha: boolean;
   videoCodec: string | null;
   audioCodec: string | null;
   sampleRate: number | null;

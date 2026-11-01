@@ -18,7 +18,8 @@ pnpm release:mac                 # cargo runs with --locked for the same reason 
 | `node` | the official Node.js runtime from nodejs.org, pinned version + SHA-256 (not Homebrew's, which links Homebrew libraries) |
 | `fonts/` | the OFL caption fonts |
 | `fx/` | the AI effects engine (`packages/fx-engine`) with its own CPython 3.12 (python-build-standalone, pinned SHA-256) and the wheels in `requirements-macos-arm64.lock` (`pip --require-hashes`, binary only); the shell points the engine at it with `REELFORGE_FX_DIR` and drops any inherited `REELFORGE_FX_PYTHON` |
-| `THIRD_PARTY_NOTICES.txt` | licences of every shipped JS package, Rust crate, Node and the fonts; the build fails on a licence outside the allowlist |
+| `motion/` | the motion-graphics renderer (`scripts/release/build-motion.mjs`): `render.mjs`, the compositions prebuilt by `@remotion/bundler`, `@remotion/renderer` with its native compositor, and Chrome Headless Shell (pinned SHA-256 of the executable). The shell points the engine at it with `REELFORGE_MOTION_DIR`. The step ends with a test render on the shipped Node. Adds about 600 MB to the installed app (Chrome is ~550 MB of that) and about 180 MB to the DMG |
+| `THIRD_PARTY_NOTICES.txt` | licences of every shipped JS package, Rust crate, Node and the fonts; the build fails on a licence outside the allowlist, except Remotion's own packages (Remotion License, excepted by name in `third-party-notices.mjs`) |
 
 A release build of the shell runs that engine; a debug build runs the monorepo CLI on your own Node. Apps opened
 from Finder get launchd's PATH, so the shell appends `/opt/homebrew/bin` and `/usr/local/bin` for FFmpeg and

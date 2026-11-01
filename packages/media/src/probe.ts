@@ -70,6 +70,7 @@ export function resolveSource(input: string): AssetFile {
 interface FfStream {
   codec_type?: string;
   codec_name?: string;
+  pix_fmt?: string;
   width?: number;
   height?: number;
   avg_frame_rate?: string;
@@ -108,6 +109,11 @@ const micros = (s: string | undefined) => {
   return Number.isFinite(n) && n > 0 ? Math.round(n * 1_000_000) : null;
 };
 
+/** Pixel formats that carry an alpha channel (yuva444p12le, rgba, ya8, gbrap10le, …). */
+export function hasAlphaPixFmt(pixFmt: string | undefined): boolean {
+  return !!pixFmt && /^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|rgba64|bgra64)/.test(pixFmt);
+}
+
 /** Interpret ffprobe JSON. Exported for unit tests. */
 export function interpretProbe(data: FfProbe, expected: AssetKind): AssetProbe {
   const streams = data.streams ?? [];
@@ -140,6 +146,7 @@ export function interpretProbe(data: FfProbe, expected: AssetKind): AssetProbe {
     vfr,
     hasVideo: kind !== "audio" && !!v,
     hasAudio: kind !== "image" && !!a,
+    hasAlpha: kind !== "audio" && hasAlphaPixFmt(v?.pix_fmt),
     videoCodec: kind !== "audio" ? v?.codec_name ?? null : null,
     audioCodec: a?.codec_name ?? null,
     sampleRate: a?.sample_rate ? Number(a.sample_rate) : null,

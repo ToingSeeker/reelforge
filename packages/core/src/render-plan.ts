@@ -14,6 +14,8 @@ export interface PlanSource {
   kind: "video" | "audio" | "image";
   width: number | null;
   height: number | null;
+  /** Picture has transparency: the preview proxy carries it packed (see media/proxy.ts). */
+  alpha: boolean;
 }
 
 export interface PlanSegment {
@@ -246,7 +248,7 @@ export function buildRenderPlan(t: Timeline): RenderPlan {
   const sources: Record<string, PlanSource> = {};
   for (const id of used) {
     const a = assets.get(id)!;
-    sources[id] = { assetId: id, path: a.sourcePath, kind: a.kind, width: a.width, height: a.height };
+    sources[id] = { assetId: id, path: a.sourcePath, kind: a.kind, width: a.width, height: a.height, alpha: a.hasAlpha };
   }
 
   return {

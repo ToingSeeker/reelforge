@@ -1,5 +1,6 @@
 import type { WorkflowRun, AIConsent, AIProposal, Analysis, AnalysisKind, Asset, CreateProjectInput, EditOperation, Project, RenderJob, Timeline, TimelineOp } from "@reelforge/core/schema";
 import type { ProjectContext } from "@reelforge/core/context";
+import type { MotionTemplateId } from "@reelforge/core/motion-catalog";
 
 // The desktop UI never touches SQLite: it talks to the same core through the
 // local REST sidecar that the Rust shell starts (or, in a plain browser during
@@ -9,6 +10,22 @@ import type { ProjectContext } from "@reelforge/core/context";
 export interface FxStatus {
   engine: { ok: true } | { ok: false; reason: string };
   bakes: ({ key: string; state: "done" | "missing" | "queued" } | { key: string; state: "running"; progress: number } | { key: string; state: "failed"; error: string })[];
+}
+
+/** A motion graphic being rendered (POST/GET /v1/projects/:id/motion). */
+export type MotionStatus =
+  | { key: string; state: "done"; asset: Asset }
+  | { key: string; state: "missing" | "queued" }
+  | { key: string; state: "running"; progress: number }
+  | { key: string; state: "failed"; error: string };
+
+export interface MotionGraphicInfo {
+  assetId: string;
+  renderKey: string;
+  template: MotionTemplateId;
+  props: Record<string, unknown>;
+  durationFrames: number;
+  createdAt: string;
 }
 
 export interface ApiInfo {
@@ -127,6 +144,12 @@ export function createClient(info: ApiInfo) {
       ),
     relink: (id: string, assetId: string, path: string) =>
       request<{ asset: Asset }>("POST", `/v1/projects/${encodeURIComponent(id)}/assets/${encodeURIComponent(assetId)}/relink`, { path }).then((r) => r.asset),
+    motionGraphics: (id: string) =>
+      request<{ engine: { ok: true } | { ok: false; reason: string }; graphics: MotionGraphicInfo[] }>("GET", `/v1/projects/${encodeURIComponent(id)}/motion`),
+    createMotion: (id: string, body: { template: MotionTemplateId; props: Record<string, unknown>; durationFrames: number }) =>
+      request<{ motion: MotionStatus }>("POST", `/v1/projects/${encodeURIComponent(id)}/motion`, body).then((r) => r.motion),
+    motionStatus: (id: string, key: string) =>
+      request<{ motion: MotionStatus }>("GET", `/v1/projects/${encodeURIComponent(id)}/motion/${encodeURIComponent(key)}`).then((r) => r.motion),
     fxStatus: (id: string) => request<FxStatus>("GET", `/v1/projects/${encodeURIComponent(id)}/fx`),
     bakeFx: (id: string) => request<FxStatus>("POST", `/v1/projects/${encodeURIComponent(id)}/fx/bake`),
     previewJob: (id: string) => request<{ job: RenderJob }>("POST", `/v1/projects/${encodeURIComponent(id)}/preview-jobs`).then((r) => r.job),

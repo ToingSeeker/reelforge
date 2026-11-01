@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Motion graphics with Remotion.** The Templates panel has three original templates (title card, lower
+  third, badge), a live preview of the actual composition, and fields generated from each template's schema. "Add at
+  playhead" renders the graphic once on this Mac into a transparent ProRes 4444 clip (identical inputs reuse
+  the file), imports it, and places it on the topmost free overlay track. REST: `GET/POST /v1/projects/:id/motion`,
+  `GET /v1/projects/:id/motion/:key`. Remotion runs as its own process; the app bundles it with Chrome Headless Shell,
+  so the DMG grows by ~180 MB. **Remotion is not open source:** companies of 4+ people need a Remotion company
+  license (see README).
+- **Transparency in the preview.** Assets now record whether they have an alpha channel. Transparent videos get a
+  "packed" preview proxy (colour over alpha in one H.264 file, unpacked by a shader) and transparent stills a PNG
+  proxy, so overlays no longer show as black boxes while editing. Rendered previews read alpha sources from the
+  original. Assets imported before this read as opaque until relinked.
+
 - **AI effects: 45 face-tracked effects** from the engine behind HELIX's Effects Studio (claude-video-effects
   by Vibha Ramprakash, MIT): spotlight, a giant word behind your head, lean-in, LED sign, checklists, glass
   widgets, liquid-glass graphs, phone fans and more. Add them in Effects → AI effects at the playhead, edit timing,

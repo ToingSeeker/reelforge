@@ -25,6 +25,7 @@ interface AssetRow {
   vfr: number;
   has_video: number;
   has_audio: number;
+  has_alpha: number;
   video_codec: string | null;
   audio_codec: string | null;
   sample_rate: number | null;
@@ -59,6 +60,7 @@ export function toAsset(r: AssetRow, projectFps: Rational, checkFile = true): As
     vfr: r.vfr === 1,
     hasVideo: r.has_video === 1,
     hasAudio: r.has_audio === 1,
+    hasAlpha: r.has_alpha === 1,
     videoCodec: r.video_codec,
     audioCodec: r.audio_codec,
     sampleRate: r.sample_rate,
@@ -128,13 +130,13 @@ export class AssetStore {
       this.#db
         .prepare(
           `INSERT INTO assets (id, project_id, kind, source_path, filename, size_bytes, mtime_ms, duration_us, width, height,
-             fps_num, fps_den, vfr, has_video, has_audio, video_codec, audio_codec, sample_rate, channels, rotation, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             fps_num, fps_den, vfr, has_video, has_audio, has_alpha, video_codec, audio_codec, sample_rate, channels, rotation, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id, pid, probe.kind, file.path, basename(file.path), file.sizeBytes, Math.floor(file.mtimeMs),
           probe.durationUs, probe.width, probe.height, probe.fps?.num ?? null, probe.fps?.den ?? null,
-          probe.vfr ? 1 : 0, probe.hasVideo ? 1 : 0, probe.hasAudio ? 1 : 0, probe.videoCodec, probe.audioCodec,
+          probe.vfr ? 1 : 0, probe.hasVideo ? 1 : 0, probe.hasAudio ? 1 : 0, probe.hasAlpha ? 1 : 0, probe.videoCodec, probe.audioCodec,
           probe.sampleRate, probe.channels, probe.rotation, now,
         );
       return { asset: this.get(pid, id), created: true };
@@ -184,8 +186,9 @@ export class AssetStore {
         now: this.#now(),
       });
       this.#db
-        .prepare("UPDATE assets SET source_path = ?, filename = ?, size_bytes = ?, mtime_ms = ? WHERE id = ?")
-        .run(file.path, basename(file.path), file.sizeBytes, Math.floor(file.mtimeMs), current.id);
+        // Alpha may differ (a flattened export of the same graphic): it changes how we preview, not what clips mean.
+        .prepare("UPDATE assets SET source_path = ?, filename = ?, size_bytes = ?, mtime_ms = ?, has_alpha = ? WHERE id = ?")
+        .run(file.path, basename(file.path), file.sizeBytes, Math.floor(file.mtimeMs), probe.hasAlpha ? 1 : 0, current.id);
       return this.get(current.projectId, current.id);
     });
   }

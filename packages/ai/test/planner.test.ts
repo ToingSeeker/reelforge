@@ -30,7 +30,7 @@ function setup(t: { after: (fn: () => void) => void }) {
   writeFileSync(join(dir, "a.mp4"), "fake");
   const st = statSync(join(dir, "a.mp4"));
   const asset = new AssetStore(db).add(p.id, { path: join(dir, "a.mp4"), sizeBytes: st.size, mtimeMs: st.mtimeMs }, {
-    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: false,
+    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: false, hasAlpha: false,
     videoCodec: "h264", audioCodec: null, sampleRate: null, channels: null, rotation: 0,
   }, "cli").asset;
   const timeline = new TimelineStore(db);

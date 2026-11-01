@@ -84,6 +84,22 @@ Data lives in `~/Library/Application Support/ReelForge/reelforge.db`. Set `REELF
 
 Building it yourself: see [docs/releasing.md](docs/releasing.md).
 
+## Motion graphics and the Remotion License
+
+The **Templates** panel makes motion graphics (title cards, lower thirds, badges) with
+[Remotion](https://www.remotion.dev). You preview a template live, and the engine renders it once on your
+Mac into a transparent clip (ProRes 4444) that goes on the overlay track like any other media.
+
+Remotion is **source-available, not open source**. It ships inside the ReelForge app, and its own license
+applies to it ([Remotion License](https://www.remotion.dev/license)):
+
+- **Free** for individuals, non-profits and companies of **up to 3 people**.
+- A **company license from Remotion is required** for for-profit organisations of 4 or more. That includes
+  using ReelForge's motion graphics at such a company.
+
+Everything else in ReelForge stays Apache-2.0. The app also ships the Chrome Headless Shell that Remotion
+draws frames with (about 170 MB of the download). Templates live in `packages/motion`.
+
 ## Use it from Claude, ChatGPT or Gemini CLI (MCP)
 
 ReelForge ships a local MCP server over stdio. External AI clients can create projects, import and analyse media,
@@ -123,6 +139,7 @@ packages/ai       AI Director: Claude + Ollama adapters, proposal planner
 packages/automation  workflow recipes (JSON) runner
 packages/mcp      MCP server (stdio) over the same engine
 packages/cli      `reelforge` JSON CLI, including `reelforge serve` and `reelforge mcp`
+packages/motion   motion-graphics templates (Remotion compositions) and their render process
 apps/desktop      Tauri 2 + React studio; the Rust shell runs the engine as a sidecar
 docs/             PRD, architecture, milestones, design reference
 ```
@@ -138,3 +155,5 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and ou
 
 [Apache-2.0](LICENSE). Third-party components keep their own licenses: FFmpeg, whisper.cpp (MIT) and its models,
 the bundled caption fonts Anton and Poppins (SIL Open Font License, texts in `assets/fonts/`), opentype.js (MIT).
+Remotion is under the Remotion License (see [Motion graphics](#motion-graphics-and-the-remotion-license)); the full list
+of what a release ships is generated into `THIRD_PARTY_NOTICES.txt`.

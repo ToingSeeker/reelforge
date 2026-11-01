@@ -124,6 +124,8 @@ struct EngineCommand {
     fonts: Option<PathBuf>,
     /// The bundled AI effects engine (fx.py + its own Python), release builds only.
     fx: Option<PathBuf>,
+    /// The bundled motion-graphics renderer (Remotion + its headless Chrome), release builds only.
+    motion: Option<PathBuf>,
 }
 
 fn bundled_engine_dir() -> Option<PathBuf> {
@@ -152,6 +154,7 @@ fn resolve_engine(release: bool, bundled: Option<PathBuf>, node_override: Option
             cli: dir.join("reelforge.mjs"),
             fonts: Some(dir.join("fonts")),
             fx: Some(dir.join("fx")),
+            motion: Some(dir.join("motion")),
         });
     }
     Ok(EngineCommand {
@@ -159,6 +162,7 @@ fn resolve_engine(release: bool, bundled: Option<PathBuf>, node_override: Option
         cli: cli_override.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/bin/reelforge.js")),
         fonts: None,
         fx: None,
+        motion: None,
     })
 }
 
@@ -186,7 +190,7 @@ fn engine_path() -> String {
 
 fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Option<ChildStdin>), String> {
     let token = random_token()?;
-    let EngineCommand { node, cli, fonts, fx } = engine_command()?;
+    let EngineCommand { node, cli, fonts, fx, motion } = engine_command()?;
     let mut cmd = Command::new(&node);
     // The token goes over stdin, not the environment, which FFmpeg/whisper children would inherit.
     cmd.arg(&cli).arg("serve").arg("--token-stdin").env("PATH", engine_path()).env_remove("REELFORGE_API_TOKEN");
@@ -199,6 +203,10 @@ fn start_engine(state: Arc<(Mutex<EngineState>, Condvar)>) -> Result<(Child, Opt
     }
     if let Some(fx) = fx {
         cmd.env("REELFORGE_FX_DIR", fx);
+    }
+    if let Some(motion) = motion {
+        // Overwrites any inherited value: a release runs only the renderer it ships.
+        cmd.env("REELFORGE_MOTION_DIR", motion);
     }
     for origin in allowed_origins(!cfg!(debug_assertions)) {
         cmd.arg("--allow-origin").arg(origin);
@@ -291,6 +299,7 @@ mod tests {
         assert_eq!(e.node, "/Applications/ReelForge.app/Contents/Resources/engine/node");
         assert_eq!(e.cli, PathBuf::from("/Applications/ReelForge.app/Contents/Resources/engine/reelforge.mjs"));
         assert_eq!(e.fx, Some(PathBuf::from("/Applications/ReelForge.app/Contents/Resources/engine/fx")));
+        assert_eq!(e.motion, Some(PathBuf::from("/Applications/ReelForge.app/Contents/Resources/engine/motion")));
     }
 
     #[test]
