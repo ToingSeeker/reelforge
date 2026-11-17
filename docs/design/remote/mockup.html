@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ReelForge Remote — mockup</title>
+<style>
+:root{
+  --bg-base:#080f0d;--surface-base:#101d19;--surface-raised:#1b3029;
+  --text-primary:#eef5f0;--text-secondary:#9cafa5;--text-muted:#72877c;
+  --accent-mint:#a8dcc8;--accent-orange:#ff7a1a;--orange-soft:rgba(255,122,26,.14);--orange-ink:#1c0c00;
+  --border-subtle:rgba(238,245,240,.09);--glass-panel:rgba(17,38,32,.6);--glass-bar:rgba(18,40,34,.58);
+  --pill-fill:linear-gradient(180deg,rgba(238,245,240,.09),rgba(238,245,240,.03));--pill-border:rgba(238,245,240,.11);
+  --field-fill:rgba(6,16,13,.42);--surface-inset:rgba(4,10,8,.5);
+  --mint-soft:rgba(168,220,200,.13);--mint-line:rgba(168,220,200,.62);--mint-ink:#0b1a15;
+  --success:#6fd3a0;--success-soft:rgba(111,211,160,.14);--warning:#f0b860;--warning-soft:rgba(240,184,96,.14);
+  --error:#f07a70;--error-soft:rgba(240,122,112,.14);
+  --clip-video:#1d362e;--clip-overlay:#2b4a3f;--clip-audio:#15291f;--clip-caption:#34352a;
+  --glass-fill:linear-gradient(180deg,rgba(255,255,255,.09),rgba(255,255,255,.035));--glass-edge:rgba(255,255,255,.11);
+  --glass-hi:inset 0 1px 0 rgba(255,255,255,.1);--glass-shadow:0 4px 14px rgba(0,0,0,.28);--glass-blur:blur(22px) saturate(170%);
+  --font-ui:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter","Segoe UI",system-ui,sans-serif;
+  --font-mono:"SF Mono",ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#050a08;color:var(--text-primary);font:13px/1.4 var(--font-ui);padding:36px 40px 48px}
+h1.page{font-size:20px;font-weight:650;letter-spacing:-.01em;margin-bottom:4px}
+p.page{color:var(--text-secondary);margin-bottom:26px}
+.row{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
+.cap{color:var(--text-muted);font-size:11.5px;margin:10px 0 0 4px;max-width:390px}
+.cap b{color:var(--text-secondary);font-weight:600}
+.phone{width:390px;height:844px;border-radius:46px;border:1px solid rgba(238,245,240,.12);overflow:hidden;position:relative;
+  background:radial-gradient(120% 60% at 20% 0%,rgba(52,96,80,.35),transparent 60%),radial-gradient(90% 50% at 100% 100%,rgba(255,122,26,.07),transparent 60%),var(--bg-base);
+  box-shadow:0 30px 80px -30px rgba(0,0,0,.9);display:flex;flex-direction:column}
+.status{height:47px;display:flex;justify-content:space-between;align-items:flex-end;padding:0 30px 6px;font-size:14px;font-weight:600}
+.status i{font-style:normal;font-size:11px;letter-spacing:1px;color:var(--text-secondary)}
+.top{display:flex;align-items:center;gap:10px;padding:10px 18px 12px}
+.top img{width:30px;height:30px}
+.top .t{font-size:17px;font-weight:650;letter-spacing:-.01em}
+.top .sub{font-size:11.5px;color:var(--text-muted)}
+.top .sp{flex:1}
+.back{width:34px;height:34px;border-radius:50%;background:var(--glass-fill);border:1px solid var(--glass-edge);box-shadow:var(--glass-hi),var(--glass-shadow);display:grid;place-items:center;color:var(--text-secondary);font-size:16px}
+.body{flex:1;overflow:hidden;padding:0 16px 12px;display:flex;flex-direction:column;gap:12px}
+.card{background:var(--glass-panel);border:1px solid var(--border-subtle);border-radius:16px;padding:14px;box-shadow:inset 0 1px 0 rgba(238,245,240,.07)}
+.label{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:8px}
+.pill{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:999px;font-size:11.5px;font-weight:600;background:var(--pill-fill);border:1px solid var(--pill-border);color:var(--text-secondary)}
+.pill.ok{background:var(--success-soft);border-color:transparent;color:var(--success)}
+.pill.run{background:var(--orange-soft);border-color:transparent;color:var(--accent-orange)}
+.pill.wait{background:var(--warning-soft);border-color:transparent;color:var(--warning)}
+.pill.mint{background:var(--mint-soft);border-color:transparent;color:var(--accent-mint)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+/* Pill glass, as in SEEKER remote: words = pill, icon only = circle; faint light fill, hairline edge,
+   highlight along the top, soft shadow. Coloured kinds are the same glass lit from above. */
+.btn{height:46px;border-radius:999px;display:flex;align-items:center;justify-content:center;gap:8px;padding:0 18px;font-weight:650;font-size:14px;background:var(--glass-fill);border:1px solid var(--glass-edge);box-shadow:var(--glass-hi),var(--glass-shadow);color:var(--text-primary)}
+.btn.orange{border-color:rgba(255,190,120,.55);background:linear-gradient(180deg,#ff9440,var(--accent-orange) 55%,#e86a10);box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 6px 18px rgba(255,122,26,.28);color:var(--orange-ink)}
+.btn.mint{border-color:rgba(220,245,235,.6);background:linear-gradient(180deg,#c4ecdc,var(--accent-mint) 55%,#93c9b4);box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 6px 18px rgba(168,220,200,.22);color:var(--mint-ink)}
+.btn.sm{height:34px;font-size:12.5px;padding:0 14px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.kv{display:flex;justify-content:space-between;padding:7px 0;border-top:1px solid var(--border-subtle);color:var(--text-secondary)}
+.kv:first-of-type{border-top:0}.kv b{color:var(--text-primary);font-weight:600}
+.mono{font-family:var(--font-mono);font-size:11.5px}
+.bar{height:6px;border-radius:999px;background:var(--surface-inset);overflow:hidden}
+.bar span{display:block;height:100%;background:var(--accent-orange);border-radius:999px}
+.proj{display:flex;gap:12px;align-items:center;padding:10px 0;border-top:1px solid var(--border-subtle)}
+.proj:first-of-type{border-top:0;padding-top:2px}
+.thumb{width:46px;height:64px;border-radius:9px;flex:none;background:linear-gradient(160deg,#2c5a4b,#0d1c17 70%);position:relative;overflow:hidden;border:1px solid var(--border-subtle)}
+.thumb.b{background:linear-gradient(160deg,#5a3b22,#1a120b 70%)}.thumb.c{background:linear-gradient(160deg,#2d3e5c,#0c1220 70%)}
+.thumb::after{content:"";position:absolute;inset:auto 6px 6px 6px;height:3px;border-radius:2px;background:rgba(238,245,240,.35)}
+.proj .n{font-weight:600}.proj .m{font-size:11.5px;color:var(--text-muted)}.proj .sp{flex:1}
+.tabs{height:78px;display:flex;justify-content:space-around;align-items:flex-start;padding-top:10px;border-top:1px solid var(--border-subtle);background:rgba(11,22,19,.78);-webkit-backdrop-filter:var(--glass-blur);backdrop-filter:var(--glass-blur)}
+.tab{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:10.5px;color:var(--text-muted);font-weight:600}
+.tab .ic{width:24px;height:24px;border-radius:7px;border:1.6px solid currentColor;opacity:.85}
+.tab.on{color:var(--accent-mint)}
+.tab .badge{position:relative}
+.tab .badge::after{content:"1";position:absolute;top:-6px;right:-9px;background:var(--accent-orange);color:var(--orange-ink);font-size:9.5px;font-weight:700;border-radius:999px;padding:0 5px;line-height:15px}
+.poster{height:300px;border-radius:14px;background:radial-gradient(80% 60% at 50% 35%,rgba(168,220,200,.22),transparent 70%),linear-gradient(180deg,#183229,#0a1411);position:relative;border:1px solid var(--border-subtle);display:grid;place-items:center}
+.poster .play{width:58px;height:58px;border-radius:50%;background:rgba(28,40,36,.55);border:1px solid rgba(255,255,255,.14);box-shadow:var(--glass-hi),0 8px 24px rgba(0,0,0,.45);-webkit-backdrop-filter:var(--glass-blur);backdrop-filter:var(--glass-blur);display:grid;place-items:center}
+.poster .play::after{content:"";border-left:18px solid var(--accent-orange);border-top:11px solid transparent;border-bottom:11px solid transparent;margin-left:5px}
+.poster .tc{position:absolute;left:12px;bottom:10px}.poster .fmt{position:absolute;right:12px;top:10px}
+.lanes{display:flex;flex-direction:column;gap:4px}
+.lane{display:flex;gap:3px;height:16px}
+.lane span{border-radius:4px;background:var(--clip-video);border:1px solid rgba(168,220,200,.18)}
+.lane.o span{background:var(--clip-overlay)}.lane.a span{background:var(--clip-audio)}.lane.c span{background:var(--clip-caption);border-color:rgba(214,205,160,.2)}
+.ask{display:flex;gap:8px;align-items:center;background:var(--field-fill);border:1px solid var(--pill-border);border-radius:24px;padding:6px 6px 6px 16px;box-shadow:var(--glass-hi)}
+.ask .ph{flex:1;color:var(--text-primary);font-size:13.5px;line-height:1.45}
+.ask .send{width:38px;height:38px;border-radius:50%;border:1px solid rgba(220,245,235,.6);background:linear-gradient(180deg,#c4ecdc,var(--accent-mint) 55%,#93c9b4);box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 4px 12px rgba(168,220,200,.22);flex:none;display:grid;place-items:center}
+.ask .send::after{content:"";border-bottom:10px solid var(--mint-ink);border-left:7px solid transparent;border-right:7px solid transparent}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chips .pill{height:32px;padding:0 14px;font-size:12px;color:var(--text-primary);background:var(--glass-fill);border-color:var(--glass-edge);box-shadow:var(--glass-hi),var(--glass-shadow)}
+.op{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--border-subtle);align-items:flex-start}
+.op:first-of-type{border-top:0;padding-top:0}
+.op .k{flex:none;width:58px;font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding-top:2px}
+.op .k.add{color:var(--success)}.op .k.trim{color:var(--accent-mint)}.op .k.del{color:var(--error)}.op .k.fx{color:var(--warning)}
+.op .d{color:var(--text-secondary)}.op .d b{color:var(--text-primary);font-weight:600}
+.bubble{align-self:flex-end;max-width:84%;background:var(--surface-raised);border:1px solid var(--border-subtle);border-radius:16px 16px 4px 16px;padding:10px 12px}
+.ai{display:flex;gap:9px;align-items:flex-start}
+.ai img{width:22px;height:22px;flex:none;margin-top:1px}
+.preset{border:1px solid var(--pill-border);border-radius:12px;padding:10px 12px;background:var(--pill-fill)}
+.preset.on{border-color:var(--mint-line);background:var(--mint-soft)}
+.preset .n{font-weight:650}.preset .m{font-size:11.5px;color:var(--text-muted)}
+.field{background:var(--field-fill);border:1px solid var(--pill-border);border-radius:10px;height:38px;display:flex;align-items:center;padding:0 12px;gap:8px}
+.field .v{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.qr{width:150px;height:150px;border-radius:12px;background:#eef5f0;padding:10px;display:grid;grid-template-columns:repeat(21,1fr);gap:0}
+.qr i{background:#0b1a15}.qr i.e{background:transparent}
+.sheet{position:absolute;inset:auto 0 0 0;background:rgba(14,28,24,.97);border-top:1px solid var(--pill-border);border-radius:22px 22px 0 0;padding:10px 18px 34px;box-shadow:0 -20px 40px rgba(0,0,0,.55)}
+.grab{width:38px;height:5px;border-radius:9px;background:rgba(238,245,240,.2);margin:0 auto 14px}
+.dim{position:absolute;inset:0;background:rgba(2,6,5,.55)}
+.desk{width:720px;border-radius:18px;border:1px solid var(--border-subtle);background:linear-gradient(180deg,rgba(36,66,57,.42),rgba(17,38,32,.6)),var(--bg-base);padding:22px 24px;box-shadow:0 30px 80px -30px rgba(0,0,0,.9)}
+.desk h2{font-size:15px;font-weight:650}.desk .s{color:var(--text-muted);font-size:12px;margin:2px 0 16px}
+.desk .sec{display:grid;grid-template-columns:150px 1fr;gap:14px 16px;align-items:center}
+.desk .k{color:var(--text-secondary);font-size:12.5px}
+.steps{display:flex;gap:8px;margin-bottom:16px}
+.steps span{flex:1;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:600;background:var(--success-soft);color:var(--success)}
+.steps span.cur{background:var(--mint-soft);color:var(--accent-mint)}
+</style>
+</head>
+<body>
+<h1 class="page">ReelForge Remote — UI mockup</h1>
+<p class="page">PWA served by your own relay on Railway. 390 × 844 (iPhone 14/15). Colours from <span class="mono">apps/desktop/src/tokens.css</span>: orange only for Export, playhead and live progress; mint for selection.</p>
+
+<div class="row">
+
+<!-- 1 Pair -->
+<div>
+<div class="phone">
+  <div class="status"><span>9:41</span><i>●●● 5G ▮</i></div>
+  <div class="body" style="justify-content:center;align-items:center;text-align:center;gap:18px;padding:0 34px">
+    <img src="../../../brand/reelforge-mark.svg" style="width:84px;height:84px">
+    <div><div style="font-size:24px;font-weight:700;letter-spacing:-.02em">ReelForge Remote</div>
+    <div style="color:var(--text-secondary);margin-top:6px">Your Mac edits. Your phone directs.</div></div>
+    <div class="card" style="text-align:left;width:100%">
+      <div class="label">Paired with</div>
+      <div style="display:flex;align-items:center;gap:10px"><div style="font-weight:600;flex:1">MacBook Pro</div><span class="pill ok"><span class="dot"></span>Online</span></div>
+      <div class="kv" style="margin-top:8px"><span>Encryption</span><b>AES-256-GCM, end to end</b></div>
+      <div class="kv"><span>Relay</span><b class="mono">reelforge-remote.up.railway.app</b></div>
+    </div>
+    <div class="btn mint" style="width:100%">Unlock with Face ID</div>
+    <div style="color:var(--text-muted);font-size:11.5px">The relay can't read your projects. Lost this phone? Settings → Phone remote → New pairing on your Mac.</div>
+  </div>
+</div>
+<div class="cap"><b>1 · Pairing / lock.</b> Opened from the link or QR in desktop Settings (<span class="mono">#k=…</span> never reaches the server). App lock guards Apply and Render.</div>
+</div>
+
+<!-- 2 Home -->
+<div>
+<div class="phone">
+  <div class="status"><span>9:41</span><i>●●● 5G ▮</i></div>
+  <div class="top"><img src="../../../brand/reelforge-mark.svg"><div><div class="t">Home</div><div class="sub">MacBook Pro · 84 ms</div></div><div class="sp"></div><span class="pill ok"><span class="dot"></span>Online</span></div>
+  <div class="body">
+    <div class="card">
+      <div class="label">Now on your Mac</div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:8px"><b>Exporting “Bali Trip Reel”</b><span class="mono" style="color:var(--accent-orange)">62%</span></div>
+      <div class="bar"><span style="width:62%"></span></div>
+      <div style="display:flex;justify-content:space-between;margin-top:8px;color:var(--text-muted);font-size:11.5px"><span>1080×1920 · H.264 · 0:34</span><span>~48 s left</span></div>
+    </div>
+    <div class="card" style="border-color:rgba(240,184,96,.35)">
+      <div style="display:flex;align-items:center;gap:8px"><span class="pill wait"><span class="dot"></span>Needs you</span><div class="sp" style="flex:1"></div><span style="color:var(--text-muted);font-size:11.5px">2 min ago</span></div>
+      <div style="margin:8px 0 10px"><b>AI Director</b> proposed <b>7 edits</b> in “Café Opening”</div>
+      <div class="btn sm mint" style="width:100%">Review proposal</div>
+    </div>
+    <div class="card">
+      <div class="label">Projects</div>
+      <div class="proj"><div class="thumb"></div><div><div class="n">Café Opening</div><div class="m">9:16 · 0:28 · edited 2 min ago</div></div><div class="sp"></div><span class="pill wait">Review</span></div>
+      <div class="proj"><div class="thumb b"></div><div><div class="n">Bali Trip Reel</div><div class="m">9:16 · 0:34 · exporting</div></div><div class="sp"></div><span class="pill run"><span class="dot"></span>62%</span></div>
+      <div class="proj"><div class="thumb c"></div><div><div class="n">Product Demo v3</div><div class="m">16:9 · 1:12 · yesterday</div></div><div class="sp"></div><span class="pill">Idle</span></div>
+    </div>
+  </div>
+  <div class="tabs"><div class="tab on"><div class="ic"></div>Home</div><div class="tab"><div class="ic"></div>Projects</div><div class="tab"><div class="ic badge"></div>Review</div><div class="tab"><div class="ic"></div>Exports</div><div class="tab"><div class="ic"></div>Settings</div></div>
+</div>
+<div class="cap"><b>2 · Home.</b> What the Mac is doing, what needs you, recent projects. Every number comes from the Mac's snapshot; unknown shows “—”.</div>
+</div>
+
+<!-- 3 Project + AI Director -->
+<div>
+<div class="phone">
+  <div class="status"><span>9:41</span><i>●●● 5G ▮</i></div>
+  <div class="top"><div class="back">‹</div><div><div class="t">Café Opening</div><div class="sub">rev 41 · 1080×1920 · 30 fps</div></div><div class="sp"></div><div class="back">↶</div></div>
+  <div class="body">
+    <div class="poster"><div class="play"></div><span class="pill fmt">9:16</span><span class="mono tc">00:00:12:04 / 00:28</span></div>
+    <div class="card" style="padding:12px">
+      <div class="lanes">
+        <div class="lane c"><span style="width:30%"></span><span style="width:25%"></span><span style="width:38%"></span></div>
+        <div class="lane o"><span style="width:18%;margin-left:40%"></span></div>
+        <div class="lane"><span style="width:22%"></span><span style="width:16%"></span><span style="width:28%"></span><span style="width:30%"></span></div>
+        <div class="lane a"><span style="width:100%"></span></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:8px;color:var(--text-muted);font-size:11.5px"><span>12 clips · 4 tracks · captions on</span><span>read-only</span></div>
+    </div>
+    <div class="label" style="margin:2px 0 -4px 2px">AI Director</div>
+    <div class="bubble">Make it punchier for Instagram — cut the slow pour, add captions with the brand font, end on the logo.</div>
+    <div class="ai"><img src="../../../brand/reelforge-mark.svg"><div><span class="pill run"><span class="dot"></span>Planning on your Mac…</span><div style="color:var(--text-muted);font-size:11.5px;margin-top:6px">Claude Opus 5.5 · reads transcript + shots</div></div></div>
+    <div style="flex:1"></div>
+    <div class="chips"><span class="pill">Tighten pacing</span><span class="pill">Add captions</span><span class="pill">Beat-sync cuts</span></div>
+    <div class="ask"><div class="ph" style="color:var(--text-muted)">Tell the AI Director what to change…</div><div class="send"></div></div>
+  </div>
+</div>
+<div class="cap"><b>3 · Project.</b> Poster frame + compact timeline (no editing by finger), undo, and the AI Director prompt. The plan runs on the Mac with the provider chosen there.</div>
+</div>
+
+<!-- 4 Proposal review -->
+<div>
+<div class="phone">
+  <div class="status"><span>9:41</span><i>●●● 5G ▮</i></div>
+  <div class="top"><div class="back">‹</div><div><div class="t">Proposal · 7 edits</div><div class="sub">Café Opening · based on rev 41</div></div></div>
+  <div class="body">
+    <div class="card">
+      <div style="color:var(--text-secondary);margin-bottom:10px">“Tightened the opening to 1.2 s cuts, removed the slow pour, captions in Inter Bold, logo end card.”</div>
+      <div class="grid2"><div class="kv" style="border:0;padding:0"><span>Length</span><b>0:28 → 0:21</b></div><div class="kv" style="border:0;padding:0"><span>Clips</span><b>12 → 10</b></div></div>
+    </div>
+    <div class="card">
+      <div class="label">Changes</div>
+      <div class="op"><span class="k del">Remove</span><span class="d"><b>pour_slowmo.mov</b> · 00:06–00:11</span></div>
+      <div class="op"><span class="k trim">Trim</span><span class="d"><b>barista_wide.mp4</b> · out 3.4 s → 1.2 s</span></div>
+      <div class="op"><span class="k trim">Trim</span><span class="d"><b>cup_closeup.mp4</b> · in +0.6 s</span></div>
+      <div class="op"><span class="k add">Add</span><span class="d"><b>Captions</b> · 14 lines · Inter Bold, bottom safe area</span></div>
+      <div class="op"><span class="k fx">Effect</span><span class="d"><b>Punch-in zoom</b> on 3 cuts</span></div>
+      <div class="op"><span class="k add">Add</span><span class="d"><b>Logo end card</b> · motion template · 1.5 s</span></div>
+      <div class="op"><span class="k trim">Move</span><span class="d"><b>music.wav</b> · fade out 0:19–0:21</span></div>
+    </div>
+    <div class="btn">Preview before/after (720p, 4.1 MB)</div>
+    <div style="flex:1"></div>
+    <div class="grid2"><div class="btn">Reject</div><div class="btn mint">Apply 7 edits</div></div>
+    <div style="text-align:center;color:var(--text-muted);font-size:11.5px">Applied as one undo step. Face ID asked first.</div>
+  </div>
+</div>
+<div class="cap"><b>4 · Review.</b> Operations from the proposal, the size of any download shown before it starts. Apply from the phone is a new authority — see the plan's questions.</div>
+</div>
+
+<!-- 5 Export -->
+<div>
+<div class="phone">
+  <div class="status"><span>9:41</span><i>●●● 5G ▮</i></div>
+  <div class="top"><div class="back">‹</div><div><div class="t">Export</div><div class="sub">Bali Trip Reel</div></div></div>
+  <div class="body">
+    <div class="label" style="margin:0 0 -4px 2px">Preset</div>
+    <div class="preset on"><div class="n">Reels / TikTok</div><div class="m">1080×1920 · H.264 · 30 fps</div></div>
+    <div class="grid2"><div class="preset"><div class="n">Square</div><div class="m">1080×1080</div></div><div class="preset"><div class="n">YouTube</div><div class="m">1920×1080</div></div></div>
+    <div class="card">
+      <div class="label">Exporting</div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:8px"><b>Frame 632 / 1020</b><span class="mono" style="color:var(--accent-orange)">62%</span></div>
+      <div class="bar"><span style="width:62%"></span></div>
+      <div style="display:flex;justify-content:space-between;margin-top:10px"><span style="color:var(--text-muted);font-size:11.5px">Saved on your Mac in Exports</span><span class="btn sm">Cancel</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Ready</div>
+      <div class="proj"><div class="thumb b"></div><div><div class="n">bali-trip-reel.mp4</div><div class="m">yesterday · 0:34 · 38.2 MB</div></div><div class="sp"></div><span class="pill ok">Done</span></div>
+      <div class="grid2" style="margin-top:10px"><div class="btn sm">Preview 720p · 6 MB</div><div class="btn sm">Full · 38 MB</div></div>
+    </div>
+    <div style="flex:1"></div>
+    <div class="btn orange">Export</div>
+  </div>
+  <div class="tabs"><div class="tab"><div class="ic"></div>Home</div><div class="tab"><div class="ic"></div>Projects</div><div class="tab"><div class="ic badge"></div>Review</div><div class="tab on"><div class="ic"></div>Exports</div><div class="tab"><div class="ic"></div>Settings</div></div>
+</div>
+<div class="cap"><b>5 · Export &amp; download.</b> Presets only, no file paths from the phone. Downloads come through the relay in encrypted pieces; the 720p preview is the default.</div>
+</div>
+
+<!-- 6 Upload sheet -->
+<div>
+<div class="phone">
+  <div class="status"><span>9:41</span><i>●●● 5G ▮</i></div>
+  <div class="top"><div class="back">‹</div><div><div class="t">Café Opening</div><div class="sub">Media</div></div></div>
+  <div class="body">
+    <div class="grid2">
+      <div class="thumb" style="width:auto;height:150px;border-radius:12px"></div><div class="thumb b" style="width:auto;height:150px;border-radius:12px"></div>
+      <div class="thumb c" style="width:auto;height:150px;border-radius:12px"></div><div class="thumb" style="width:auto;height:150px;border-radius:12px"></div>
+    </div>
+  </div>
+  <div class="dim"></div>
+  <div class="sheet">
+    <div class="grab"></div>
+    <div style="font-size:16px;font-weight:650;margin-bottom:4px">Send to your Mac</div>
+    <div style="color:var(--text-muted);font-size:12px;margin-bottom:14px">Encrypted on this phone, imported into “Café Opening”.</div>
+    <div class="proj" style="border:0;padding-top:0"><div class="thumb"></div><div style="flex:1"><div class="n">IMG_4821.MOV</div><div class="m">4K HEVC · 0:18 · 212 MB</div><div class="bar" style="margin-top:8px"><span style="width:41%;background:var(--accent-mint)"></span></div></div><span class="mono" style="color:var(--accent-mint)">41%</span></div>
+    <div class="proj"><div class="thumb b"></div><div style="flex:1"><div class="n">IMG_4822.MOV</div><div class="m">waiting · 96 MB</div></div><span class="pill">Queued</span></div>
+    <div class="grid2" style="margin-top:16px"><div class="btn">Cancel</div><div class="btn mint">Choose more</div></div>
+  </div>
+</div>
+<div class="cap"><b>6 · Send media.</b> Upload from the camera roll in pieces to the Mac's inbox, then imported (demuxer forced per extension, as today).</div>
+</div>
+
+<!-- Desktop settings -->
+<div>
+<div class="desk">
+  <div style="display:flex;align-items:center;gap:10px"><div style="flex:1"><h2>Phone remote</h2><div class="s">Control this Mac from your phone through your own relay. Nothing is readable by the relay.</div></div><span class="pill ok"><span class="dot"></span>Connected</span></div>
+  <div class="steps"><span>1 · Relay deployed</span><span>2 · Address set</span><span class="cur">3 · Pair a phone</span></div>
+  <div class="sec">
+    <div class="k">Relay address</div><div class="field"><span class="v mono">https://reelforge-remote.up.railway.app</span><span class="pill ok">healthz ok</span></div>
+    <div class="k">Relay variable</div><div class="field"><span class="v mono">REELFORGE_REMOTE_AUTH=9f3c…a71e</span><span class="btn sm">Copy</span></div>
+    <div class="k">Pair a phone</div>
+    <div style="display:flex;gap:16px;align-items:center">
+      <div class="qr" id="qr"></div>
+      <div style="flex:1;color:var(--text-secondary);font-size:12.5px">Scan with the phone camera, or <span style="color:var(--accent-mint)">copy the link</span>. The link holds your secret: anyone with it can direct this Mac. Don't screenshot or share it.<div style="display:flex;gap:8px;margin-top:12px"><span class="btn sm">Copy link</span><span class="btn sm">New pairing (unpair all)</span></div></div>
+    </div>
+    <div class="k">Phones</div>
+    <div><div class="proj" style="padding-top:0;border:0"><div style="flex:1"><div class="n">iPhone · Safari</div><div class="m">last seen now · app lock on</div></div><span class="pill ok">Online</span></div></div>
+    <div class="k">Start with the app</div><div style="display:flex;gap:8px;align-items:center"><span class="pill mint">On</span><span style="color:var(--text-muted);font-size:12px">The Mac only connects out; no port is opened.</span><div style="flex:1"></div><span class="btn sm">Stop</span></div>
+  </div>
+</div>
+<div class="cap" style="max-width:720px"><b>7 · Desktop Settings → Phone remote.</b> Sits beside “Claude &amp; ChatGPT”. Same flow as <span class="mono">seeker remote --setup</span>, but in the app: copy the relay variable, set the address, scan to pair.</div>
+</div>
+
+</div>
+<script>
+// decorative QR-like pattern (not a real code)
+const q=document.getElementById('qr');let s=7;const r=()=>(s=(s*16807)%2147483647)/2147483647;
+const fin=(x,y)=>[[0,0],[14,0],[0,14]].some(([a,b])=>x>=a&&x<a+7&&y>=b&&y<b+7&&(x==a||x==a+6||y==b||y==b+6||(x>a+1&&x<a+5&&y>b+1&&y<b+5)));
+const inFin=(x,y)=>[[0,0],[14,0],[0,14]].some(([a,b])=>x>=a-1&&x<a+8&&y>=b-1&&y<b+8);
+for(let y=0;y<21;y++)for(let x=0;x<21;x++){const i=document.createElement('i');if(!(inFin(x,y)?fin(x,y):r()>.52))i.className='e';q.appendChild(i);}
+</script>
+</body>
+</html>

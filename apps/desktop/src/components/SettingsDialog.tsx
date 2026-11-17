@@ -4,6 +4,7 @@ import type { Notify } from "../editor.ts";
 import { keychain } from "../native.ts";
 import { Icon } from "../icons.tsx";
 import { ConnectorSettings } from "./ConnectorSettings.tsx";
+import { PhoneRemoteSettings } from "./PhoneRemoteSettings.tsx";
 
 /** AI provider keys: saved to the macOS Keychain by the desktop shell, never shown again. */
 export function SettingsDialog({ client, projectId, notify, onClose }: { client: Client | null; projectId: string | null; notify: Notify; onClose: () => void }) {
@@ -74,6 +75,7 @@ export function SettingsDialog({ client, projectId, notify, onClose }: { client:
           )}
         </section>
         <ConnectorSettings client={client} notify={notify} />
+        <PhoneRemoteSettings client={client} notify={notify} />
         {projectId && (
           <section className="rf-settings-group">
             <h3>This project</h3>

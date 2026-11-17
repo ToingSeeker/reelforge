@@ -120,6 +120,10 @@ export function createClient(info: ApiInfo) {
     stopConnector: () => request<{ connector: ConnectorStatus }>("POST", "/v1/connector/stop").then((r) => r.connector),
     rotateConnectorKey: () => request<{ connector: ConnectorStatus }>("POST", "/v1/connector/rotate-key").then((r) => r.connector),
     revokeConnector: () => request<{ connector: ConnectorStatus }>("POST", "/v1/connector/revoke").then((r) => r.connector),
+    remote: () => request<{ remote: RemoteStatus }>("GET", "/v1/remote").then((r) => r.remote),
+    startRemote: (body: { url?: string | null }) => request<{ remote: RemoteStatus }>("POST", "/v1/remote/start", body).then((r) => r.remote),
+    stopRemote: () => request<{ remote: RemoteStatus }>("POST", "/v1/remote/stop").then((r) => r.remote),
+    rotateRemote: () => request<{ remote: RemoteStatus }>("POST", "/v1/remote/rotate").then((r) => r.remote),
     consent: (id: string) => request<{ consent: AIConsent | null }>("GET", `/v1/projects/${encodeURIComponent(id)}/ai-consent`).then((r) => r.consent),
     setConsent: (id: string, granted: boolean, provider?: string) =>
       request<{ consent: AIConsent | null }>("POST", `/v1/projects/${encodeURIComponent(id)}/ai-consent`, { granted, ...(provider ? { provider } : {}) }).then((r) => r.consent),
@@ -180,6 +184,17 @@ export interface AIProviderInfo {
   available?: boolean;
   defaultModel: string | null;
   models: string[];
+}
+
+/** The phone remote the engine runs (GET /v1/remote). */
+export interface RemoteStatus {
+  state: "stopped" | "connecting" | "online" | "error";
+  settings: { url: string | null; autoStart: boolean };
+  /** Value for REELFORGE_REMOTE_AUTH on the relay. */
+  relayAuth: string;
+  /** Holds the pairing secret: show only to the owner, as a QR code or behind Copy. */
+  pairingLink: string | null;
+  error: string | null;
 }
 
 /** The Claude.ai / ChatGPT connector the engine runs (GET /v1/connector). */

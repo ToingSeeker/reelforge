@@ -69,6 +69,16 @@ export interface ApiServerOptions {
   log?: (line: string) => void;
   /** The Claude.ai / ChatGPT connector, run by the same process (`reelforge serve` passes one). */
   connector?: ConnectorControl;
+  /** The phone remote (RemoteManager in @reelforge/remote), run by the same process. */
+  remote?: RemoteControl;
+}
+
+/** What Settings → Phone remote needs from the remote manager. */
+export interface RemoteControl {
+  status(): unknown;
+  start(input: { url?: string | null }): Promise<unknown>;
+  stop(): Promise<unknown>;
+  rotate(): Promise<unknown>;
 }
 
 /** What Settings needs from the remote connector (implemented by ConnectorManager in @reelforge/mcp). */
@@ -258,6 +268,11 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
   const connector = (): ConnectorControl => {
     if (!opts.connector) throw new ReelForgeError("UNAVAILABLE", "this engine was started without the connector");
     return opts.connector;
+  };
+
+  const remote = (): RemoteControl => {
+    if (!opts.remote) throw new ReelForgeError("UNAVAILABLE", "this engine was started without the phone remote");
+    return opts.remote;
   };
 
   const routes: Route[] = [
@@ -474,6 +489,18 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     { method: "POST", pattern: re("/v1/connector/stop"), handle: async ({ res }) => send(res, 200, { connector: await connector().stop() }) },
     { method: "POST", pattern: re("/v1/connector/rotate-key"), handle: ({ res }) => send(res, 200, { connector: connector().rotateKey() }) },
     { method: "POST", pattern: re("/v1/connector/revoke"), handle: ({ res }) => send(res, 200, { connector: connector().revokeAll() }) },
+    { method: "GET", pattern: re("/v1/remote"), handle: ({ res }) => send(res, 200, { remote: remote().status() }) },
+    {
+      method: "POST",
+      pattern: re("/v1/remote/start"),
+      handle: async ({ req, res }) => {
+        const b = (await readJson(req)) as { url?: unknown };
+        if (b.url !== undefined && b.url !== null && typeof b.url !== "string") throw new ReelForgeError("VALIDATION_ERROR", "url must be a string");
+        return send(res, 200, { remote: await remote().start(typeof b.url === "string" ? { url: b.url } : {}) });
+      },
+    },
+    { method: "POST", pattern: re("/v1/remote/stop"), handle: async ({ res }) => send(res, 200, { remote: await remote().stop() }) },
+    { method: "POST", pattern: re("/v1/remote/rotate"), handle: async ({ res }) => send(res, 200, { remote: await remote().rotate() }) },
     {
       method: "GET",
       pattern: re(`/v1/projects/${ID}/ai-consent`),

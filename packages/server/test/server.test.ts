@@ -405,3 +405,31 @@ test("connector routes: unavailable without one, and pass through to it", async 
   assert.equal((await call(withConn, "POST", "/v1/connector/rotate-key")).status, 200);
   assert.equal((await call(withConn, "POST", "/v1/connector/start", { auth: false })).status, 401);
 });
+
+test("phone remote routes: unavailable without one, and pass through to it", async (t) => {
+  const srv = await boot(t);
+  assert.equal((await call(srv, "GET", "/v1/remote")).status, 503);
+
+  const dir = mkdtempSync(join(tmpdir(), "reelforge-server-remote-"));
+  const db = openDatabase(join(dir, "reelforge.db"));
+  const calls: unknown[] = [];
+  const fake = {
+    status: () => ({ state: "stopped" }),
+    start: async (input: unknown) => (calls.push(input), { state: "connecting" }),
+    stop: async () => ({ state: "stopped" }),
+    rotate: async () => ({ rotated: true }),
+  };
+  const withRemote = await startApiServer({ db, token: TOKEN, cacheDir: join(dir, "cache"), remote: fake });
+  t.after(async () => {
+    await withRemote.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  assert.deepEqual(await (await call(withRemote, "GET", "/v1/remote")).json(), { remote: { state: "stopped" } });
+  assert.equal((await call(withRemote, "POST", "/v1/remote/start", { body: { url: 42 } })).status, 400);
+  assert.deepEqual(await (await call(withRemote, "POST", "/v1/remote/start", { body: { url: "https://relay.test" } })).json(), { remote: { state: "connecting" } });
+  assert.equal((await call(withRemote, "POST", "/v1/remote/start", { body: {} })).status, 200);
+  assert.deepEqual(calls, [{ url: "https://relay.test" }, {}]);
+  assert.deepEqual(await (await call(withRemote, "POST", "/v1/remote/rotate")).json(), { remote: { rotated: true } });
+  assert.equal((await call(withRemote, "POST", "/v1/remote/stop", { auth: false })).status, 401);
+});

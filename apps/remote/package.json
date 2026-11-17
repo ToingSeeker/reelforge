@@ -1,0 +1,14 @@
+{
+  "name": "forge-remote",
+  "version": "0.1.0-alpha.1",
+  "description": "Relay and phone web app for the ReelForge phone remote",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
