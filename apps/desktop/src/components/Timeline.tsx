@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as RPointerEvent } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as RPointerEvent } from "react";
 import type { Asset, Caption, Clip, Timeline as TimelineData, TimelineOp, Track } from "@reelforge/core/schema";
 import { canPlace } from "@reelforge/core/timeline-ops";
 import { trackLabels } from "@reelforge/core/schema";
@@ -7,7 +7,7 @@ import type { Client } from "../api.ts";
 import { useThumbnail } from "../editor.ts";
 import { Icon, type IconName } from "../icons.tsx";
 
-const HEADER_W = 176; // keep in step with .rf-track-head width in app.css
+const HEADER_W = 196; // keep in step with --track-head-w in app.css
 const SNAP_PX = 8;
 const EDGE_PX = 7;
 const MIN_PX_PER_FRAME = 0.02;
@@ -87,6 +87,23 @@ export function Timeline(p: Props) {
   const px = pxPerFrame ?? fitPx();
   const contentFrames = Math.max((tl?.durationFrames ?? 0) + Math.round(10 * fpsNum), p.playhead + Math.round(fpsNum), Math.ceil(viewW / px));
   const contentW = contentFrames * px;
+
+  // Only clips, captions and ruler ticks near the viewport are mounted. The window moves in whole
+  // viewport-sized steps (one viewport of margin each side) so scrolling re-renders the rows rarely.
+  const [scrollChunk, setScrollChunk] = useState(0);
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const chunkW = Math.max(200, viewW);
+    const update = () => setScrollChunk(Math.floor(el.scrollLeft / chunkW));
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    return () => el.removeEventListener("scroll", update);
+  }, [viewW]);
+  const visPx = useMemo(() => {
+    const chunkW = Math.max(200, viewW);
+    return { from: (scrollChunk - 1) * chunkW, to: (scrollChunk + 3) * chunkW };
+  }, [scrollChunk, viewW]);
 
   const frameAtClientX = useCallback(
     (clientX: number) => {
@@ -258,50 +275,83 @@ export function Timeline(p: Props) {
   };
 
   const step = rulerStep(fps, px);
-  const ticks: number[] = [];
-  for (let s = 0; s * fpsNum <= contentFrames; s += step) ticks.push(s);
+  const ticks = useMemo(() => {
+    const out: number[] = [];
+    for (let t = 0; t * fpsNum <= contentFrames; t += step) {
+      const x = t * fpsNum * px;
+      if (x >= visPx.from - 200 && x <= visPx.to) out.push(t);
+    }
+    return out;
+  }, [step, fpsNum, contentFrames, px, visPx]);
   const hasSelection = p.selection.size > 0;
 
-  const tools: { label: string; icon: IconName; onClick: () => void; disabled: boolean; title: string }[] = [
-    { label: "Split", icon: "split", onClick: p.onSplit, disabled: !tl, title: "Split at playhead (S)" },
-    { label: "Delete", icon: "trash", onClick: () => p.onDelete(false), disabled: !hasSelection, title: "Delete selected (⌫)" },
-    { label: "Ripple", icon: "ripple", onClick: () => p.onDelete(true), disabled: !hasSelection, title: "Ripple delete: close the gap (⇧⌫)" },
+  // Handlers for the (memoised) track rows read the latest props through a ref, so the rows only
+  // re-render when the timeline, zoom, selection or a drag changes, never because the playhead moved.
+  const live = useRef({ startClipDrag, p, frameAtClientX });
+  live.current = { startClipDrag, p, frameAtClientX };
+  const handlers = useMemo<RowHandlers>(
+    () => ({
+      clipDown: (e, clip, track) => live.current.startClipDrag(e, clip, track),
+      laneDown: (e) => {
+        live.current.p.onSelect(new Set());
+        live.current.p.onPlayhead(live.current.frameAtClientX(e.clientX));
+      },
+      captionDown: (e, c, track) => {
+        live.current.p.onSelect(new Set());
+        live.current.p.onSelectCaption(c.id);
+        if (!track.locked) setDrag({ kind: "caption", caption: c, originX: e.clientX, delta: 0, moved: false });
+      },
+      toggle: (track, patch, label) => live.current.p.onApply(label, [{ type: "track.update", trackId: track.id, ...patch }]),
+    }),
+    [],
+  );
+
+  const tools: { label: string; icon: IconName; onClick: () => void; disabled: boolean; tip: string }[] = [
+    { label: "Split at playhead", icon: "cut", onClick: p.onSplit, disabled: !tl, tip: "Split at playhead  S" },
+    { label: "Delete selected", icon: "trash", onClick: () => p.onDelete(false), disabled: !hasSelection && !p.selectedCaption, tip: "Delete  ⌫" },
+    { label: "Ripple delete", icon: "ripple", onClick: () => p.onDelete(true), disabled: !hasSelection, tip: "Ripple delete: close the gap  ⇧⌫" },
   ];
 
   return (
-    <section className="rf-timeline" aria-label="Timeline">
+    <section className="rf-panel rf-timeline" aria-label="Timeline">
       <div className="rf-timeline-toolbar">
-        {tools.map((t) => (
-          <button key={t.label} className="rf-tool" onClick={t.onClick} disabled={t.disabled} title={t.title}>
-            <Icon name={t.icon} size={16} /> {t.label}
-          </button>
-        ))}
+        <div className="rf-toolgroup">
+          {tools.map((t) => (
+            <button key={t.label} className="rf-icon-btn" onClick={t.onClick} disabled={t.disabled} aria-label={t.label} data-tip={t.tip}>
+              <Icon name={t.icon} size={17} />
+            </button>
+          ))}
+        </div>
         <span className="rf-toolbar-divider" />
-        <button className="rf-tool" aria-pressed={snap} onClick={() => setSnap((s) => !s)} title="Snap to clip edges and playhead">
-          <Icon name="magnet" size={16} /> Snap
+        <button className="rf-icon-btn" aria-pressed={snap} onClick={() => setSnap((v) => !v)} aria-label="Snap" data-tip={snap ? "Snapping on: clip edges, playhead" : "Snapping off"}>
+          <Icon name="magnet" size={17} />
         </button>
-        <span className="rf-toolbar-spacer" />
-        <span className="rf-timecode rf-toolbar-tc">
-          <strong>{formatClock(p.playhead, fps)}</strong> / {formatClock(tl?.durationFrames ?? 0, fps)}
+        <span className="rf-toolbar-meta rf-num-tab">
+          {tl ? `${tl.clips.length} clip${tl.clips.length === 1 ? "" : "s"} · ${formatClock(tl.durationFrames, fps)}` : ""}
+          {hasSelection ? ` · ${p.selection.size} selected` : ""}
         </span>
-        <button className="rf-icon-btn" onClick={() => zoomBy(1 / 1.4)} aria-label="Zoom out" title="Zoom out (⌘ + scroll)">
-          <Icon name="zoomOut" size={16} />
-        </button>
-        <input
-          className="rf-zoom"
-          type="range"
-          min={Math.log(MIN_PX_PER_FRAME)}
-          max={Math.log(MAX_PX_PER_FRAME)}
-          step={0.01}
-          value={Math.log(px)}
-          onChange={(e) => setPx(Math.exp(Number(e.target.value)))}
-          aria-label="Timeline zoom"
-        />
-        <button className="rf-icon-btn" onClick={() => zoomBy(1.4)} aria-label="Zoom in">
-          <Icon name="zoomIn" size={16} />
-        </button>
-        <button className="rf-tool" onClick={() => setPx(fitPx())} title="Fit the whole timeline">
-          Fit
+        <span className="rf-grow" />
+        <div className="rf-zoomgroup">
+          <button className="rf-icon-btn rf-icon-btn-sm" onClick={() => zoomBy(1 / 1.4)} aria-label="Zoom out" data-tip="Zoom out  ⌘ scroll">
+            <Icon name="minus" size={15} />
+          </button>
+          <input
+            className="rf-slider rf-zoom"
+            type="range"
+            min={Math.log(MIN_PX_PER_FRAME)}
+            max={Math.log(MAX_PX_PER_FRAME)}
+            step={0.01}
+            value={Math.log(px)}
+            style={{ "--rf-fill": `${((Math.log(px) - Math.log(MIN_PX_PER_FRAME)) / (Math.log(MAX_PX_PER_FRAME) - Math.log(MIN_PX_PER_FRAME))) * 100}%` } as React.CSSProperties}
+            onChange={(e) => setPx(Math.exp(Number(e.target.value)))}
+            aria-label="Timeline zoom"
+          />
+          <button className="rf-icon-btn rf-icon-btn-sm" onClick={() => zoomBy(1.4)} aria-label="Zoom in" data-tip="Zoom in  ⌘ scroll">
+            <Icon name="plus" size={15} />
+          </button>
+        </div>
+        <button className="rf-icon-btn" onClick={() => setPx(fitPx())} aria-label="Fit timeline to window" data-tip="Fit to window">
+          <Icon name="fit" size={17} />
         </button>
       </div>
 
@@ -311,101 +361,33 @@ export function Timeline(p: Props) {
             <div className="rf-track-head rf-ruler-head" />
             <div
               className="rf-ruler"
-              style={{ width: contentW }}
+              style={{ width: contentW, "--rf-minor": `${(step * fpsNum * px) / 5}px` } as React.CSSProperties}
               onPointerDown={(e) => {
                 p.onPlayhead(frameAtClientX(e.clientX));
                 setDrag({ kind: "playhead" });
               }}
             >
-              {ticks.map((s) => (
-                <span key={s} className="rf-tick" style={{ left: s * fpsNum * px }}>
-                  {formatClock(Math.round(s * fpsNum), fps).replace(/\.00$/, "")}
-                </span>
-              ))}
+              <RulerTicks ticks={ticks} fpsNum={fpsNum} px={px} fps={fps} />
             </div>
           </div>
 
-          {(tl?.tracks ?? []).map((track) => (
-            <div key={track.id} className="rf-track-row" data-kind={track.kind}>
-              <TrackHeader track={track} label={labels.get(track.id) ?? ""} onToggle={(patch, label) => p.onApply(label, [{ type: "track.update", trackId: track.id, ...patch }])} />
-              <div
-                className={`rf-lane rf-lane-${track.kind}${track.locked ? " is-locked" : ""}${track.hidden || track.muted ? " is-dimmed" : ""}`}
-                data-track-id={track.id}
-                style={{ width: contentW }}
-                onPointerDown={(e) => {
-                  if (e.target !== e.currentTarget) return;
-                  p.onSelect(new Set());
-                  p.onPlayhead(frameAtClientX(e.clientX));
-                }}
-              >
-                {track.kind === "caption" &&
-                  tl!.captions
-                    .filter((c) => c.trackId === track.id)
-                    .map((c) => {
-                      const start = c.start + (drag?.kind === "caption" && drag.caption.id === c.id ? drag.delta : 0);
-                      return (
-                        <div
-                          key={c.id}
-                          className={`rf-caption-block${p.selectedCaption === c.id ? " is-selected" : ""}`}
-                          style={{ left: start * px, width: Math.max(2, c.duration * px) }}
-                          title={c.text}
-                          role="button"
-                          aria-pressed={p.selectedCaption === c.id}
-                          aria-label={`Caption: ${c.text}`}
-                          onPointerDown={(e) => {
-                            if (e.button !== 0) return;
-                            e.stopPropagation();
-                            p.onSelect(new Set());
-                            p.onSelectCaption(c.id);
-                            if (!track.locked) setDrag({ kind: "caption", caption: c, originX: e.clientX, delta: 0, moved: false });
-                          }}
-                        >
-                          <span className="rf-clip-label">{c.text}</span>
-                        </div>
-                      );
-                    })}
-                {tl!.clips
-                  .filter((c) => (drag?.kind === "move" && drag.clip.id === c.id ? drag.trackId : c.trackId) === track.id)
-                  .map((c) => {
-                    let start = c.start;
-                    let duration = c.duration;
-                    let sourceIn = c.sourceIn;
-                    if (drag && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id) {
-                      if (drag.kind === "move") start += drag.delta;
-                      else if (drag.kind === "trim-start") {
-                        start += drag.delta;
-                        duration -= drag.delta;
-                        sourceIn += drag.delta;
-                      } else duration += drag.delta;
-                    }
-                    return (
-                      <ClipView
-                        key={c.id}
-                        client={p.client}
-                        projectId={tl!.project.id}
-                        clip={c}
-                        track={track}
-                        asset={assets.get(c.assetId)}
-                        left={start * px}
-                        width={Math.max(2, duration * px)}
-                        sourceIn={sourceIn}
-                        pxPerFrame={px}
-                        selected={p.selection.has(c.id)}
-                        markers={p.markers.get(c.id)}
-                        clipStart={start}
-                        dragging={drag !== null && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id && drag.moved}
-                        onPointerDown={(e) => startClipDrag(e, c, track)}
-                      />
-                    );
-                  })}
-                {dropHover?.trackId === track.id && (
-                  <div className={`rf-drop-marker${dropHover.ok ? "" : " is-invalid"}`} style={{ left: dropHover.frame * px }} />
-                )}
-              </div>
-            </div>
-          ))}
+          <TrackRows
+            client={p.client}
+            timeline={tl}
+            labels={labels}
+            assets={assets}
+            px={px}
+            contentW={contentW}
+            visPx={visPx}
+            drag={drag}
+            dropHover={dropHover}
+            selection={p.selection}
+            selectedCaption={p.selectedCaption}
+            markers={p.markers}
+            handlers={handlers}
+          />
 
-          <div className="rf-playhead" style={{ left: HEADER_W + p.playhead * px }} aria-hidden="true">
+          <div className="rf-playhead" style={{ transform: `translateX(${HEADER_W + p.playhead * px}px)` }} aria-hidden="true">
             <span />
           </div>
 
@@ -420,47 +402,174 @@ export function Timeline(p: Props) {
   );
 }
 
+const RulerTicks = memo(function RulerTicks({ ticks, fpsNum, px, fps }: { ticks: number[]; fpsNum: number; px: number; fps: Rational }) {
+  return (
+    <>
+      {ticks.map((t) => (
+        <span key={t} className="rf-tick" style={{ left: t * fpsNum * px }}>
+          {formatClock(Math.round(t * fpsNum), fps).replace(/\.00$/, "")}
+        </span>
+      ))}
+    </>
+  );
+});
+
+interface RowHandlers {
+  clipDown: (e: RPointerEvent, clip: Clip, track: Track) => void;
+  laneDown: (e: RPointerEvent) => void;
+  captionDown: (e: RPointerEvent, c: Caption, track: Track) => void;
+  toggle: (track: Track, patch: Partial<Track>, label: string) => void;
+}
+
+const LANE_ICON: Record<Track["kind"], IconName> = { video: "video", overlay: "layers", audio: "waveform", caption: "captions" };
+
+const TrackRows = memo(function TrackRows(p: {
+  client: Client | null;
+  timeline: TimelineData | null;
+  labels: ReadonlyMap<string, string>;
+  assets: ReadonlyMap<string, Asset>;
+  px: number;
+  contentW: number;
+  /** Horizontal pixel window to mount; items outside it are skipped (the dragged and selected ones never are). */
+  visPx: { from: number; to: number };
+  drag: Drag | null;
+  dropHover: { trackId: string; frame: number; ok: boolean } | null;
+  selection: ReadonlySet<string>;
+  selectedCaption: string | null;
+  markers: ReadonlyMap<string, { beats: number[]; cuts: number[] }>;
+  handlers: RowHandlers;
+}) {
+  const tl = p.timeline;
+  const { drag, px, handlers } = p;
+  const fps = tl?.project.settings.fps ?? { num: 30, den: 1 };
+  const inView = (start: number, duration: number) => (start + duration) * px >= p.visPx.from && start * px <= p.visPx.to;
+  return (
+    <>
+      {(tl?.tracks ?? []).map((track) => {
+        const allClips = tl!.clips.filter((c) => (drag?.kind === "move" && drag.clip.id === c.id ? drag.trackId : c.trackId) === track.id);
+        const allCaptions = track.kind === "caption" ? tl!.captions.filter((c) => c.trackId === track.id) : [];
+        const empty = !allClips.length && !allCaptions.length && p.dropHover?.trackId !== track.id && !(drag?.kind === "move");
+        const clips = allClips.filter((c) => inView(c.start, c.duration) || p.selection.has(c.id) || (drag && "clip" in drag && drag.clip.id === c.id));
+        const captions = allCaptions.filter((c) => inView(c.start, c.duration) || p.selectedCaption === c.id || (drag?.kind === "caption" && drag.caption.id === c.id));
+        return (
+          <div key={track.id} className={`rf-track-row${empty ? " is-empty" : ""}`} data-kind={track.kind}>
+            <TrackHeader track={track} label={p.labels.get(track.id) ?? ""} onToggle={(patch, label) => handlers.toggle(track, patch, label)} />
+            <div
+              className={`rf-lane rf-lane-${track.kind}${track.locked ? " is-locked" : ""}${track.hidden || track.muted ? " is-dimmed" : ""}`}
+              data-track-id={track.id}
+              style={{ width: p.contentW }}
+              onPointerDown={(e) => {
+                if (e.target !== e.currentTarget) return;
+                handlers.laneDown(e);
+              }}
+            >
+              {captions.map((c) => {
+                const start = c.start + (drag?.kind === "caption" && drag.caption.id === c.id ? drag.delta : 0);
+                const sel = p.selectedCaption === c.id;
+                return (
+                  <div
+                    key={c.id}
+                    className={`rf-caption-block${sel ? " is-selected" : ""}`}
+                    style={{ left: start * px, width: Math.max(2, c.duration * px) }}
+                    title={c.text}
+                    role="button"
+                    aria-pressed={sel}
+                    aria-label={`Caption: ${c.text}`}
+                    onPointerDown={(e) => {
+                      if (e.button !== 0) return;
+                      e.stopPropagation();
+                      handlers.captionDown(e, c, track);
+                    }}
+                  >
+                    {c.duration * px > 40 && <Icon name="captions" size={13} />}
+                    <span className="rf-clip-label">{c.text}</span>
+                  </div>
+                );
+              })}
+              {clips.map((c) => {
+                let start = c.start;
+                let duration = c.duration;
+                let sourceIn = c.sourceIn;
+                if (drag && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id) {
+                  if (drag.kind === "move") start += drag.delta;
+                  else if (drag.kind === "trim-start") {
+                    start += drag.delta;
+                    duration -= drag.delta;
+                    sourceIn += drag.delta;
+                  } else duration += drag.delta;
+                }
+                return (
+                  <ClipView
+                    key={c.id}
+                    client={p.client}
+                    projectId={tl!.project.id}
+                    clip={c}
+                    track={track}
+                    asset={p.assets.get(c.assetId)}
+                    left={start * px}
+                    width={Math.max(2, duration * px)}
+                    sourceIn={sourceIn}
+                    pxPerFrame={px}
+                    selected={p.selection.has(c.id)}
+                    markers={p.markers.get(c.id)}
+                    range={`${formatClock(start, fps)} – ${formatClock(start + duration, fps)}`}
+                    dragging={drag !== null && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id && drag.moved}
+                    onPointerDown={(e) => handlers.clipDown(e, c, track)}
+                  />
+                );
+              })}
+              {p.dropHover?.trackId === track.id && <div className={`rf-drop-marker${p.dropHover.ok ? "" : " is-invalid"}`} style={{ left: p.dropHover.frame * px }} />}
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+});
+
 function TrackHeader({ track, label, onToggle }: { track: Track; label: string; onToggle: (patch: Partial<Track>, label: string) => void }) {
   const audio = track.kind === "audio";
+  const name = track.kind === "caption" ? "Captions" : track.name;
   return (
     <div className="rf-track-head">
-      <div className="rf-track-title">
-        <div className="rf-track-id">{track.kind === "caption" ? "CAPTIONS" : label}</div>
-        {track.kind !== "caption" && <div className="rf-track-kind">{track.name.toUpperCase()}</div>}
-      </div>
       <div className="rf-track-controls">
+        <button
+          className="rf-icon-btn rf-icon-btn-xs"
+          aria-pressed={track.locked}
+          onClick={() => onToggle({ locked: !track.locked }, track.locked ? "Unlock track" : "Lock track")}
+          aria-label={`${track.locked ? "Unlock" : "Lock"} ${label || name}`}
+          data-tip={track.locked ? "Unlock" : "Lock"}
+        >
+          <Icon name={track.locked ? "lock" : "unlock"} size={14} />
+        </button>
         {/* Picture tracks: eye = picture, speaker = their videos' own sound. Audio tracks: speaker only. */}
-        {track.kind !== "audio" && (
+        {!audio && (
           <button
-            className="rf-icon-btn"
+            className="rf-icon-btn rf-icon-btn-xs"
             aria-pressed={track.hidden}
             onClick={() => onToggle({ hidden: !track.hidden }, track.hidden ? "Show track" : "Hide track")}
-            aria-label={`${track.hidden ? "Show" : "Hide"} ${label || track.name}`}
-            title={track.hidden ? "Show" : "Hide"}
+            aria-label={`${track.hidden ? "Show" : "Hide"} ${label || name}`}
+            data-tip={track.hidden ? "Show" : "Hide"}
           >
-            <Icon name={track.hidden ? "eyeOff" : "eye"} size={15} />
+            <Icon name={track.hidden ? "eyeOff" : "eye"} size={14} />
           </button>
         )}
         {track.kind !== "caption" && (
           <button
-            className="rf-icon-btn"
+            className="rf-icon-btn rf-icon-btn-xs"
             aria-pressed={track.muted}
             onClick={() => onToggle({ muted: !track.muted }, track.muted ? "Unmute track" : "Mute track")}
-            aria-label={`${track.muted ? "Unmute" : "Mute"} ${label}`}
-            title={track.muted ? "Unmute" : audio ? "Mute" : "Mute this track's video sound"}
+            aria-label={`${track.muted ? "Unmute" : "Mute"} ${label || name}`}
+            data-tip={track.muted ? "Unmute" : audio ? "Mute" : "Mute this track's video sound"}
           >
-            <Icon name={track.muted ? "volumeOff" : "volume"} size={15} />
+            <Icon name={track.muted ? "volumeOff" : "volume"} size={14} />
           </button>
         )}
-        <button
-          className="rf-icon-btn"
-          aria-pressed={track.locked}
-          onClick={() => onToggle({ locked: !track.locked }, track.locked ? "Unlock track" : "Lock track")}
-          aria-label={`${track.locked ? "Unlock" : "Lock"} ${label || track.name}`}
-          title={track.locked ? "Unlock" : "Lock"}
-        >
-          <Icon name={track.locked ? "lock" : "unlock"} size={15} />
-        </button>
+      </div>
+      <div className="rf-track-title" title={`${label ? `${label} · ` : ""}${name}`}>
+        <Icon name={LANE_ICON[track.kind]} size={15} />
+        <span className="rf-track-name">{name}</span>
+        {label && track.kind !== "caption" && <span className="rf-track-id">{label}</span>}
       </div>
     </div>
   );
@@ -480,39 +589,49 @@ interface ClipViewProps {
   dragging: boolean;
   onPointerDown: (e: RPointerEvent) => void;
   markers: { beats: number[]; cuts: number[] } | undefined;
-  /** Where the clip is drawn (may differ from clip.start while dragging). */
-  clipStart: number;
+  /** Timeline range shown under the name (follows a drag or trim). */
+  range: string;
 }
 
 function ClipView(p: ClipViewProps) {
   const thumb = useThumbnail(p.client, p.projectId, p.asset);
   const waveform = p.asset?.kind === "audio";
   const missing = p.asset?.status === "missing";
+  const picture = p.track.kind === "video" || p.track.kind === "overlay";
   const style: React.CSSProperties = { left: p.left, width: p.width };
-  if (thumb && !missing) {
-    if (waveform && p.asset?.durationFrames) {
-      // The waveform image spans the whole source; offset it so the visible slice matches sourceIn.
-      Object.assign(style, {
-        backgroundImage: `url(${thumb})`,
-        backgroundSize: `${p.asset.durationFrames * p.pxPerFrame}px 100%`,
-        backgroundPosition: `${-p.sourceIn * p.pxPerFrame}px center`,
-      });
-    } else if (!waveform && p.track.kind !== "audio") {
-      Object.assign(style, { backgroundImage: `url(${thumb})` });
-    }
+  let wave: React.CSSProperties | null = null;
+  if (thumb && !missing && waveform && p.asset?.durationFrames) {
+    // The waveform image spans the whole source; offset it so the visible slice matches sourceIn.
+    wave = {
+      backgroundImage: `url(${thumb})`,
+      backgroundSize: `${p.asset.durationFrames * p.pxPerFrame}px 100%`,
+      backgroundPosition: `${-p.sourceIn * p.pxPerFrame}px center`,
+    };
   }
+  const name = p.asset?.filename ?? "clip";
+  const roomy = p.width > 150;
   return (
     <div
-      className={`rf-clip rf-clip-${p.track.kind}${waveform ? " is-wave" : ""}${p.selected ? " is-selected" : ""}${p.dragging ? " is-dragging" : ""}${missing ? " is-missing" : ""}`}
+      className={`rf-clip rf-clip-${p.track.kind}${waveform ? " is-wave" : ""}${p.selected ? " is-selected" : ""}${p.dragging ? " is-dragging" : ""}${missing ? " is-missing" : ""}${p.width < 56 ? " is-tiny" : ""}`}
       style={style}
       onPointerDown={p.onPointerDown}
       role="button"
       aria-pressed={p.selected}
-      aria-label={`${p.asset?.filename ?? "clip"}${missing ? " (media offline)" : ""}`}
-      title={`${p.asset?.filename ?? ""}${missing ? " — media offline" : ""}`}
+      aria-label={`${name}${missing ? " (media offline)" : ""}${p.selected ? ", selected" : ""}`}
+      title={`${name} · ${p.range}${missing ? " · media offline" : ""}`}
     >
-      <span className="rf-clip-label">
-        {missing && <Icon name="alert" size={12} />} {p.asset?.filename.replace(/\.[^.]+$/, "") ?? "clip"}
+      {wave && <span className="rf-clip-wave" style={wave} aria-hidden="true" />}
+      {picture && thumb && !missing && !waveform && (
+        <span className="rf-clip-thumbs" style={{ backgroundImage: `url(${thumb})`, width: roomy ? Math.min(160, p.width * 0.42) : "100%" }} aria-hidden="true" />
+      )}
+      <span className="rf-clip-text">
+        <span className="rf-clip-label">
+          {missing && <Icon name="alert" size={12} />}
+          {waveform && <Icon name="waveform" size={13} />}
+          {p.track.kind === "overlay" && !thumb && <Icon name="layers" size={13} />}
+          {name}
+        </span>
+        {p.width > 110 && <span className="rf-clip-range rf-num-tab">{p.range}</span>}
       </span>
       {!!p.clip.props.transitionIn && <span className="rf-clip-transition" style={{ width: (p.clip.props.transitionIn / 2) * p.pxPerFrame }} title="Dissolve / crossfade in" />}
       {!!p.clip.props.fadeIn && <span className="rf-clip-fade rf-clip-fade-in" style={{ width: p.clip.props.fadeIn * p.pxPerFrame }} />}
@@ -523,8 +642,8 @@ function ClipView(p: ClipViewProps) {
       {p.markers?.cuts.map((f) => (
         <span key={`s${f}`} className="rf-marker rf-marker-cut" style={{ left: (f - p.clip.start) * p.pxPerFrame }} aria-hidden="true" />
       ))}
-      <span className="rf-clip-handle rf-clip-handle-start" />
-      <span className="rf-clip-handle rf-clip-handle-end" />
+      <span className="rf-clip-handle rf-clip-handle-start" aria-hidden="true" />
+      <span className="rf-clip-handle rf-clip-handle-end" aria-hidden="true" />
     </div>
   );
 }

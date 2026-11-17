@@ -1,6 +1,7 @@
 import {
   AnalysisStore,
   buildProjectContext,
+  consentCovers,
   isReelForgeError,
   OPERATION_TYPES,
   ProposalStore,
@@ -32,8 +33,9 @@ export async function propose(db: Database, projectId: string, provider: Planner
   const instruction = input.instruction.trim();
   if (!instruction || instruction.length > 4000) throw new ReelForgeError("VALIDATION_ERROR", "the instruction must be 1–4000 characters");
   const proposals = new ProposalStore(db);
-  if (provider.external && !proposals.consent(projectId)) {
-    throw new ReelForgeError("CONSENT_REQUIRED", `sending this project's context to ${provider.id} needs your permission first`, { provider: provider.id });
+  const recipient = provider.recipient ?? provider.id;
+  if (provider.external && !consentCovers(proposals.consent(projectId), recipient)) {
+    throw new ReelForgeError("CONSENT_REQUIRED", `sending this project's context to ${provider.id} needs your permission first`, { provider: provider.id, recipient });
   }
   const tl = new TimelineStore(db).get(projectId);
   const selection = [...new Set(input.selection ?? [])];

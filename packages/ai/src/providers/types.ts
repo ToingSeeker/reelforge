@@ -22,5 +22,7 @@ export interface PlannerProvider {
   id: string;
   /** External providers need the project's consent before context leaves the machine. */
   external: boolean;
+  /** Who receives the context when external ("anthropic", "openai", …); consent is granted per recipient. Defaults to the id. */
+  recipient?: string;
   complete(req: CompletionRequest): Promise<CompletionResult>;
 }

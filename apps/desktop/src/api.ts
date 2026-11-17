@@ -114,9 +114,15 @@ export function createClient(info: ApiInfo) {
     applyProposal: (proposalId: string) =>
       request<{ proposal: AIProposal; timeline: Timeline }>("POST", `/v1/proposals/${encodeURIComponent(proposalId)}/apply`),
     rejectProposal: (proposalId: string) => request<{ proposal: AIProposal }>("POST", `/v1/proposals/${encodeURIComponent(proposalId)}/reject`).then((r) => r.proposal),
+    connector: () => request<{ connector: ConnectorStatus }>("GET", "/v1/connector").then((r) => r.connector),
+    startConnector: (body: { tunnel: "ngrok" | "none"; domain?: string | null; publicUrl?: string | null }) =>
+      request<{ connector: ConnectorStatus }>("POST", "/v1/connector/start", body).then((r) => r.connector),
+    stopConnector: () => request<{ connector: ConnectorStatus }>("POST", "/v1/connector/stop").then((r) => r.connector),
+    rotateConnectorKey: () => request<{ connector: ConnectorStatus }>("POST", "/v1/connector/rotate-key").then((r) => r.connector),
+    revokeConnector: () => request<{ connector: ConnectorStatus }>("POST", "/v1/connector/revoke").then((r) => r.connector),
     consent: (id: string) => request<{ consent: AIConsent | null }>("GET", `/v1/projects/${encodeURIComponent(id)}/ai-consent`).then((r) => r.consent),
-    setConsent: (id: string, granted: boolean) =>
-      request<{ consent: AIConsent | null }>("POST", `/v1/projects/${encodeURIComponent(id)}/ai-consent`, { granted }).then((r) => r.consent),
+    setConsent: (id: string, granted: boolean, provider?: string) =>
+      request<{ consent: AIConsent | null }>("POST", `/v1/projects/${encodeURIComponent(id)}/ai-consent`, { granted, ...(provider ? { provider } : {}) }).then((r) => r.consent),
     context: (id: string) => request<{ context: ProjectContext }>("GET", `/v1/projects/${encodeURIComponent(id)}/context`).then((r) => r.context),
     runWorkflow: (path: string, approveAi: boolean) => request<{ run: WorkflowRun }>("POST", "/v1/workflows/run", { path, approveAi }).then((r) => r.run),
     workflowRuns: () => request<{ runs: WorkflowRun[] }>("GET", "/v1/workflows/runs").then((r) => r.runs),
@@ -127,6 +133,8 @@ export function createClient(info: ApiInfo) {
       request<{ project: Project }>("POST", "/v1/projects", input).then((r) => r.project),
     renameProject: (id: string, name: string, baseRevision: number) =>
       request<{ project: Project }>("PATCH", `/v1/projects/${encodeURIComponent(id)}`, { name, baseRevision }).then((r) => r.project),
+    resizeProject: (id: string, width: number, height: number, baseRevision: number) =>
+      request<{ project: Project }>("PATCH", `/v1/projects/${encodeURIComponent(id)}/format`, { width, height, baseRevision }).then((r) => r.project),
     history: (id: string) =>
       request<{ operations: EditOperation[] }>("GET", `/v1/projects/${encodeURIComponent(id)}/history`).then((r) => r.operations),
     timeline: (id: string) => request<{ timeline: Timeline }>("GET", `/v1/projects/${encodeURIComponent(id)}/timeline`).then((r) => r.timeline),
@@ -165,11 +173,24 @@ export function createClient(info: ApiInfo) {
 export type Client = ReturnType<typeof createClient>;
 
 export interface AIProviderInfo {
-  id: "anthropic" | "ollama";
+  id: "anthropic" | "ollama" | "claude-code" | "codex";
   label: string;
   external: boolean;
   credential?: "keychain" | "environment" | "none";
   available?: boolean;
   defaultModel: string | null;
   models: string[];
+}
+
+/** The Claude.ai / ChatGPT connector the engine runs (GET /v1/connector). */
+export interface ConnectorStatus {
+  state: "stopped" | "starting" | "running";
+  mcpUrl: string | null;
+  localUrl: string | null;
+  public: boolean;
+  accessKey: string;
+  settings: { tunnel: "ngrok" | "none"; domain?: string; publicUrl?: string; autoStart: boolean };
+  ngrokAvailable: boolean;
+  error: string | null;
+  connections: { clientName: string; createdAt: string; active: boolean }[];
 }

@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
   AnalysisStore,
   ANALYSIS_KINDS,
@@ -32,7 +32,7 @@ import {
 import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor, setCredential } from "@reelforge/ai";
 import { AnalysisRunner, createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
-import { createMcpServer } from "@reelforge/mcp";
+import { ConnectorAuth, ConnectorManager, createMcpServer } from "@reelforge/mcp";
 import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
@@ -96,6 +96,9 @@ Usage:
   reelforge workflow run <file.json> [--approve-ai]   (repeatable recipe; --approve-ai also applies AI Director steps)
   reelforge workflow validate <file.json> | workflow runs [--project <id>]
   reelforge mcp                                (MCP server on stdio, for Claude, ChatGPT, Gemini CLI…)
+  reelforge connector [--port 4410] [--tunnel ngrok [--domain <name>] | --public-url <https://…>] [--out <dir>]
+                                               (remote MCP connector for Claude.ai / ChatGPT, with OAuth)
+  reelforge connector status | revoke          (list connected apps | disconnect all of them)
 
   reelforge serve [--port 0] [--allow-origin <origin>]... [--token-stdin]
 
@@ -168,6 +171,9 @@ const OPTIONS = {
   project: { type: "string" },
   revoke: { type: "boolean" },
   wait: { type: "boolean" },
+  tunnel: { type: "string" },
+  domain: { type: "string" },
+  "public-url": { type: "string" },
 } as const;
 
 type Values = ReturnType<typeof parseArgs<{ options: typeof OPTIONS; allowPositionals: true }>>["values"];
@@ -218,6 +224,16 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
     }
     if (cmd === "serve") return await serve(env, values, io);
     if (cmd === "mcp") return await mcp(env);
+    if (cmd === "connector" && sub === "status") {
+      print({ connections: new ConnectorAuth(join(resolveHome(env), "connector", "auth.json")).connections() });
+      return 0;
+    }
+    if (cmd === "connector" && sub === "revoke") {
+      new ConnectorAuth(join(resolveHome(env), "connector", "auth.json")).revokeAll();
+      print({ revoked: true, note: "every app is disconnected and the access key is new; restart a running connector (or Stop/Start it in the app) for this to take effect" });
+      return 0;
+    }
+    if (cmd === "connector" && !sub) return await connector(env, values, io);
 
     if (cmd === "render" || cmd === "preview") {
       const db = openDatabase(resolveDbPath(env));
@@ -607,6 +623,59 @@ async function mcp(env: NodeJS.ProcessEnv): Promise<number> {
   return 0;
 }
 
+/**
+ * The remote connector: MCP over HTTPS for Claude.ai and ChatGPT. Listens on loopback; a tunnel
+ * (ngrok, or one the user runs, given as --public-url) makes it reachable. Runs until Ctrl-C.
+ * The desktop app runs the same thing inside its engine (Settings → Claude & ChatGPT).
+ */
+async function connector(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<number> {
+  if (values.tunnel && values.tunnel !== "ngrok") invalid("--tunnel supports: ngrok");
+  if (values.tunnel && values["public-url"]) invalid("use --tunnel or --public-url, not both");
+  const publicUrl = values["public-url"];
+  if (publicUrl && !/^https:\/\/[^/]+\/?$/.test(publicUrl)) invalid("--public-url must be an https origin, like https://example.ngrok.app");
+  const db = openDatabase(resolveDbPath(env));
+  const manager = new ConnectorManager({
+    db,
+    dir: join(resolveHome(env), "connector"),
+    cacheDir: resolveCacheDir(env),
+    port: int("port", values.port) ?? 4410,
+    ...(values.out ? { exportsDir: resolve(values.out) } : {}),
+    log: (line) => io.err(`[connector] ${line}\n`),
+  });
+  let st;
+  try {
+    st = await manager.start({ tunnel: values.tunnel === "ngrok" ? "ngrok" : "none", domain: values.domain ?? null, publicUrl: publicUrl ?? null, remember: false });
+  } catch (e) {
+    await manager.close();
+    db.close();
+    throw e;
+  }
+  io.out(JSON.stringify({ event: "ready", mcpUrl: st.mcpUrl, localUrl: st.localUrl, pairingCode: st.accessKey }) + "\n");
+  io.err(
+    `\nReelForge connector is running.\n\n  Connector URL:  ${st.mcpUrl}\n  Access key:     ${st.accessKey}\n\n` +
+      (st.public
+        ? "Add the URL as a custom connector (Claude: Settings → Connectors → Add custom connector; ChatGPT: Settings → Apps & Connectors → Developer mode → Create).\n" +
+          "When it asks you to sign in, enter the access key. Keep this running while you chat. Ctrl-C to stop.\n\n"
+        : "This URL is only reachable from this computer. Claude and ChatGPT need a public https URL: add --tunnel ngrok, or --public-url.\n\n"),
+  );
+  await new Promise<void>((done) => {
+    process.once("SIGINT", () => done());
+    process.once("SIGTERM", () => done());
+    const poll = setInterval(() => {
+      if (manager.status().state === "stopped") {
+        clearInterval(poll);
+        io.err("[connector] the tunnel stopped; shutting down\n");
+        done();
+      }
+    }, 2000);
+    poll.unref();
+  });
+  // Ctrl-C here means "stop now", not "turn off auto-start in the app".
+  await manager.close();
+  db.close();
+  return 0;
+}
+
 async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<number> {
   // The desktop shell sends API keys from the OS keychain as JSON lines; they stay in memory only.
   // With --token-stdin the first line carries the engine token, so it is never in the environment
@@ -646,9 +715,16 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
   }
   const token = provided ?? randomBytes(32).toString("base64url");
   const db = openDatabase(resolveDbPath(env));
+  const connectorManager = new ConnectorManager({
+    db,
+    dir: join(resolveHome(env), "connector"),
+    cacheDir: resolveCacheDir(env),
+    log: (line) => io.err(`[connector] ${line}\n`),
+  });
   const srv = await startApiServer({
     db,
     token,
+    connector: connectorManager,
     cacheDir: resolveCacheDir(env),
     port: int("port", values.port) ?? 0,
     allowedOrigins: values["allow-origin"] ?? [],
@@ -656,6 +732,8 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
   });
   // One machine-readable line; the sidecar parent waits for it.
   io.out(JSON.stringify({ event: "ready", url: srv.url, ...(provided ? {} : { token }) }) + "\n");
+  // Bring the Claude/ChatGPT connector back if the user left it on (never blocks the engine).
+  void connectorManager.autoStart();
 
   await new Promise<void>((resolve) => {
     const stop = () => resolve();
@@ -666,6 +744,7 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
   });
   // stdin was only a liveness signal; release it or it keeps the event loop alive.
   process.stdin.destroy();
+  await connectorManager.close();
   await srv.close();
   db.close();
   return 0;

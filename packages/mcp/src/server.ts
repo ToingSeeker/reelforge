@@ -24,7 +24,8 @@ import {
   type AnalysisKind,
   type Database,
 } from "@reelforge/core";
-import { AnalysisRunner, createRenderJob, importMedia, RenderRunner } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, importMedia, RenderRunner, type ImportResult } from "@reelforge/media";
+import type { RenderJob } from "@reelforge/core";
 import { ANTHROPIC_DEFAULT_MODEL, listOllamaModels, OPERATIONS_GUIDE, parseModelOutput, propose, providerFor } from "@reelforge/ai";
 import { globImportSteps, parseWorkflow, quoteUntrusted, runWorkflow, timelineSteps } from "@reelforge/automation";
 
@@ -53,26 +54,57 @@ const Id = z.string().describe("UUID");
 const READ = { readOnlyHint: true, openWorldHint: false } as const;
 const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: false } as const;
 
-export interface McpOptions {
-  cacheDir: string;
+/**
+ * What the remote connector (Claude, ChatGPT over HTTPS) adds. A remote client is not on this
+ * machine: it can't name local paths, so files arrive by upload link or download, exports land in
+ * ReelForge's own folder and come back as links, and approvals happen on a page the user opens.
+ */
+export interface RemoteHooks {
+  createUploadLink(projectId: string): { uploadId: string; url: string; expiresAt: string };
+  uploadStatus(uploadId: string): unknown;
+  importFromUrl(projectId: string, url: string, fileName?: string): Promise<ImportResult>;
+  /** A download link for a finished render, or undefined if this connector may not hand it out. */
+  downloadLink(job: RenderJob): string | undefined;
+  approvalLink(proposalId: string): string;
+  /** A fresh, unused .mp4 path in the connector's export folder. */
+  exportPath(projectId: string): string;
 }
 
+export interface McpOptions {
+  cacheDir: string;
+  /** Shared runners (the remote connector serves many sessions from one process). The caller starts and stops them. */
+  runners?: { render: RenderRunner; analysis: AnalysisRunner };
+  remote?: RemoteHooks;
+}
+
+const LOCAL_INSTRUCTIONS =
+  "ReelForge edits vertical videos. Typical flow: projects_create → media_import → media_analyze → timeline_get (read the context) → " +
+  "timeline_propose_edit (your operations) → the user approves (timeline_apply_proposal asks them) → render_start → jobs_get until completed. " +
+  "Timeline changes always need the user's approval; never claim they approved.";
+
+const REMOTE_INSTRUCTIONS =
+  "ReelForge is a video editor running on the user's own computer. Typical flow: projects_list or projects_create → add media → " +
+  "media_analyze → timeline_get (read the context) → timeline_propose_edit (your operations) → timeline_apply_proposal (gives an approval link; " +
+  "the user opens it and presses Apply) → render_start → jobs_get until completed, then give the user the download link.\n" +
+  "Adding media: if the user attached a file in this chat and media_add_file is available, pass it there. Otherwise call media_upload_link and " +
+  "give the user the link to upload from their browser (or, if you can run code with internet access and hold the file, PUT it to the link), " +
+  "then media_upload_status. media_add_from_url takes a public https link.\n" +
+  "Timeline changes always need the user's approval on that page; never claim they approved, and never open or submit the approval page yourself.";
+
 export function createMcpServer(db: Database, opts: McpOptions) {
-  const server = new McpServer(SERVER_INFO, {
-    instructions:
-      "ReelForge edits vertical videos. Typical flow: projects_create → media_import → media_analyze → timeline_get (read the context) → " +
-      "timeline_propose_edit (your operations) → the user approves (timeline_apply_proposal asks them) → render_start → jobs_get until completed. " +
-      "Timeline changes always need the user's approval; never claim they approved.",
-  });
+  const remote = opts.remote;
+  const server = new McpServer(SERVER_INFO, { instructions: remote ? REMOTE_INSTRUCTIONS : LOCAL_INSTRUCTIONS });
   const projects = new ProjectStore(db);
   const timeline = new TimelineStore(db);
   const proposals = new ProposalStore(db);
   const analyses = new AnalysisStore(db);
   const jobs = new JobStore(db);
-  const renderRunner = new RenderRunner(db, { cacheDir: opts.cacheDir });
-  const analysisRunner = new AnalysisRunner(db, { cacheDir: opts.cacheDir });
-  renderRunner.start();
-  analysisRunner.start();
+  const renderRunner = opts.runners?.render ?? new RenderRunner(db, { cacheDir: opts.cacheDir });
+  const analysisRunner = opts.runners?.analysis ?? new AnalysisRunner(db, { cacheDir: opts.cacheDir });
+  if (!opts.runners) {
+    renderRunner.start();
+    analysisRunner.start();
+  }
   const clientName = () => server.server.getClientVersion()?.name ?? "client";
   // Render jobs this session queued: the only ones it may cancel, and the queued ones are dropped on close.
   const ownJobs = new Set<string>();
@@ -94,16 +126,73 @@ export function createMcpServer(db: Database, opts: McpOptions) {
   server.registerTool("projects_get", { title: "Get project", inputSchema: { projectId: Id }, annotations: READ }, tool(({ projectId }: { projectId: string }) => ({ project: projects.get(projectId) })));
 
   // ---- media ------------------------------------------------------------------
-  server.registerTool(
-    "media_import",
-    {
-      title: "Import media",
-      description: "Import local files (absolute paths: MP4, MOV, JPEG, PNG, WAV, MP3). Originals are only read, never modified.",
-      inputSchema: { projectId: Id, paths: z.array(z.string()).min(1).max(200) },
-      annotations: WRITE,
-    },
-    tool(({ projectId, paths }: { projectId: string; paths: string[] }) => importMedia(db, projectId, paths, "mcp")),
-  );
+  if (!remote) {
+    server.registerTool(
+      "media_import",
+      {
+        title: "Import media",
+        description: "Import local files (absolute paths: MP4, MOV, JPEG, PNG, WAV, MP3). Originals are only read, never modified.",
+        inputSchema: { projectId: Id, paths: z.array(z.string()).min(1).max(200) },
+        annotations: WRITE,
+      },
+      tool(({ projectId, paths }: { projectId: string; paths: string[] }) => importMedia(db, projectId, paths, "mcp")),
+    );
+  } else {
+    // A remote client can't name files on this machine (and must not read them): media arrives as uploads.
+    server.registerTool(
+      "media_add_file",
+      {
+        title: "Add an attached file",
+        description: "Add a file the user attached in this chat (video MP4/MOV, image JPEG/PNG, audio WAV/MP3) to a project. It is downloaded to the user's computer and imported.",
+        inputSchema: {
+          projectId: Id,
+          file: z
+            .object({ download_url: z.string(), file_id: z.string(), mime_type: z.string().optional(), file_name: z.string().optional() })
+            .describe("The attached file"),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+        // ChatGPT fills this field with the attachment (a temporary download URL).
+        _meta: { "openai/fileParams": ["file"] },
+      },
+      tool(({ projectId, file }: { projectId: string; file: { download_url: string; mime_type?: string; file_name?: string } }) => {
+        projects.get(projectId);
+        return remote.importFromUrl(projectId, file.download_url, file.file_name ?? nameFromMime(file.mime_type));
+      }),
+    );
+    server.registerTool(
+      "media_add_from_url",
+      {
+        title: "Add media from a link",
+        description: "Download a public https link to a media file (MP4, MOV, JPEG, PNG, WAV, MP3) to the user's computer and import it into a project.",
+        inputSchema: { projectId: Id, url: z.string().describe("https:// link to the file itself"), fileName: z.string().optional().describe("Name with extension, if the link doesn't show one") },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      },
+      tool(({ projectId, url, fileName }: { projectId: string; url: string; fileName?: string }) => {
+        projects.get(projectId);
+        return remote.importFromUrl(projectId, url, fileName);
+      }),
+    );
+    server.registerTool(
+      "media_upload_link",
+      {
+        title: "Get an upload link",
+        description:
+          "A one-time link (valid 1 hour) for uploading one media file into a project. Give it to the user to open in their browser; " +
+          "or, if you can run code with internet access, PUT the file bytes to it with the file name in an X-File-Name header. Then call media_upload_status.",
+        inputSchema: { projectId: Id },
+        annotations: WRITE,
+      },
+      tool(({ projectId }: { projectId: string }) => {
+        projects.get(projectId);
+        return remote.createUploadLink(projectId);
+      }),
+    );
+    server.registerTool(
+      "media_upload_status",
+      { title: "Upload status", description: "Whether the file for an upload link has arrived, and the imported asset.", inputSchema: { uploadId: z.string() }, annotations: READ },
+      tool(({ uploadId }: { uploadId: string }) => remote.uploadStatus(uploadId)),
+    );
+  }
   server.registerTool(
     "media_analyze",
     {
@@ -210,7 +299,12 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       const p = proposals.get(proposalId);
       if (p.status !== "pending") return { status: p.status, proposal: describe(p) };
       if (!p.operations.length) return { status: "nothing_to_apply", warnings: p.warnings };
-      const human = { approve_in_reelforge: `Open ReelForge → AI Director and press Apply, or run: reelforge ai apply ${p.id} --yes` };
+      const human = remote
+        ? {
+            approvalUrl: remote.approvalLink(p.id),
+            next: "Give the user this link. They review the changes there and press Apply (or open ReelForge → AI Director). Call timeline_get_proposal afterwards to see if it was applied.",
+          }
+        : { approve_in_reelforge: `Open ReelForge → AI Director and press Apply, or run: reelforge ai apply ${p.id} --yes` };
       if (!server.server.getClientCapabilities()?.elicitation) return { status: "approval_required", ...human };
       // Change lines are generated by the engine from the dry run; the summary and warnings may come from the client: quote them.
       const redo = timeline.get(p.projectId).history.canRedo;
@@ -307,28 +401,50 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       return { jobId: job.id, state: job.state };
     }),
   );
-  server.registerTool(
-    "render_start",
-    {
-      title: "Render MP4",
-      description: "Export H.264/AAC MP4 at the project size to an absolute .mp4 path (never overwrites an existing file). Returns a job id.",
-      inputSchema: { projectId: Id, outputPath: z.string() },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    },
-    tool(({ projectId, outputPath }: { projectId: string; outputPath: string }) => {
-      const job = createRenderJob(db, projectId, "export", outputPath);
-      ownJobs.add(job.id);
-      renderRunner.enqueue(job.id);
-      return { jobId: job.id, state: job.state, outputPath: job.outputPath };
-    }),
-  );
+  if (!remote) {
+    server.registerTool(
+      "render_start",
+      {
+        title: "Render MP4",
+        description: "Export H.264/AAC MP4 at the project size to an absolute .mp4 path (never overwrites an existing file). Returns a job id.",
+        inputSchema: { projectId: Id, outputPath: z.string() },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      },
+      tool(({ projectId, outputPath }: { projectId: string; outputPath: string }) => {
+        const job = createRenderJob(db, projectId, "export", outputPath);
+        ownJobs.add(job.id);
+        renderRunner.enqueue(job.id);
+        return { jobId: job.id, state: job.state, outputPath: job.outputPath };
+      }),
+    );
+  } else {
+    server.registerTool(
+      "render_start",
+      {
+        title: "Render MP4",
+        description: "Export the project as H.264/AAC MP4 at full size, saved in ReelForge's exports folder on the user's computer. Poll jobs_get; when completed it has a download link.",
+        inputSchema: { projectId: Id },
+        annotations: WRITE,
+      },
+      tool(({ projectId }: { projectId: string }) => {
+        const job = createRenderJob(db, projectId, "export", remote.exportPath(projectId));
+        ownJobs.add(job.id);
+        renderRunner.enqueue(job.id);
+        return { jobId: job.id, state: job.state };
+      }),
+    );
+  }
+  const jobView = (j: RenderJob) => {
+    if (!remote) return { type: j.kind, state: j.state, progress: j.progress, outputPath: j.outputPath, error: j.error };
+    const downloadUrl = j.state === "completed" ? remote.downloadLink(j) : undefined;
+    return { type: j.kind, state: j.state, progress: j.progress, error: j.error, ...(downloadUrl ? { downloadUrl, downloadExpires: "in 24 hours; call jobs_get again for a fresh link" } : {}) };
+  };
   server.registerTool(
     "jobs_get",
     { title: "Get job", description: "Status of a render/preview job or an analysis job.", inputSchema: { jobId: Id }, annotations: READ },
     tool(({ jobId }: { jobId: string }) => {
       try {
-        const j = jobs.get(jobId);
-        return { type: j.kind, state: j.state, progress: j.progress, outputPath: j.outputPath, error: j.error };
+        return jobView(jobs.get(jobId));
       } catch (e) {
         if (!isReelForgeError(e) || e.code !== "NOT_FOUND") throw e;
       }
@@ -347,12 +463,18 @@ export function createMcpServer(db: Database, opts: McpOptions) {
   );
   server.registerTool(
     "outputs_get",
-    { title: "List outputs", description: "Finished exports of a project (paths, sizes, frame counts).", inputSchema: { projectId: Id }, annotations: READ },
-    tool(({ projectId }: { projectId: string }) => ({ outputs: jobs.artifacts(projectId) })),
+    { title: "List outputs", description: remote ? "Finished exports of a project made through this connector, with download links." : "Finished exports of a project (paths, sizes, frame counts).", inputSchema: { projectId: Id }, annotations: READ },
+    tool(({ projectId }: { projectId: string }) => {
+      if (!remote) return { outputs: jobs.artifacts(projectId) };
+      // Only exports this connector made: the user's own exports live in folders a remote client has no business seeing.
+      const done = jobs.list(projectId, { kind: "export", limit: 50 }).filter((j) => j.state === "completed");
+      return { outputs: done.flatMap((j) => (remote.downloadLink(j) ? [{ jobId: j.id, finishedAt: j.finishedAt, downloadUrl: remote.downloadLink(j) }] : [])) };
+    }),
   );
 
   // ---- automation -------------------------------------------------------------
-  server.registerTool(
+  // Workflows read local files and folders, so they stay with local clients.
+  if (!remote) server.registerTool(
     "workflows_run",
     {
       title: "Run a workflow",
@@ -420,6 +542,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
         // already gone
       }
     }
+    if (opts.runners) return; // shared: the owner stops them
     analysisRunner.stop();
     await renderRunner.stop();
   };
@@ -437,4 +560,20 @@ function describe(p: AIProposal) {
     durationFrames: { before: p.durationBefore, after: p.durationAfter },
     next: p.status === "pending" && p.operations.length ? "call timeline_apply_proposal to ask the user to approve it" : undefined,
   };
+}
+
+/** A file name for an attachment that came without one, so the import can tell its type. */
+function nameFromMime(mime: string | undefined): string | undefined {
+  const ext: Record<string, string> = {
+    "video/mp4": "mp4",
+    "video/quicktime": "mov",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/mpeg": "mp3",
+  };
+  const e = mime ? ext[mime.split(";")[0]!.trim().toLowerCase()] : undefined;
+  return e ? `attachment.${e}` : undefined;
 }

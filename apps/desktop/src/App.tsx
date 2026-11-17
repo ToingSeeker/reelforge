@@ -3,7 +3,6 @@ import type { AIProposal, Asset, CaptionStylePatch, ClipPropsPatch, Project, Tim
 import { applyOperations, canPlace, clipEnd } from "@reelforge/core/timeline-ops";
 import { SettingsDialog } from "./components/SettingsDialog.tsx";
 import { AutomationLab } from "./components/AutomationLab.tsx";
-import { formatClock } from "@reelforge/core/timebase";
 import { createClient, resolveApiInfo, type Client } from "./api.ts";
 import { useEditor } from "./editor.ts";
 import { onFileDrop, pickExportPath, pickMediaFiles } from "./native.ts";
@@ -20,8 +19,10 @@ import { LeftRail, type RailItem } from "./components/LeftRail.tsx";
 import { MediaLibrary } from "./components/MediaLibrary.tsx";
 import { Preview } from "./components/Preview.tsx";
 import { AIDirector } from "./components/AIDirector.tsx";
-import { Inspector, RightPanelTabs } from "./components/Inspector.tsx";
-import type { PreviewMode } from "./components/Preview.tsx";
+import { Inspector, InspectorEmpty, type InspectorTab } from "./components/Inspector.tsx";
+import { AgentActivityCard } from "./components/AgentActivityCard.tsx";
+import { useAgentActivity, type AiRun } from "./activity.ts";
+import type { FxBaking, PreviewMode } from "./components/Preview.tsx";
 import { Timeline, type AssetDropHandler } from "./components/Timeline.tsx";
 import { NewProjectDialog } from "./components/NewProjectDialog.tsx";
 import { Welcome } from "./components/Welcome.tsx";
@@ -47,6 +48,10 @@ function writePref(key: string, value: string) {
   }
 }
 
+const EMPTY_ASSETS: Asset[] = [];
+/** Timeline height: at least a ruler and two tracks, and leave the preview a usable picture. */
+const clampTimeline = (h: number, studioH: number) => Math.round(Math.max(170, Math.min(studioH - 300, h)));
+
 const isTyping = (t: EventTarget | null) =>
   t instanceof HTMLElement && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName));
 
@@ -64,7 +69,17 @@ export function App() {
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [previewMode, setPreviewMode] = useState<PreviewMode>(() => (readPref("rf.previewMode") === "rendered" ? "rendered" : "live"));
-  const [rightTab, setRightTab] = useState<"inspector" | "director">("director");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>(() => (readPref("rf.inspectorTab") as InspectorTab | null) ?? "transform");
+  const [libraryOpen, setLibraryOpen] = useState(() => readPref("rf.libraryOpen") !== "0");
+  const [inspectorOpen, setInspectorOpen] = useState(() => readPref("rf.inspectorOpen") !== "0");
+  const [timelineH, setTimelineH] = useState<number | null>(() => {
+    const v = Number(readPref("rf.timelineH"));
+    return Number.isFinite(v) && v > 0 ? v : null;
+  });
+  const [aiRun, setAiRun] = useState<AiRun | null>(null);
+  const [fxBaking, setFxBaking] = useState<FxBaking | null>(null);
+  const [motionRender, setMotionRender] = useState<{ template: string; progress: number } | null>(null);
+  const studio = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState<{ clipId: string; props: ClipPropsPatch } | null>(null);
   const [styleDraft, setStyleDraft] = useState<{ trackId: string; style: CaptionStylePatch } | null>(null);
   const [selectedCaption, setSelectedCaption] = useState<string | null>(null);
@@ -201,10 +216,34 @@ export function App() {
   }, [tl, analyses.map]);
   const snapExtra = useMemo(() => (snapToBeats ? [...markers.values()].flatMap((x) => [...x.beats, ...x.cuts]) : []), [markers, snapToBeats]);
   useEffect(() => {
-    if (selectedClip) setRightTab("inspector");
     setDraft(null);
   }, [selectedClip?.id]);
+  useEffect(() => writePref("rf.inspectorTab", inspectorTab), [inspectorTab]);
+  useEffect(() => writePref("rf.libraryOpen", libraryOpen ? "1" : "0"), [libraryOpen]);
+  useEffect(() => writePref("rf.inspectorOpen", inspectorOpen ? "1" : "0"), [inspectorOpen]);
   const exports = useExports(client, notify);
+  const cancelExport = useCallback(() => void exports.cancel(), [exports.cancel]);
+  const activity = useAgentActivity({
+    ai: aiRun,
+    analyses: analyses.map,
+    assets: tl?.assets ?? EMPTY_ASSETS,
+    onAnalyze: (a, kinds) => void analyses.analyze(a.id, kinds),
+    exportJob: exports.active,
+    exportDone: exports.done,
+    cancelExport,
+    previewJob: previewMode === "rendered" ? preview.pending : null,
+    fxBaking,
+    motionRender,
+  });
+  const agentLabel = activity.primary?.phase === "running"
+    ? `${activity.primary.title}${activity.primary.progress !== null ? ` ${Math.round(activity.primary.progress * 100)}%` : "…"}`
+    : activity.outcome?.tone === "error"
+      ? activity.outcome.title
+      : null;
+  const openRail = (r: RailItem) => {
+    setRail(r);
+    setLibraryOpen(true);
+  };
   /** Any manual playhead move stops playback. */
   const seek = useCallback((f: number) => {
     setPlaying(false);
@@ -260,6 +299,16 @@ export function App() {
     await refresh();
   };
 
+  const resizeProject = async (width: number, height: number) => {
+    if (!client || !tl) return;
+    try {
+      await client.resizeProject(tl.project.id, width, height, tl.project.revision);
+    } catch (e) {
+      notify("error", e instanceof Error ? e.message : String(e));
+    }
+    await Promise.all([editor.reload(), refresh()]);
+  };
+
   const doImport = async (paths?: string[]) => {
     const files = paths ?? (await pickMediaFiles());
     if (!files.length) return;
@@ -276,14 +325,24 @@ export function App() {
 
   const apply = (label: string, ops: TimelineOp[]) => void editor.apply(label, ops);
 
-  const appendAsset = (asset: Asset) => {
-    if (!tl) return;
-    const track =
-      tl.tracks.find((t) => !t.locked && t.kind === (asset.kind === "audio" ? "audio" : "video") && canPlace(asset, t.kind)) ??
-      tl.tracks.find((t) => !t.locked && canPlace(asset, t.kind));
-    if (!track) return notify("error", `No unlocked track can hold ${asset.filename}.`);
-    const end = tl.clips.filter((c) => c.trackId === track.id).reduce((m, c) => Math.max(m, clipEnd(c)), 0);
-    apply("Append clip", [{ type: "clip.add", trackId: track.id, assetId: asset.id, start: end }]);
+  /** Append media at the end of the first fitting unlocked track; several assets go in one undo step, in order. */
+  const appendAssets = (list: Asset[]) => {
+    if (!tl || !list.length) return;
+    void editor.applyBuilt(list.length === 1 ? "Append clip" : `Append ${list.length} clips`, (t) => {
+      const ends = new Map<string, number>();
+      const ops: TimelineOp[] = [];
+      for (const asset of list) {
+        const track =
+          t.tracks.find((x) => !x.locked && x.kind === (asset.kind === "audio" ? "audio" : "video") && canPlace(asset, x.kind)) ??
+          t.tracks.find((x) => !x.locked && canPlace(asset, x.kind));
+        if (!track) throw new Error(`No unlocked track can hold ${asset.filename}.`);
+        const end = ends.get(track.id) ?? t.clips.filter((c) => c.trackId === track.id).reduce((m, c) => Math.max(m, clipEnd(c)), 0);
+        ops.push({ type: "clip.add", trackId: track.id, assetId: asset.id, start: end });
+        if (asset.durationFrames !== null) ends.set(track.id, end + asset.durationFrames);
+        else ends.delete(track.id);
+      }
+      return ops;
+    });
   };
 
   /**
@@ -422,6 +481,8 @@ export function App() {
   return (
     <div className={`rf-app${assetDrag ? " is-dragging-asset" : ""}`}>
       <TopBar
+        logoState={activity.logo}
+        agentLabel={agentLabel}
         projects={projects ?? []}
         current={current}
         offline={offline}
@@ -444,36 +505,52 @@ export function App() {
       {projects !== null && !current ? (
         <Welcome onCreate={() => setDialogOpen(true)} />
       ) : workspace === "review" && current ? (
-        <RenderQueue client={client} projectId={current.id} notify={notify} onExport={() => void doExport()} />
+        <main className="rf-page">
+          <RenderQueue client={client} projectId={current.id} notify={notify} onExport={() => void doExport()} />
+        </main>
       ) : workspace === "automate" ? (
-        <AutomationLab
-          client={client}
-          notify={notify}
-          onOpenProject={(id) => {
-            selectProject(id);
-            setWorkspace("edit");
-            void refresh();
-          }}
-        />
+        <main className="rf-page">
+          <AutomationLab
+            client={client}
+            notify={notify}
+            onOpenProject={(id) => {
+              selectProject(id);
+              setWorkspace("edit");
+              void refresh();
+            }}
+          />
+        </main>
       ) : (
-        <div className="rf-studio">
-          <LeftRail active={rail} onChange={setRail} onSettings={() => setSettingsOpen(true)} />
-          {rail === "media" ? (
+        <div
+          ref={studio}
+          className="rf-studio"
+          data-library={libraryOpen ? "open" : "closed"}
+          data-inspector={inspectorOpen ? "open" : "closed"}
+          style={timelineH ? ({ "--timeline-h": `${timelineH}px` } as React.CSSProperties) : undefined}
+        >
+          <LeftRail
+            active={rail}
+            open={libraryOpen}
+            onChange={(r) => (r === rail && libraryOpen ? setLibraryOpen(false) : openRail(r))}
+            onSettings={() => setSettingsOpen(true)}
+          />
+          {libraryOpen && rail === "media" ? (
             <MediaLibrary
               client={client}
               projectId={current?.id ?? null}
               fps={fps}
-              assets={tl?.assets ?? []}
+              assets={tl?.assets ?? EMPTY_ASSETS}
               importing={importing}
               dropHover={fileHover}
               onImport={() => void doImport()}
-              onAppend={appendAsset}
+              onAppend={appendAssets}
               onRelink={(a) => void relink(a)}
               onDragStart={(asset, e) => setAssetDrag({ asset, x: e.clientX, y: e.clientY })}
               analyses={analyses.map}
               onAnalyze={(a, kinds) => void analyses.analyze(a.id, kinds)}
+              onCollapse={() => setLibraryOpen(false)}
             />
-          ) : rail === "text" && tl ? (
+          ) : !libraryOpen || rail === "director" ? null : rail === "text" && tl ? (
             <CaptionsPanel
               client={client}
               timeline={tl}
@@ -499,7 +576,7 @@ export function App() {
               onAnalyze={(a, kinds) => void analyses.analyze(a.id, kinds)}
             />
           ) : rail === "templates" && tl && client ? (
-            <MotionPanel client={client} timeline={tl} notify={notify} onPlace={placeMotion} />
+            <MotionPanel client={client} timeline={tl} notify={notify} onPlace={placeMotion} onRender={setMotionRender} />
           ) : rail === "effects" && tl ? (
             <EffectsPanel
               timeline={tl}
@@ -511,6 +588,24 @@ export function App() {
           ) : (
             <RailPlaceholder item={rail} />
           )}
+          {/* Always mounted, so a request keeps running (and reporting) while another tool is open. */}
+          <section className="rf-panel rf-library rf-director-panel" aria-label="AI Director" hidden={!(libraryOpen && rail === "director")}>
+            <AIDirector
+              client={client}
+              timeline={tl}
+              selection={Array.from(selection)}
+              notify={notify}
+              previewing={proposed ? previewProposal!.id : null}
+              onPreview={(proposal) => {
+                setPreviewProposal(proposal);
+                if (proposal) setPreviewMode("live");
+              }}
+              onApplied={() => void editor.reload()}
+              onOpenSettings={() => setSettingsOpen(true)}
+              onRun={setAiRun}
+              onOpen={() => openRail("director")}
+            />
+          </section>
           <Preview
             client={client}
             timeline={viewTimeline}
@@ -525,38 +620,91 @@ export function App() {
             onPlayhead={(f) => (playing ? setPlayhead(f) : seek(f))}
             playing={playing}
             onPlaying={setPlaying}
-            badge={proposed ? "Previewing AI plan (not applied)" : null}
+            badge={proposed ? "Previewing AI plan · not applied" : null}
+            inspectorOpen={inspectorOpen}
+            onShowInspector={() => setInspectorOpen(true)}
+            onFormat={proposed ? undefined : resizeProject}
+            onFxBaking={setFxBaking}
+            selectedClipId={proposed ? null : (selectedClip?.id ?? null)}
+            onClipDraft={(props) => setDraft(props && selectedClip ? { clipId: selectedClip.id, props } : null)}
+            onClipCommit={(props, label) => {
+              if (!selectedClip) return;
+              const id = selectedClip.id;
+              // Keep the draft on screen until the edit lands, so the clip doesn't snap back for a frame.
+              void editor
+                .apply(label, [{ type: "clip.update", clipId: id, props }])
+                .finally(() => setDraft((d) => (d?.clipId === id && d.props === props ? null : d)));
+            }}
           />
-          <aside className="rf-panel rf-right" aria-label={rightTab === "inspector" ? "Inspector" : "AI Director"}>
-            <RightPanelTabs tab={rightTab} onTab={setRightTab} hasClip={!!selectedClip} />
-            {rightTab === "director" ? (
-              <AIDirector
-                client={client}
-                timeline={tl}
-                selection={Array.from(selection)}
-                notify={notify}
-                previewing={proposed ? previewProposal!.id : null}
-                onPreview={(proposal) => {
-                  setPreviewProposal(proposal);
-                  if (proposal) setPreviewMode("live");
-                }}
-                onApplied={() => void editor.reload()}
-                onOpenSettings={() => setSettingsOpen(true)}
-              />
-            ) : selectedClip && tl ? (
-              <Inspector
-                timeline={tl}
-                clip={selectedClip}
-                onDraft={(props) => setDraft(props ? { clipId: selectedClip.id, props } : null)}
-                onCommit={(props, label) => apply(label, [{ type: "clip.update", clipId: selectedClip.id, props }])}
-              />
-            ) : (
-              <div className="rf-empty">
-                <p className="rf-empty-title">No clip selected</p>
-                <p className="rf-empty-body">Select one clip on the timeline to adjust its transform, fades, transition or gain.</p>
+          {inspectorOpen && (
+            <aside className="rf-right" aria-label="Inspector">
+              <div className="rf-panel rf-inspector-panel">
+                {selectedClip && tl ? (
+                  <Inspector
+                    timeline={tl}
+                    clip={selectedClip}
+                    tab={inspectorTab}
+                    onTab={setInspectorTab}
+                    onDraft={(props) => setDraft(props ? { clipId: selectedClip.id, props } : null)}
+                    onCommit={(props, label) => apply(label, [{ type: "clip.update", clipId: selectedClip.id, props }])}
+                    onHide={() => setInspectorOpen(false)}
+                  />
+                ) : (
+                  <InspectorEmpty
+                    selectedCount={selection.size}
+                    captionSelected={!!selectedCaption}
+                    hasClips={!!tl?.clips.length}
+                    onOpenText={() => openRail("text")}
+                    onHide={() => setInspectorOpen(false)}
+                  />
+                )}
               </div>
-            )}
-          </aside>
+              <AgentActivityCard
+                active={activity.active}
+                primary={activity.primary}
+                outcome={activity.outcome}
+                onDismiss={activity.dismiss}
+                onOpenDirector={() => openRail("director")}
+              />
+            </aside>
+          )}
+          <div
+            className="rf-splitter"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize timeline"
+            tabIndex={0}
+            onPointerDown={(e) => {
+              const box = studio.current?.getBoundingClientRect();
+              if (!box) return;
+              e.currentTarget.setPointerCapture(e.pointerId);
+              const move = (ev: PointerEvent) => setTimelineH(clampTimeline(box.bottom - ev.clientY, box.height));
+              const up = () => {
+                window.removeEventListener("pointermove", move);
+                setTimelineH((h) => {
+                  if (h) writePref("rf.timelineH", String(Math.round(h)));
+                  return h;
+                });
+              };
+              window.addEventListener("pointermove", move);
+              window.addEventListener("pointerup", up, { once: true });
+            }}
+            onDoubleClick={() => {
+              setTimelineH(null);
+              writePref("rf.timelineH", "");
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+              e.preventDefault();
+              const box = studio.current?.getBoundingClientRect();
+              const tlEl = studio.current?.querySelector(".rf-timeline");
+              if (!box || !tlEl) return;
+              const next = clampTimeline(tlEl.getBoundingClientRect().height + (e.key === "ArrowUp" ? 24 : -24), box.height);
+              setTimelineH(next);
+              writePref("rf.timelineH", String(Math.round(next)));
+            }}
+            data-tip="Drag to resize · double-click to reset"
+          />
           <Timeline
             client={client}
             timeline={tl}
@@ -576,34 +724,11 @@ export function App() {
             selectedCaption={selectedCaption}
             onSelectCaption={(id) => {
               setSelectedCaption(id);
-              if (id) setRail("text");
+              if (id) openRail("text");
             }}
           />
         </div>
       )}
-
-      <footer className="rf-statusbar">
-        {current ? (
-          <>
-            <span>{current.name}</span>
-            <span className="rf-sep" />
-            <span>{formatClock(tl?.durationFrames ?? 0, fps)}</span>
-            <span className="rf-sep" />
-            <span>
-              {tl?.clips.length ?? 0} clip{tl?.clips.length === 1 ? "" : "s"}
-            </span>
-            <span className="rf-sep" />
-            <span>{tl?.assets.length ?? 0} media</span>
-            <span className="rf-sep" />
-            <span>rev {current.revision}</span>
-            <span className="rf-statusbar-right">
-              {current.settings.width} × {current.settings.height} · {fps.den === 1 ? fps.num : (fps.num / fps.den).toFixed(2)} FPS
-            </span>
-          </>
-        ) : (
-          <span>{projects === null ? "Connecting to engine…" : "No project open"}</span>
-        )}
-      </footer>
 
       {assetDrag && (
         <div className="rf-drag-ghost" style={{ left: assetDrag.x + 12, top: assetDrag.y + 12 }} aria-hidden="true">

@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import type { Project, RenderJob } from "@reelforge/core/schema";
 import { aspectRatioLabel } from "@reelforge/core/schema";
-import { Icon, LogoMark } from "../icons.tsx";
+import { Icon } from "../icons.tsx";
+import { ReelForgeLogo, type LogoState } from "./ReelForgeLogo.tsx";
 
 export type Workspace = "edit" | "automate" | "review";
 
 const WORKSPACES: { id: Workspace; label: string }[] = [
   { id: "edit", label: "Edit" },
   { id: "automate", label: "Automate" },
-  { id: "review", label: "Review & Export" },
+  { id: "review", label: "Review" },
 ];
 
 interface Props {
@@ -29,29 +30,31 @@ interface Props {
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
   onRename: (name: string) => Promise<void>;
+  /** Agent lifecycle, mapped in activity.ts. */
+  logoState: LogoState;
+  /** Short text for the agent state (also what reduced-motion users get instead of the animation). */
+  agentLabel: string | null;
 }
 
 export function TopBar(p: Props) {
   return (
     <header className="rf-topbar">
-      <div className="rf-brand">
-        <LogoMark />
-        <div>
-          <div className="rf-brand-name">ReelForge</div>
-          <div className="rf-brand-sub">AI VIDEO EDITOR</div>
+      <div className="rf-topbar-left">
+        <div className="rf-brand" tabIndex={-1}>
+          <ReelForgeLogo state={p.logoState} size={34} wordmark title={`ReelForge${p.agentLabel ? `: ${p.agentLabel}` : ""}`} />
+          {p.agentLabel && (
+            <span className={`rf-brand-state is-${p.logoState}`} role="status">
+              {p.agentLabel}
+            </span>
+          )}
         </div>
+        <span className="rf-topbar-sep" aria-hidden="true" />
+        <ProjectSwitcher {...p} />
       </div>
 
-      <ProjectSwitcher {...p} />
-
-      <nav className="rf-workspaces" aria-label="Workspace">
+      <nav className="rf-seg rf-seg-glass rf-workspaces" aria-label="Workspace">
         {WORKSPACES.map((w) => (
-          <button
-            key={w.id}
-            className="rf-workspace-tab"
-            aria-current={p.workspace === w.id ? "page" : undefined}
-            onClick={() => p.onWorkspace(w.id)}
-          >
+          <button key={w.id} type="button" aria-current={p.workspace === w.id ? "page" : undefined} onClick={() => p.onWorkspace(w.id)}>
             {w.label}
           </button>
         ))}
@@ -60,28 +63,26 @@ export function TopBar(p: Props) {
       <div className="rf-topbar-right">
         <SaveStatus current={p.current} offline={p.offline} loading={p.loading} busy={p.busy} />
         <div className="rf-btn-group">
-          <button className="rf-icon-btn" disabled={!p.canUndo} onClick={p.onUndo} title="Undo (⌘Z)" aria-label="Undo">
+          <button className="rf-icon-btn" disabled={!p.canUndo} onClick={p.onUndo} data-tip="Undo  ⌘Z" aria-label="Undo">
             <Icon name="undo" />
           </button>
-          <button className="rf-icon-btn" disabled={!p.canRedo} onClick={p.onRedo} title="Redo (⇧⌘Z)" aria-label="Redo">
+          <button className="rf-icon-btn" disabled={!p.canRedo} onClick={p.onRedo} data-tip="Redo  ⇧⌘Z" aria-label="Redo">
             <Icon name="redo" />
           </button>
         </div>
         {p.exporting ? (
           <div className="rf-export-progress" role="status" title={p.exporting.outputPath ?? undefined}>
-            <span>
-              Exporting {p.exporting.state === "queued" ? "(queued)" : `${Math.round(p.exporting.progress * 100)}%`}
-            </span>
-            <div className="rf-export-bar">
+            <span className="rf-num-tab">Exporting {p.exporting.state === "queued" ? "· queued" : `${Math.round(p.exporting.progress * 100)}%`}</span>
+            <div className="rf-meter rf-meter-orange">
               <div style={{ width: `${Math.round(p.exporting.progress * 100)}%` }} />
             </div>
-            <button className="rf-icon-btn" onClick={p.onCancelExport} aria-label="Cancel export" title="Cancel export">
+            <button className="rf-icon-btn rf-icon-btn-sm" onClick={p.onCancelExport} aria-label="Cancel export" data-tip="Cancel export">
               <Icon name="x" size={14} />
             </button>
           </div>
         ) : (
-          <button className="rf-btn rf-btn-primary" onClick={p.onExport} disabled={!p.current} title="Export MP4 (H.264 / AAC)">
-            <Icon name="export" size={16} /> Export
+          <button className="rf-btn rf-btn-export" onClick={p.onExport} disabled={!p.current} title="Export MP4 (H.264 / AAC)">
+            Export <Icon name="export" size={16} strokeWidth={2} />
           </button>
         )}
       </div>
@@ -97,20 +98,19 @@ function SaveStatus({ current, offline, loading, busy }: { current: Project | nu
       </span>
     );
   }
-  if (loading || !current) return <span className="rf-save" />;
+  if (loading) return <span className="rf-save">Connecting…</span>;
+  if (!current) return <span className="rf-save" />;
   if (busy) {
     return (
       <span className="rf-save" role="status">
-        <span className="rf-save-dot rf-save-dot-busy" /> Saving…
+        <span className="rf-spinner" aria-hidden="true" /> Saving…
       </span>
     );
   }
   return (
-    <span className="rf-save" role="status" title={`Last committed ${new Date(current.updatedAt).toLocaleString()}`}>
-      <span className="rf-save-dot">
-        <Icon name="check" size={11} strokeWidth={3} />
-      </span>
-      Saved · rev {current.revision}
+    <span className="rf-save" role="status" title={`Saved by the engine · revision ${current.revision} · ${new Date(current.updatedAt).toLocaleString()}`}>
+      <Icon name="checkCircle" size={17} />
+      Saved {ago(current.updatedAt)}
     </span>
   );
 }
@@ -185,8 +185,9 @@ function ProjectSwitcher({ projects, current, onSelectProject, onNewProject, onR
         }}
         title="Switch project (double-click to rename)"
       >
+        <Icon name="folder" size={17} />
         <span className="rf-switcher-name">{current.name}</span>
-        <Icon name="chevronDown" size={16} />
+        <Icon name="chevronDown" size={15} />
       </button>
       {open && (
         <div className="rf-menu" role="menu">
@@ -239,4 +240,13 @@ function ProjectSwitcher({ projects, current, onSelectProject, onNewProject, onR
       )}
     </div>
   );
+}
+
+/** "just now", "2 min ago", "3 h ago", then the date. Re-evaluated on the app's 2 s poll. */
+function ago(iso: string): string {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 45) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return new Date(iso).toLocaleDateString();
 }

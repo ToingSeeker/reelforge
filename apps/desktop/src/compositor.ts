@@ -30,6 +30,8 @@ export class Compositor {
   #videos = new Map<string, HTMLVideoElement>(); // by clipId
   #images = new Map<string, HTMLImageElement>(); // by assetId
   #audioCtx: AudioContext | null = null;
+  #master: GainNode | null = null;
+  #volume = 1;
   #buffers = new Map<string, Promise<AudioBuffer | null>>(); // by assetId
   #playing: { f0: number; t0: number; nodes: AudioScheduledSourceNode[]; raf: number } | null = null;
   #frame = 0;
@@ -138,6 +140,12 @@ export class Compositor {
     for (const v of this.#videos.values()) v.pause();
   }
 
+  /** Monitor level 0..1 (the preview only; exports are unaffected). */
+  setVolume(v: number) {
+    this.#volume = Math.max(0, Math.min(1, v));
+    if (this.#master && this.#audioCtx) this.#master.gain.setTargetAtTime(this.#volume, this.#audioCtx.currentTime, 0.015);
+  }
+
   dispose() {
     this.pause();
     for (const [id, v] of this.#videos) this.#release(id, v);
@@ -149,6 +157,16 @@ export class Compositor {
   #audio(): AudioContext {
     this.#audioCtx ??= new AudioContext({ latencyHint: "interactive" });
     return this.#audioCtx;
+  }
+
+  #out(): GainNode {
+    const ctx = this.#audio();
+    if (!this.#master) {
+      this.#master = ctx.createGain();
+      this.#master.gain.value = this.#volume;
+      this.#master.connect(ctx.destination);
+    }
+    return this.#master;
   }
 
   #currentPlayFrame(): number {
@@ -429,7 +447,7 @@ export class Compositor {
         .sort((a, b) => a - b);
       gain.gain.setValueAtTime(audioGain(seg, first), Math.max(ctx.currentTime, when));
       for (const f of points) gain.gain.linearRampToValueAtTime(audioGain(seg, f), play.t0 + (f - play.f0) / fps);
-      src.connect(gain).connect(ctx.destination);
+      src.connect(gain).connect(this.#out());
       const lateBy = Math.max(0, ctx.currentTime - when);
       src.start(Math.max(ctx.currentTime, when), offset + lateBy, Math.max(0, dur - lateBy));
       play.nodes.push(src);

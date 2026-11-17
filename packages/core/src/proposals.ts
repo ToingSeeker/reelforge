@@ -228,9 +228,16 @@ export class ProposalStore {
     return row.ai_consent ? (JSON.parse(row.ai_consent) as AIConsent) : null;
   }
 
-  setConsent(projectId: string, granted: boolean, by: Actor): AIConsent | null {
+  /**
+   * Grant adds `recipient` to the existing consent ("*" = anyone); revoke without a recipient
+   * clears the whole record, with one it removes just that recipient.
+   */
+  setConsent(projectId: string, granted: boolean, by: Actor, recipient = "*"): AIConsent | null {
     const pid = parse(ProjectIdSchema, projectId);
-    const value = granted ? { grantedAt: this.#now(), grantedBy: by } : null;
+    const prev = this.consent(pid);
+    const had = prev ? (prev.recipients ?? ["anthropic", "ollama"]) : [];
+    const recipients = granted ? [...new Set([...had, recipient])] : recipient === "*" ? [] : had.filter((r) => r !== recipient);
+    const value: AIConsent | null = recipients.length ? { grantedAt: granted || !prev ? this.#now() : prev.grantedAt, grantedBy: granted || !prev ? by : prev.grantedBy, recipients } : null;
     const r = this.#db.prepare("UPDATE projects SET ai_consent = ? WHERE id = ?").run(value ? JSON.stringify(value) : null, pid);
     if (Number(r.changes) !== 1) throw new ReelForgeError("NOT_FOUND", `project ${pid} not found`);
     return value;

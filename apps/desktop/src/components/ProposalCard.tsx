@@ -82,7 +82,7 @@ export function ProposalCard(p: {
         {x.status === "pending" && x.operations.length > 0 && (
           <div className="rf-proposal-actions">
             <button className="rf-btn rf-btn-primary rf-btn-block" onClick={p.onApply}>
-              <Icon name="sparkle" size={15} /> Apply to timeline
+              <Icon name="director" size={15} /> Apply to timeline
             </button>
             <div className="rf-proposal-row">
               <button className="rf-btn" aria-pressed={p.previewing} onClick={p.onPreview}>

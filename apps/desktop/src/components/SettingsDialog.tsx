@@ -3,6 +3,7 @@ import type { Client } from "../api.ts";
 import type { Notify } from "../editor.ts";
 import { keychain } from "../native.ts";
 import { Icon } from "../icons.tsx";
+import { ConnectorSettings } from "./ConnectorSettings.tsx";
 
 /** AI provider keys: saved to the macOS Keychain by the desktop shell, never shown again. */
 export function SettingsDialog({ client, projectId, notify, onClose }: { client: Client | null; projectId: string | null; notify: Notify; onClose: () => void }) {
@@ -37,7 +38,7 @@ export function SettingsDialog({ client, projectId, notify, onClose }: { client:
 
   return (
     <div className="rf-scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="rf-dialog" role="dialog" aria-modal="true" aria-labelledby="rf-settings-title">
+      <div className="rf-dialog rf-dialog-settings" role="dialog" aria-modal="true" aria-labelledby="rf-settings-title">
         <div className="rf-dialog-head">
           <h2 id="rf-settings-title">Settings</h2>
           <button type="button" className="rf-icon-btn" onClick={onClose} aria-label="Close">
@@ -72,6 +73,7 @@ export function SettingsDialog({ client, projectId, notify, onClose }: { client:
             <p className="rf-hint">In browser dev mode, start the engine with ANTHROPIC_API_KEY set; the desktop app stores keys in the Keychain.</p>
           )}
         </section>
+        <ConnectorSettings client={client} notify={notify} />
         {projectId && (
           <section className="rf-settings-group">
             <h3>This project</h3>

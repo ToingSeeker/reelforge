@@ -74,6 +74,8 @@ export function usePreview(client: Client | null, timeline: Timeline | null, ena
 /** Export jobs started from this window, with progress and cancel. */
 export function useExports(client: Client | null, notify: Notify) {
   const [active, setActive] = useState<RenderJob | null>(null);
+  /** The last export that reached a terminal state in this window. */
+  const [done, setDone] = useState<RenderJob | null>(null);
   const start = useCallback(
     async (projectId: string, path: string) => {
       if (!client) return;
@@ -82,6 +84,7 @@ export function useExports(client: Client | null, notify: Notify) {
         setActive(job);
         const done = await until(client, job.id, setActive, () => true);
         setActive(null);
+        setDone(done);
         if (done.state === "completed") notify("info", `Exported ${done.outputPath}`);
         else if (done.state === "failed") notify("error", `Export failed: ${done.error?.message ?? "unknown error"}`);
         else notify("info", "Export cancelled.");
@@ -95,5 +98,5 @@ export function useExports(client: Client | null, notify: Notify) {
   const cancel = useCallback(async () => {
     if (client && active) await client.cancelJob(active.id).catch(() => {});
   }, [client, active]);
-  return { active, start, cancel };
+  return { active, done, start, cancel };
 }

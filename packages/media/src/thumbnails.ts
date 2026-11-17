@@ -15,7 +15,7 @@ const inflight = new Map<string, Promise<Thumbnail>>();
 /** Cache key includes size+mtime so a relinked or changed file gets a fresh image. */
 export function thumbnailFile(cacheDir: string, asset: Asset): Thumbnail {
   const audio = asset.kind === "audio";
-  const name = `${asset.id}-${asset.sizeBytes}${audio ? "-wave.png" : ".jpg"}`;
+  const name = `${asset.id}-${asset.sizeBytes}${audio ? "-wave-mint.png" : ".jpg"}`;
   return { path: join(cacheDir, "thumbs", name), contentType: audio ? "image/png" : "image/jpeg" };
 }
 
@@ -26,8 +26,9 @@ function args(asset: Asset, out: string): string[] {
   const input = sourceInputArgs(asset.sourcePath);
   const common = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"];
   if (asset.kind === "audio") {
-    // Waveform strip in the music-track colour; also used as the clip background in the timeline.
-    return [...common, ...input, "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=960x120:colors=0x2bd47d", "-frames:v", "1", ...SINGLE_IMAGE, `file:${out}`];
+    // Waveform strip in the UI's mint accent (--accent-mint); also used as the clip background in the timeline.
+    // The colour is part of the cache name, so changing it regenerates old strips instead of mixing two greens.
+    return [...common, ...input, "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=960x120:colors=0xa8dcc8", "-frames:v", "1", ...SINGLE_IMAGE, `file:${out}`];
   }
   // Poster frame 10% in (capped at 3s) so black lead-ins don't become the thumbnail.
   const seek = asset.kind === "video" && asset.durationUs ? Math.min(asset.durationUs * 0.1, 3_000_000) / 1_000_000 : 0;

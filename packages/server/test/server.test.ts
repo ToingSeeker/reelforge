@@ -375,3 +375,33 @@ test("captions/propose: transcribes first (202), refuses a timeline with no soun
   assert.equal(r.analyses.length, 1);
 });
 
+
+test("connector routes: unavailable without one, and pass through to it", async (t) => {
+  const srv = await boot(t);
+  const none = await call(srv, "GET", "/v1/connector");
+  assert.equal(none.status, 503);
+
+  const dir = mkdtempSync(join(tmpdir(), "reelforge-server-conn-"));
+  const db = openDatabase(join(dir, "reelforge.db"));
+  const calls: unknown[] = [];
+  const fake = {
+    status: () => ({ state: "stopped" }),
+    start: async (input: unknown) => (calls.push(input), { state: "running" }),
+    stop: async () => ({ state: "stopped" }),
+    rotateKey: () => ({ rotated: true }),
+    revokeAll: () => ({ revoked: true }),
+  };
+  const withConn = await startApiServer({ db, token: TOKEN, cacheDir: join(dir, "cache"), connector: fake });
+  t.after(async () => {
+    await withConn.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  assert.deepEqual(await (await call(withConn, "GET", "/v1/connector")).json(), { connector: { state: "stopped" } });
+  assert.equal((await call(withConn, "POST", "/v1/connector/start", { body: { tunnel: "ftp" } })).status, 400);
+  const started = await call(withConn, "POST", "/v1/connector/start", { body: { tunnel: "none", publicUrl: "https://x.test", domain: null } });
+  assert.equal(started.status, 200);
+  assert.deepEqual(calls, [{ tunnel: "none", domain: null, publicUrl: "https://x.test" }]);
+  assert.equal((await call(withConn, "POST", "/v1/connector/rotate-key")).status, 200);
+  assert.equal((await call(withConn, "POST", "/v1/connector/start", { auth: false })).status, 401);
+});

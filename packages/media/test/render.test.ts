@@ -161,8 +161,8 @@ test("M2 exit: a 30-second project renders to MP4 H.264/AAC 1080x1920 @ 30 fps",
   assert.deepEqual([a.codec_name, Number(a.sample_rate), a.channels], ["aac", 48000, 2]);
   assert.deepEqual([v.color_space, v.color_primaries, v.color_transfer, v.color_range], ["bt709", "bt709", "bt709", "tv"], "tagged as what we encode");
   assert.ok(Math.abs(Number(info.format.duration) - 30) < 0.05, `duration ${info.format.duration}`);
-  const head = execFileSync("sh", ["-c", `head -c 4096 "${out}" | strings | grep -c moov || true`]).toString().trim();
-  assert.notEqual(head, "0", "moov atom up front (+faststart)");
+  // Read the bytes directly: `strings` is an Xcode tool on macOS and exits without output until its licence is accepted.
+  assert.ok(readFileSync(out).subarray(0, 4096).includes("moov"), "moov atom up front (+faststart)");
   const artifacts = new JobStore(s.db).artifacts(s.projectId);
   assert.equal(artifacts[0]?.frames, 900);
 });

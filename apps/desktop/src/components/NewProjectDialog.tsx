@@ -4,7 +4,7 @@ import { parseFps } from "@reelforge/core/timebase";
 import { ApiError } from "../api.ts";
 import { Icon } from "../icons.tsx";
 
-const FORMATS = [
+export const FORMATS = [
   { id: "9:16", label: "9:16 · Reels / TikTok / Shorts", width: 1080, height: 1920 },
   { id: "16:9", label: "16:9 · YouTube", width: 1920, height: 1080 },
   { id: "1:1", label: "1:1 · Square", width: 1080, height: 1080 },

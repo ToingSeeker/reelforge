@@ -70,6 +70,14 @@ export const RenameProjectInputSchema = z.object({
 });
 export type RenameProjectInput = z.input<typeof RenameProjectInputSchema>;
 
+/** Change the frame size (format). Clip transforms are frame-relative, so they carry over. */
+export const ResizeProjectInputSchema = z.object({
+  width: Dimension,
+  height: Dimension,
+  baseRevision: z.number().int().nonnegative(),
+});
+export type ResizeProjectInput = z.input<typeof ResizeProjectInputSchema>;
+
 export const EditOperationSchema = z.object({
   id: z.uuid(),
   projectId: ProjectIdSchema,
@@ -651,6 +659,20 @@ export interface AIProposal {
 export interface AIConsent {
   grantedAt: string;
   grantedBy: string;
+  /**
+   * Who may receive the project context: "anthropic", "openai", "ollama" (a remote Ollama), or "*".
+   * Records written before this field existed only ever covered Anthropic and a remote Ollama.
+   */
+  recipients?: string[];
+}
+
+const LEGACY_RECIPIENTS = ["anthropic", "ollama"];
+
+/** Whether a consent record lets the project context go to this recipient. */
+export function consentCovers(consent: AIConsent | null, recipient: string): boolean {
+  if (!consent) return false;
+  const list = consent.recipients ?? LEGACY_RECIPIENTS;
+  return list.includes("*") || list.includes(recipient);
 }
 
 // ---------------------------------------------------------------------------

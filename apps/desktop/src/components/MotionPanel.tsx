@@ -11,6 +11,8 @@ interface Props {
   notify: (tone: "info" | "error", text: string) => void;
   /** Put a finished graphic on the timeline at the playhead (App picks the track). */
   onPlace: (asset: Asset, durationFrames: number) => void | Promise<void>;
+  /** Reports a render in progress (null when none) so the agent card can show it. */
+  onRender?: (r: { template: string; progress: number } | null) => void;
 }
 
 type Field = { key: string; label: string } & ({ kind: "text"; max: number } | { kind: "color" } | { kind: "choice"; options: readonly string[] });
@@ -30,10 +32,10 @@ function fieldsOf(id: MotionTemplateId): Field[] {
   });
 }
 
-type Progress = { state: "rendering"; progress: number } | { state: "idle" };
+type Progress = { state: "rendering"; progress: number; label: string } | { state: "idle" };
 
 /** Motion graphics: Remotion templates, previewed live and rendered by the engine into a transparent clip. */
-export function MotionPanel({ client, timeline, notify, onPlace }: Props) {
+export function MotionPanel({ client, timeline, notify, onPlace, onRender }: Props) {
   const { width, height, fps: rate } = timeline.project.settings;
   const fps = rate.num / rate.den;
   const [template, setTemplate] = useState<MotionTemplateId>("title-card");
@@ -42,6 +44,11 @@ export function MotionPanel({ client, timeline, notify, onPlace }: Props) {
   );
   const [seconds, setSeconds] = useState<number>(MOTION_TEMPLATES["title-card"].defaultSeconds);
   const [progress, setProgress] = useState<Progress>({ state: "idle" });
+  // Mirror the render into the agent card; clear it when this panel goes away (the poll stops with it).
+  useEffect(() => {
+    onRender?.(progress.state === "rendering" ? { template: progress.label, progress: progress.progress } : null);
+  }, [progress, onRender]);
+  useEffect(() => () => onRender?.(null), [onRender]);
   const [engine, setEngine] = useState<{ ok: true } | { ok: false; reason: string } | null>(null);
   const [graphics, setGraphics] = useState<MotionGraphicInfo[]>([]);
   const projectId = timeline.project.id;
@@ -87,12 +94,13 @@ export function MotionPanel({ client, timeline, notify, onPlace }: Props) {
 
   const create = async () => {
     if (!check.success || !secondsOk) return;
-    setProgress({ state: "rendering", progress: 0 });
+    const label = MOTION_TEMPLATES[template].label;
+    setProgress({ state: "rendering", progress: 0, label });
     try {
       let st = await client.createMotion(projectId, { template, props: check.data as Record<string, unknown>, durationFrames });
       while (st.state !== "done" && st.state !== "failed") {
         if (!alive.current) return;
-        setProgress({ state: "rendering", progress: st.state === "running" ? st.progress : 0 });
+        setProgress({ state: "rendering", progress: st.state === "running" ? st.progress : 0, label });
         await new Promise((r) => setTimeout(r, 400));
         st = await client.motionStatus(projectId, st.key);
       }

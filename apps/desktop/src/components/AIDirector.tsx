@@ -6,6 +6,7 @@ import type { Notify } from "../editor.ts";
 import { Icon } from "../icons.tsx";
 import { ProposalCard } from "./ProposalCard.tsx";
 import { captionRequest } from "../caption-intent.ts";
+import type { AiRun } from "../activity.ts";
 
 interface Props {
   client: Client | null;
@@ -17,6 +18,10 @@ interface Props {
   previewing: string | null;
   onApplied: (timeline: Timeline) => void;
   onOpenSettings: () => void;
+  /** Lifecycle of the latest request, for the activity card and the logo. */
+  onRun: (run: AiRun | null) => void;
+  /** Bring this panel into view (from the activity card). */
+  onOpen: () => void;
 }
 
 const MODEL_KEY = "rf.aiModel";
@@ -26,6 +31,9 @@ const SUGGESTIONS = [
   "Buat caption dari voiceover dengan gaya Bold",
   "Zoom pelan (Ken Burns) di klip terakhir",
 ];
+
+// The closed model select shows only the option text, so each option names its provider too.
+const SHORT: Record<string, string> = { anthropic: "Claude API", "claude-code": "Claude Code", codex: "Codex", ollama: "Local" };
 
 function readModel(): { provider: string; model: string } | null {
   try {
@@ -40,7 +48,9 @@ export function AIDirector(p: Props) {
   const [choice, setChoice] = useState<{ provider: string; model: string } | null>(readModel);
   const [thread, setThread] = useState<AIProposal[]>([]);
   const [text, setText] = useState("");
-  const [pending, setPending] = useState<{ instruction: string; started: number; abort: AbortController; stage?: string } | null>(null);
+  const [pending, setPending] = useState<{ instruction: string; started: number; abort: AbortController; mode: "model" | "captions"; step: 0 | 1; stage?: string } | null>(null);
+  const [applying, setApplying] = useState<string | null>(null);
+  const [result, setResult] = useState<{ phase: "applied"; instruction: string; summary: string } | { phase: "failed"; instruction: string; error: string } | null>(null);
   const [, setTick] = useState(0);
   const [consent, setConsent] = useState<{ instruction: string; context: ProjectContext | null } | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
@@ -51,15 +61,15 @@ export function AIDirector(p: Props) {
     void p.client.aiProviders().then(setProviders, () => setProviders([]));
   }, [p.client]);
 
-  // Default model: a configured Claude if there is one, else the first local model.
+  // Default model: Claude with an API key, else an installed Claude Code or Codex, else the first local model.
   useEffect(() => {
     if (!providers.length) return;
     const valid = choice && providers.some((x) => x.id === choice.provider && x.models.includes(choice.model));
     if (valid) return;
-    const claude = providers.find((x) => x.id === "anthropic");
-    const local = providers.find((x) => x.id === "ollama" && x.available && x.models.length);
-    const pick = claude && claude.credential !== "none" ? { provider: "anthropic", model: claude.defaultModel! } : local ? { provider: "ollama", model: local.models[0]! } : claude ? { provider: "anthropic", model: claude.defaultModel! } : null;
-    if (pick) setChoice(pick);
+    const ready = (x: AIProviderInfo) => x.models.length > 0 && (x.id === "anthropic" ? x.credential !== "none" : x.available !== false);
+    const order = ["anthropic", "claude-code", "codex", "ollama"];
+    const first = order.map((id) => providers.find((x) => x.id === id && ready(x))).find(Boolean) ?? providers.find((x) => x.id === "anthropic");
+    if (first) setChoice({ provider: first.id, model: first.defaultModel ?? first.models[0]! });
   }, [providers]);
 
   useEffect(() => {
@@ -87,10 +97,11 @@ export function AIDirector(p: Props) {
     const captions = captionRequest(instruction); // needs no model: whisper.cpp + the engine
     if (!p.client || !projectId || (!choice && !captions) || pending) return;
     const abort = new AbortController();
-    setPending({ instruction, started: Date.now(), abort, ...(captions ? { stage: "Finding the speech on the timeline…" } : {}) });
+    setResult(null);
+    setPending({ instruction, started: Date.now(), abort, mode: captions ? "captions" : "model", step: 0, ...(captions ? { stage: "Finding the speech on the timeline…" } : {}) });
     try {
       const proposal = captions
-        ? await captionProposal(projectId, instruction, captions.style, abort.signal, (stage) => setPending((x) => (x ? { ...x, stage } : x)))
+        ? await captionProposal(projectId, instruction, captions.style, abort.signal, (stage, step) => setPending((x) => (x ? { ...x, stage, step } : x)))
         : await p.client.propose(projectId, { instruction, provider: choice!.provider, model: choice!.model, selection: p.selection }, abort.signal);
       setThread((t) => [...t, proposal]);
       setText("");
@@ -99,7 +110,11 @@ export function AIDirector(p: Props) {
       else if (e instanceof ApiError && e.code === "CONSENT_REQUIRED") {
         setConsent({ instruction, context: null });
         void p.client.context(projectId).then((context) => setConsent((c) => (c ? { ...c, context } : c)));
-      } else p.notify("error", e instanceof Error ? e.message : String(e));
+      } else {
+        const error = e instanceof Error ? e.message : String(e);
+        setResult({ phase: "failed", instruction, error });
+        p.notify("error", error);
+      }
     } finally {
       setPending(null);
     }
@@ -107,7 +122,7 @@ export function AIDirector(p: Props) {
 
   // Captions need what the model can't do: hear the audio. Transcribe locally (whisper.cpp) where it's
   // missing, then let the engine time a caption to each word. The result is a normal proposal.
-  const captionProposal = async (projectId: string, instruction: string, style: string | undefined, signal: AbortSignal, stage: (s: string) => void) => {
+  const captionProposal = async (projectId: string, instruction: string, style: string | undefined, signal: AbortSignal, stage: (s: string, step: 0 | 1) => void) => {
     const client = p.client!;
     for (let round = 0; round < 3; round++) {
       const r = await client.proposeCaptions(projectId, { instruction, ...(style ? { style } : {}) });
@@ -122,10 +137,10 @@ export function AIDirector(p: Props) {
         if (failed) throw new Error(`Transcription failed: ${failed.error ?? "unknown error"}`);
         if (latest.every((a) => a?.state === "completed")) break;
         const progress = latest.reduce((n, a) => n + (a?.progress ?? 0), 0) / latest.length;
-        stage(`Transcribing speech locally (${names}) · ${Math.round(progress * 100)}%`);
+        stage(`Transcribing speech locally (${names}) · ${Math.round(progress * 100)}%`, 0);
         await new Promise((ok) => setTimeout(ok, 1000));
       }
-      stage("Timing captions to each word…");
+      stage("Timing captions to each word…", 1);
     }
     throw new Error("The transcripts finished but the captions still couldn't be planned. Try again.");
   };
@@ -134,7 +149,9 @@ export function AIDirector(p: Props) {
     if (!p.client) return;
     try {
       if (action === "apply") {
+        setApplying(proposal.id);
         const r = await p.client.applyProposal(proposal.id);
+        setResult({ phase: "applied", instruction: proposal.instruction, summary: proposal.summary });
         setThread((t) => t.map((x) => (x.id === r.proposal.id ? r.proposal : x)));
         p.onPreview(null);
         p.onApplied(r.timeline);
@@ -149,22 +166,46 @@ export function AIDirector(p: Props) {
         setThread((t) => t.map((x) => (x.id === proposal.id ? { ...x, status: "stale" } : x)));
         p.notify("error", "The timeline changed since this proposal was made, so it wasn't applied. Regenerate it.");
       } else p.notify("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setApplying(null);
     }
   };
 
   const grant = async () => {
     if (!p.client || !projectId || !consent) return;
-    await p.client.setConsent(projectId, true);
+    await p.client.setConsent(projectId, true, choice?.provider);
     const instruction = consent.instruction;
     setConsent(null);
     void send(instruction);
   };
 
-  const options = useMemo(
+  // The newest proposal that can still be applied to this exact revision is waiting for the user.
+  const revision = p.timeline?.project.revision;
+  const waiting = [...thread].reverse().find((x) => x.status === "pending" && x.baseRevision === revision) ?? null;
+  const applyingProposal = applying ? thread.find((x) => x.id === applying) : null;
+  const run = useMemo<AiRun | null>(() => {
+    if (pending)
+      return { phase: "planning", mode: pending.mode, instruction: pending.instruction, model: pending.mode === "model" ? (choice?.model ?? null) : null, step: pending.step, stage: pending.stage ?? null, cancel: () => pending.abort.abort() };
+    if (applyingProposal) return { phase: "applying", mode: applyingProposal.provider === "reelforge" ? "captions" : "model", instruction: applyingProposal.instruction };
+    if (waiting) return { phase: "review", mode: waiting.provider === "reelforge" ? "captions" : "model", instruction: waiting.instruction, summary: waiting.summary, open: p.onOpen };
+    if (result?.phase === "failed") return { ...result, retry: () => void send(result.instruction) };
+    return result;
+  }, [pending, applyingProposal?.id, waiting?.id, result, choice?.model]);
+  const onRun = p.onRun;
+  useEffect(() => {
+    onRun(run);
+  }, [run]);
+
+  // One group per provider; a CLI agent that isn't installed stays listed but can't be picked.
+  const groups = useMemo(
     () =>
-      providers.flatMap((x) =>
-        x.models.map((m) => ({ value: `${x.id}|${m}`, label: `${x.id === "anthropic" ? "Claude" : "Local"} · ${m}${x.id === "anthropic" && x.credential === "none" ? " (no key)" : ""}`, disabled: x.id === "ollama" && !x.available })),
-      ),
+      providers
+        .filter((x) => x.models.length)
+        .map((x) => ({
+          id: x.id,
+          label: `${x.label}${x.id === "anthropic" && x.credential === "none" ? " (no key)" : x.available === false ? (x.id === "ollama" ? " (offline)" : " (not installed)") : ""}`,
+          options: x.models.map((m) => ({ value: `${x.id}|${m}`, label: `${SHORT[x.id] ?? x.label} · ${m.replace(/^claude-/, "")}`, disabled: x.available === false })),
+        })),
     [providers],
   );
 
@@ -172,7 +213,7 @@ export function AIDirector(p: Props) {
     <div className="rf-director">
       <div className="rf-director-head">
         <span className="rf-director-mark">
-          <Icon name="sparkle" size={22} />
+          <Icon name="director" size={22} />
         </span>
         <div>
           <h2>AI Director</h2>
@@ -192,11 +233,15 @@ export function AIDirector(p: Props) {
             }
           }}
         >
-          {!options.length && <option value="">No models</option>}
-          {options.map((o) => (
-            <option key={o.value} value={o.value} disabled={o.disabled}>
-              {o.label}
-            </option>
+          {!groups.length && <option value="">No models</option>}
+          {groups.map((g) => (
+            <optgroup key={g.id} label={g.label}>
+              {g.options.map((o) => (
+                <option key={o.value} value={o.value} disabled={o.disabled}>
+                  {o.label}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </select>
       </div>
@@ -218,7 +263,7 @@ export function AIDirector(p: Props) {
             </div>
             {provider?.id === "anthropic" && provider.credential === "none" && (
               <p className="rf-hint">
-                Claude needs an API key. <button className="rf-link-btn" onClick={p.onOpenSettings}>Add it in Settings</button>, or pick a local model.
+                Claude needs an API key. <button className="rf-link-btn" onClick={p.onOpenSettings}>Add it in Settings</button>, or pick Claude Code, Codex or a local model.
               </p>
             )}
           </div>
@@ -272,7 +317,7 @@ export function AIDirector(p: Props) {
         </button>
       </form>
 
-      {consent && <ConsentDialog provider={provider?.label ?? "Claude"} context={consent.context} onAllow={() => void grant()} onCancel={() => setConsent(null)} />}
+      {consent && <ConsentDialog provider={provider?.id === "codex" ? "Codex (OpenAI)" : provider?.id === "claude-code" ? "Claude Code (Anthropic)" : (provider?.label ?? "Claude")} context={consent.context} onAllow={() => void grant()} onCancel={() => setConsent(null)} />}
     </div>
   );
 }

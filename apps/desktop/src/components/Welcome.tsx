@@ -1,9 +1,10 @@
-import { Icon, LogoMark } from "../icons.tsx";
+import { Icon } from "../icons.tsx";
+import { ReelForgeLogo } from "./ReelForgeLogo.tsx";
 
 export function Welcome({ onCreate }: { onCreate: () => void }) {
   return (
     <main className="rf-center-state">
-      <LogoMark size={56} />
+      <ReelForgeLogo size={72} title="ReelForge" />
       <h1>Welcome to ReelForge</h1>
       <p>Create a project to start. Everything stays on this Mac. The CLI and MCP clients see the same projects.</p>
       <button className="rf-btn rf-btn-primary rf-btn-lg" onClick={onCreate} autoFocus>

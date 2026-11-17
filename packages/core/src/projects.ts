@@ -12,11 +12,13 @@ import {
   ProjectIdSchema,
   ProjectSettingsSchema,
   RenameProjectInputSchema,
+  ResizeProjectInputSchema,
   type Actor,
   type CreateProjectInput,
   type EditOperation,
   type Project,
   type RenameProjectInput,
+  type ResizeProjectInput,
 } from "./schema.ts";
 
 interface ProjectRow {
@@ -135,6 +137,25 @@ export class ProjectStore {
         now: this.#now(),
       });
       this.#db.prepare("UPDATE projects SET name = ? WHERE id = ?").run(name, pid);
+      return this.get(pid);
+    });
+  }
+
+  resize(id: string, input: ResizeProjectInput, actor: Actor): Project {
+    const pid = parse(ProjectIdSchema, id);
+    const { width, height, baseRevision } = parse(ResizeProjectInputSchema, input);
+    return transaction(this.#db, () => {
+      const current = this.get(pid);
+      if (current.settings.width === width && current.settings.height === height) return current;
+      commitRevision(this.#db, {
+        projectId: pid,
+        baseRevision,
+        kind: "project.resize",
+        payload: { from: { width: current.settings.width, height: current.settings.height }, to: { width, height } },
+        actor,
+        now: this.#now(),
+      });
+      this.#db.prepare("UPDATE projects SET width = ?, height = ? WHERE id = ?").run(width, height, pid);
       return this.get(pid);
     });
   }

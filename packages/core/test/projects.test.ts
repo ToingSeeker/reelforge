@@ -93,3 +93,16 @@ test("migrations run once per database", (t) => {
   const rows = db.prepare("SELECT version FROM schema_migrations").all();
   assert.deepEqual(rows.map((r) => r.version), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 });
+
+test("resize changes the format, bumps revision, and is a no-op when unchanged", (t) => {
+  const store = new ProjectStore(openDatabase(tempDb(t)));
+  const p = store.create({ name: "Reel" }, "cli");
+  const same = store.resize(p.id, { width: 1080, height: 1920, baseRevision: 1 }, "desktop");
+  assert.equal(same.revision, 1);
+  const r = store.resize(p.id, { width: 1920, height: 1080, baseRevision: 1 }, "desktop");
+  assert.equal(r.revision, 2);
+  assert.deepEqual(r.settings, { width: 1920, height: 1080, fps: { num: 30, den: 1 } });
+  assert.deepEqual(store.history(p.id)[1]?.payload, { from: { width: 1080, height: 1920 }, to: { width: 1920, height: 1080 } });
+  assert.equal(code(() => store.resize(p.id, { width: 1081, height: 1080, baseRevision: 2 }, "desktop")), "VALIDATION_ERROR");
+  assert.equal(code(() => store.resize(p.id, { width: 1080, height: 1080, baseRevision: 1 }, "desktop")), "REVISION_CONFLICT");
+});

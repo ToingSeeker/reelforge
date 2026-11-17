@@ -30,7 +30,7 @@ import {
   type Database,
   type ErrorCode,
 } from "@reelforge/core";
-import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor } from "@reelforge/ai";
+import { ANTHROPIC_DEFAULT_MODEL, CLAUDE_CODE_MODELS, claudeBinary, codexBinary, consentRecipient, credentialSource, defaultModelFor, listCodexModels, listOllamaModels, OllamaProvider, propose, providerFor } from "@reelforge/ai";
 import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
 import {
   AnalysisRunner,
@@ -67,6 +67,17 @@ export interface ApiServerOptions {
   generatedDir?: string;
   /** Optional access log (method, path, status, origin). Never logs headers or bodies. */
   log?: (line: string) => void;
+  /** The Claude.ai / ChatGPT connector, run by the same process (`reelforge serve` passes one). */
+  connector?: ConnectorControl;
+}
+
+/** What Settings needs from the remote connector (implemented by ConnectorManager in @reelforge/mcp). */
+export interface ConnectorControl {
+  status(): unknown;
+  start(input: { tunnel?: "ngrok" | "none"; domain?: string | null; publicUrl?: string | null }): Promise<unknown>;
+  stop(): Promise<unknown>;
+  rotateKey(): unknown;
+  revokeAll(): unknown;
 }
 
 export interface RunningServer {
@@ -244,6 +255,11 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
   };
 
   const ID = "([^/]+)";
+  const connector = (): ConnectorControl => {
+    if (!opts.connector) throw new ReelForgeError("UNAVAILABLE", "this engine was started without the connector");
+    return opts.connector;
+  };
+
   const routes: Route[] = [
     { method: "GET", pattern: re("/v1/projects"), handle: ({ res }) => send(res, 200, { projects: projects.list() }) },
     { method: "POST", pattern: re("/v1/projects"), handle: async ({ req, res, actor }) => send(res, 201, { project: projects.create(await body(req), actor) }) },
@@ -252,6 +268,11 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       method: "PATCH",
       pattern: re(`/v1/projects/${ID}`),
       handle: async ({ req, res, params: [id], actor }) => send(res, 200, { project: projects.rename(id!, await body(req), actor) }),
+    },
+    {
+      method: "PATCH",
+      pattern: re(`/v1/projects/${ID}/format`),
+      handle: async ({ req, res, params: [id], actor }) => send(res, 200, { project: projects.resize(id!, await body(req), actor) }),
     },
     { method: "GET", pattern: re(`/v1/projects/${ID}/history`), handle: ({ res, params: [id] }) => send(res, 200, { operations: projects.history(id!) }) },
     { method: "GET", pattern: re(`/v1/projects/${ID}/timeline`), handle: ({ res, params: [id] }) => send(res, 200, { timeline: timeline.get(id!) }) },
@@ -422,12 +443,37 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         const ollama = await listOllamaModels();
         return send(res, 200, {
           providers: [
-            { id: "anthropic", label: "Claude", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL, models: [ANTHROPIC_DEFAULT_MODEL, "claude-sonnet-5-5"] },
+            { id: "anthropic", label: "Claude API", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL, models: [ANTHROPIC_DEFAULT_MODEL, "claude-sonnet-5-5"] },
+            { id: "claude-code", label: "Claude Code", external: true, available: !!claudeBinary(), defaultModel: CLAUDE_CODE_MODELS[0], models: CLAUDE_CODE_MODELS },
+            { id: "codex", label: "Codex", external: true, available: !!codexBinary(), defaultModel: listCodexModels()[0] ?? null, models: listCodexModels() },
             { id: "ollama", label: "Local (Ollama)", external: new OllamaProvider().external, available: ollama.available, defaultModel: ollama.models[0] ?? null, models: ollama.models },
           ],
         });
       },
     },
+    {
+      method: "GET",
+      pattern: re("/v1/connector"),
+      handle: ({ res }) => send(res, 200, { connector: connector().status() }),
+    },
+    {
+      method: "POST",
+      pattern: re("/v1/connector/start"),
+      handle: async ({ req, res }) => {
+        const b = (await readJson(req)) as { tunnel?: unknown; domain?: unknown; publicUrl?: unknown };
+        if (b.tunnel !== undefined && b.tunnel !== "ngrok" && b.tunnel !== "none") throw new ReelForgeError("VALIDATION_ERROR", 'tunnel must be "ngrok" or "none"');
+        const str = (v: unknown) => (typeof v === "string" ? v : v === null ? null : undefined);
+        const input = {
+          ...(b.tunnel ? { tunnel: b.tunnel as "ngrok" | "none" } : {}),
+          ...(str(b.domain) !== undefined ? { domain: str(b.domain)! } : {}),
+          ...(str(b.publicUrl) !== undefined ? { publicUrl: str(b.publicUrl)! } : {}),
+        };
+        return send(res, 200, { connector: await connector().start(input) });
+      },
+    },
+    { method: "POST", pattern: re("/v1/connector/stop"), handle: async ({ res }) => send(res, 200, { connector: await connector().stop() }) },
+    { method: "POST", pattern: re("/v1/connector/rotate-key"), handle: ({ res }) => send(res, 200, { connector: connector().rotateKey() }) },
+    { method: "POST", pattern: re("/v1/connector/revoke"), handle: ({ res }) => send(res, 200, { connector: connector().revokeAll() }) },
     {
       method: "GET",
       pattern: re(`/v1/projects/${ID}/ai-consent`),
@@ -437,9 +483,11 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       method: "POST",
       pattern: re(`/v1/projects/${ID}/ai-consent`),
       handle: async ({ req, res, params: [id], actor }) => {
-        const b = (await readJson(req)) as { granted?: unknown };
-        if (typeof b.granted !== "boolean") throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"granted": true|false}');
-        return send(res, 200, { consent: proposals.setConsent(id!, b.granted, actor) });
+        const b = (await readJson(req)) as { granted?: unknown; provider?: unknown };
+        if (typeof b.granted !== "boolean") throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"granted": true|false, "provider"?: string}');
+        // Consent is per recipient: allowing Claude doesn't also send the project to OpenAI.
+        const recipient = typeof b.provider === "string" ? consentRecipient(b.provider) : undefined;
+        return send(res, 200, { consent: proposals.setConsent(id!, b.granted, actor, recipient) });
       },
     },
     {
@@ -449,8 +497,8 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         const b = (await readJson(req)) as { instruction?: unknown; provider?: unknown; model?: unknown; selection?: unknown };
         if (typeof b.instruction !== "string") throw new ReelForgeError("VALIDATION_ERROR", "instruction is required");
         const provider = providerFor(typeof b.provider === "string" ? b.provider : "anthropic");
-        const model = typeof b.model === "string" && b.model ? b.model : provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : ((await listOllamaModels()).models[0] ?? "");
-        if (!model) throw new ReelForgeError("UNAVAILABLE", "no local model available in Ollama");
+        const model = typeof b.model === "string" && b.model ? b.model : await defaultModelFor(provider.id);
+        if (!model) throw new ReelForgeError("UNAVAILABLE", provider.id === "ollama" ? "no local model available in Ollama" : `no model available for ${provider.id}`);
         // If the client goes away (cancel), stop the model request too.
         const abort = new AbortController();
         res.on("close", () => !res.writableEnded && abort.abort());

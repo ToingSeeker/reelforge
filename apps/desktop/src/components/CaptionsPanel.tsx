@@ -146,7 +146,7 @@ export function CaptionsPanel(p: Props) {
             </select>
           </label>
           <button className="rf-btn rf-btn-primary rf-btn-block" onClick={() => void generate()} disabled={pending || !sources.length || !sourceAssets.length}>
-            <Icon name="sparkle" size={15} />{" "}
+            <Icon name="director" size={15} />{" "}
             {pending ? (running.length ? `Transcribing… ${Math.round(progress * 100)}%` : "Working…") : captions.length ? "Regenerate captions" : "Generate captions"}
           </button>
           <p className="rf-hint">Speech is transcribed on this Mac (whisper.cpp). Regenerating replaces the captions as one undoable step.</p>

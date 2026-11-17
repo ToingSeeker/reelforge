@@ -12,6 +12,7 @@ const MISSING_KEY = "no Anthropic API key: add one in Settings (stored in the ma
  */
 export class AnthropicProvider implements PlannerProvider {
   readonly id = "anthropic";
+  readonly recipient = "anthropic";
   readonly external = true;
   readonly #apiKey: () => string | undefined;
 

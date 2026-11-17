@@ -253,6 +253,47 @@ Tools: `projects_list|create|get`, `media_import|analyze|get_analysis`, `audio_d
 `timeline_propose_edit|get_proposal|apply_proposal|undo`, `captions_generate`, `preview_create`, `render_start`,
 `jobs_get|cancel`, `outputs_get`, `workflows_run|runs`.
 
+### Claude.ai and ChatGPT (remote connector)
+
+The web and mobile apps of Claude and ChatGPT can't start a local process. They need a remote MCP server on a
+public https URL. ReelForge runs one on your machine, behind an [ngrok](https://ngrok.com) tunnel. Once, install
+ngrok and add your (free) token: `brew install ngrok && ngrok config add-authtoken <your-token>`.
+
+**From the app:** open Settings (gear, bottom left) → Claude & ChatGPT → Start. It shows the connector link and an
+access key, each with a Copy button. The connector starts again with the app until you press Stop. Under Tunnel
+options you can set a reserved ngrok domain, so the link stays the same, or use a tunnel you run yourself.
+
+**From a terminal:**
+
+```sh
+reelforge connector --tunnel ngrok           # prints the connector URL and the access key
+```
+
+Add the `…/mcp` link as a custom connector. In Claude, go to Settings → Connectors → Add custom connector.
+In ChatGPT, go to Settings → Apps & Connectors → Advanced → Developer mode, then create a connector. When the app
+opens the ReelForge sign-in page, enter the access key. The key stays the same until you press New key; apps
+already connected keep working when you do. The connection lasts 60 days. Keep ReelForge (or the command) running
+while you chat.
+
+How it differs from the local server:
+
+- **Sending video.** In ChatGPT, attach the file in the chat and the AI adds it with `media_add_file`. Claude
+  can't pass attachments to a connector, so it gives you a one-time upload link (`media_upload_link`) to open in
+  your browser. Both can also take a public https link (`media_add_from_url`). Files are stored in
+  ReelForge's folder on your computer.
+- **Approving edits.** `timeline_apply_proposal` returns an approval link. Open it, review the changes, and
+  press Apply. The page only applies an edit from the browser that entered the access key, or when the code is
+  typed again. The AI can hold the link, but it can't approve its own edit.
+- **Getting the video back.** `render_start` writes to ReelForge's exports folder (`--out <dir>` changes it).
+  When the job completes, `jobs_get` gives a download link valid for 24 hours.
+- **What's not offered.** Local file paths (`media_import`) and `workflows_run` aren't available, so a remote
+  client can't read other files on your computer. Downloads from links are https only and never go to local or
+  private network addresses.
+
+`reelforge connector status` lists the connected apps. `reelforge connector revoke` disconnects all of them;
+restart the connector afterwards. To use your own tunnel instead of ngrok, pass
+`--public-url https://your.domain`.
+
 ## Workflow recipes
 
 A recipe is a JSON file that runs the whole pipeline the same way every time, from the CLI, from the
@@ -337,7 +378,7 @@ packages/media       FFprobe/FFmpeg: import, probing, proxies, thumbnails, wavef
 packages/server      local REST API (loopback only, bearer token, Host/Origin checks)
 packages/ai          AI Director: Claude + Ollama adapters, proposal planner
 packages/automation  workflow recipe (JSON) runner
-packages/mcp         MCP server (stdio) over the same engine
+packages/mcp         MCP server (stdio) and the remote connector (HTTPS + OAuth) over the same engine
 packages/cli         `reelforge` JSON CLI, including `reelforge serve` and `reelforge mcp`
 packages/motion      motion-graphics templates (Remotion compositions) and their render process
 packages/fx-engine   AI effects engine (Python, MediaPipe), vendored from claude-video-effects (MIT)

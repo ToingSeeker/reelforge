@@ -1,46 +1,124 @@
-/* ReelForge design tokens (PRD §16). Dark professional only. */
+/* ReelForge design tokens: "Smoked Emerald Glass". Dark only. Every colour in app.css comes from here. */
+@font-face {
+  /* Wordmark only (OFL, assets/fonts/OFL-Poppins.txt). The UI itself uses the system sans. */
+  font-family: "RF Wordmark";
+  src: url("../../../assets/fonts/Poppins-SemiBold.ttf") format("truetype");
+  font-weight: 600;
+  font-display: swap;
+}
+
 :root {
   color-scheme: dark;
 
-  --rf-bg: #090f16;
-  --rf-surface: #141e2b;
-  --rf-surface-2: #1a2636;
-  --rf-surface-3: #223146;
-  --rf-panel: #0e1620;
-  --rf-border: #213044;
-  --rf-border-strong: #2d4058;
+  /* Base palette */
+  --bg-base: #080f0d;
+  --bg-stage: #090e0c;
+  --surface-base: #101d19;
+  --surface-raised: #1b3029;
+  --text-primary: #eef5f0;
+  --text-secondary: #9cafa5;
+  --text-muted: #72877c;
+  --accent-mint: #a8dcc8;
+  --accent-orange: #ff7a1a;
+  --border-subtle: rgba(238, 245, 240, 0.09);
+  --border-hover: rgba(238, 245, 240, 0.16);
 
-  --rf-primary: #00d5ed;
-  --rf-primary-ink: #04161b;
-  --rf-primary-soft: rgba(0, 213, 237, 0.12);
-  --rf-selection: #186ce6;
-  --rf-selection-soft: rgba(24, 108, 230, 0.22);
+  /* Page light: a static emerald wash, brightest behind the top of the shell (two soft pools, as in the mockup). */
+  --page-wash:
+    radial-gradient(360px 200px at 30% -30px, rgba(104, 160, 150, 0.36), transparent 72%),
+    radial-gradient(320px 190px at 70% -30px, rgba(112, 172, 162, 0.4), transparent 72%),
+    radial-gradient(1400px 560px at 50% -200px, rgba(44, 96, 80, 0.3), transparent 75%),
+    linear-gradient(180deg, #0d1c18 0%, #0b1714 55%, #09130f 100%);
 
-  --rf-text: #e6edf5;
-  --rf-text-2: #a3b1c2;
-  --rf-text-3: #6b7c90;
-  --rf-success: #2bd47d;
-  --rf-warning: #f5b544;
-  --rf-danger: #ff5c6c;
+  /* Glass material: emerald-tinted, translucent enough to pick up the page light, dense enough for crisp text */
+  --glass-panel: rgba(17, 38, 32, 0.6);
+  --glass-panel-top: rgba(36, 66, 57, 0.42);
+  --glass-bar: rgba(18, 40, 34, 0.58);
+  --glass-menu: rgba(19, 36, 31, 0.95);
+  --glass-highlight: inset 0 1px 0 rgba(238, 245, 240, 0.07);
+  --glass-blur: blur(18px) saturate(1.15);
+  --shadow-panel: 0 1px 0 rgba(238, 245, 240, 0.07) inset, 0 18px 40px -22px rgba(0, 0, 0, 0.75);
+  --shadow-float: 0 1px 0 rgba(238, 245, 240, 0.08) inset, 0 24px 48px -16px rgba(0, 0, 0, 0.7);
 
-  /* Track lane colours (timeline) */
-  --rf-track-overlay: #4b3a8f;
-  --rf-track-video: #1d4f9a;
-  --rf-track-music: #1f7a4a;
-  --rf-track-voice: #2f3f9e;
-  --rf-track-caption: #5b3693;
+  /* Glass pill controls: a lit top edge over a faint emerald fill */
+  --pill-fill: linear-gradient(180deg, rgba(238, 245, 240, 0.09), rgba(238, 245, 240, 0.03));
+  --pill-fill-hover: linear-gradient(180deg, rgba(238, 245, 240, 0.14), rgba(238, 245, 240, 0.05));
+  --pill-border: rgba(238, 245, 240, 0.11);
+  --pill-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09), 0 1px 2px rgba(0, 0, 0, 0.28);
+  --field-fill: rgba(6, 16, 13, 0.42);
 
-  --rf-radius-sm: 4px;
-  --rf-radius: 6px;
-  --rf-radius-lg: 10px;
+  /* Neutral states */
+  --surface-inset: rgba(4, 10, 8, 0.5);
+  --surface-hover: rgba(238, 245, 240, 0.05);
+  --surface-press: rgba(238, 245, 240, 0.08);
 
-  --rf-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
-  --rf-font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+  /* Accents, used sparingly: mint = selection / active, orange = export, playhead, live agent work */
+  --mint-soft: rgba(168, 220, 200, 0.13);
+  --mint-line: rgba(168, 220, 200, 0.62);
+  --mint-ink: #0b1a15;
+  --ivory: #eef5f0;
+  --ivory-ink: #0d1814;
+  --orange-hover: #ff8c38;
+  --orange-ink: #1c0c00;
+  --orange-soft: rgba(255, 122, 26, 0.14);
 
-  --rf-topbar-h: 56px;
-  --rf-rail-w: 76px;
-  --rf-library-w: 340px;
-  --rf-director-w: 420px;
-  --rf-timeline-h: 340px;
-  --rf-statusbar-h: 32px;
+  /* Semantic */
+  --success: #6fd3a0;
+  --success-soft: rgba(111, 211, 160, 0.14);
+  --warning: #f0b860;
+  --warning-soft: rgba(240, 184, 96, 0.14);
+  --error: #f07a70;
+  --error-soft: rgba(240, 122, 112, 0.14);
+  --on-semantic: #12100c;
+
+  /* Timeline surfaces */
+  --clip-video: #1d362e;
+  --clip-overlay: #2b4a3f;
+  --clip-audio: #15291f;
+  --clip-caption: #34352a;
+  --clip-caption-border: rgba(214, 205, 160, 0.2);
+  --lane-bg: rgba(26, 54, 46, 0.4);
+  --timeline-head: #10231e; /* sticky ruler / track heads: opaque so clips scroll under them */
+  --timeline-ruler: #11251f;
+
+  /* Shape */
+  --radius-panel: 16px;
+  --radius-card: 12px;
+  --radius-control: 8px;
+  --radius-sm: 6px;
+  --radius-pill: 999px;
+
+  /* Type */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+  --font-wordmark: "RF Wordmark", var(--font-ui);
+  --fs-ui: 13px;
+  --fs-meta: 11.5px;
+  --fs-title: 15px;
+
+  /* Motion */
+  --dur-hover: 140ms;
+  --dur-panel: 190ms;
+  --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  /* Layout */
+  --header-h: 64px;
+  --rail-w: 62px;
+  --library-w: 320px;
+  --inspector-w: 328px;
+  --shell-gap: 10px;
+}
+
+@media (max-width: 1400px) {
+  :root {
+    --library-w: 288px;
+    --inspector-w: 308px;
+  }
+}
+@media (max-width: 1280px) {
+  :root {
+    --library-w: 264px;
+    --inspector-w: 292px;
+    --shell-gap: 8px;
+  }
 }
