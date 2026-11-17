@@ -195,6 +195,8 @@ export interface RemoteStatus {
   /** Holds the pairing secret: show only to the owner, as a QR code or behind Copy. */
   pairingLink: string | null;
   error: string | null;
+  /** Phones that turned on notifications (sent from this Mac, not through the relay). */
+  notifications: number;
 }
 
 /** The Claude.ai / ChatGPT connector the engine runs (GET /v1/connector). */

@@ -30,7 +30,7 @@ import {
   type TimelineOp,
 } from "@reelforge/core";
 import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor, setCredential } from "@reelforge/ai";
-import { AnalysisRunner, createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 import { ConnectorAuth, ConnectorManager, createMcpServer } from "@reelforge/mcp";
 import { RemoteManager } from "@reelforge/remote";
@@ -726,6 +726,7 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     db,
     dir: join(resolveHome(env), "remote"),
     version: VERSION,
+    thumbnail: (asset) => ensureThumbnail(resolveCacheDir(env), asset),
     log: (line) => io.err(`[remote] ${line}\n`),
   });
   const srv = await startApiServer({
