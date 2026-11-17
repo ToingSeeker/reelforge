@@ -33,6 +33,7 @@ import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProv
 import { AnalysisRunner, createRenderJob, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 import { ConnectorAuth, ConnectorManager, createMcpServer } from "@reelforge/mcp";
+import { RemoteManager } from "@reelforge/remote";
 import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
@@ -721,10 +722,17 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     cacheDir: resolveCacheDir(env),
     log: (line) => io.err(`[connector] ${line}\n`),
   });
+  const remoteManager = new RemoteManager({
+    db,
+    dir: join(resolveHome(env), "remote"),
+    version: VERSION,
+    log: (line) => io.err(`[remote] ${line}\n`),
+  });
   const srv = await startApiServer({
     db,
     token,
     connector: connectorManager,
+    remote: remoteManager,
     cacheDir: resolveCacheDir(env),
     port: int("port", values.port) ?? 0,
     allowedOrigins: values["allow-origin"] ?? [],
@@ -734,6 +742,8 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
   io.out(JSON.stringify({ event: "ready", url: srv.url, ...(provided ? {} : { token }) }) + "\n");
   // Bring the Claude/ChatGPT connector back if the user left it on (never blocks the engine).
   void connectorManager.autoStart();
+  // Same for the phone remote: reconnect to the relay if it was on.
+  void remoteManager.autoStart();
 
   await new Promise<void>((resolve) => {
     const stop = () => resolve();
@@ -745,6 +755,7 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
   // stdin was only a liveness signal; release it or it keeps the event loop alive.
   process.stdin.destroy();
   await connectorManager.close();
+  await remoteManager.close();
   await srv.close();
   db.close();
   return 0;

@@ -3464,6 +3464,24 @@ select.rf-input {
 .rf-connector code {
   font-size: 10.5px;
 }
+.rf-remote-pair {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  margin-top: 6px;
+}
+.rf-remote-qr {
+  width: 168px;
+  height: 168px;
+  flex: none;
+  border-radius: 10px;
+}
+.rf-remote-pair-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
 /* M5: Automation Lab */
 .rf-run {
   padding: 12px 14px;

@@ -17,6 +17,7 @@
     "@reelforge/core": "workspace:*",
     "@reelforge/mcp": "workspace:*",
     "@reelforge/media": "workspace:*",
+    "@reelforge/remote": "workspace:*",
     "@reelforge/server": "workspace:*"
   }
 }
