@@ -51,4 +51,8 @@ jobs:
         run: pnpm --filter @reelforge/desktop build
       - name: Check Rust shell
         working-directory: apps/desktop/src-tauri
-        run: cargo check --locked
+        # engine/ is produced by the release build (gitignored); tauri-build
+        # only needs the bundled resource path to exist for a check.
+        run: |
+          mkdir -p engine && touch engine/.ci-placeholder
+          cargo check --locked
