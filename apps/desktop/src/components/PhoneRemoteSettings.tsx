@@ -82,7 +82,7 @@ export function PhoneRemoteSettings({ client, notify }: { client: Client | null;
   return (
     <section className="rf-settings-group rf-connector rf-remote">
       <h3>Phone remote</h3>
-      <p className="rf-hint">Follow projects and exports from your phone, through your own relay. Everything is encrypted on this Mac; the relay can't read it.</p>
+      <p className="rf-hint">Follow projects and exports from your phone, through your own relay, and get notified when an export is ready. Everything is encrypted on this Mac; the relay can't read it.</p>
 
       <div className="rf-connector-status">
         <span className={`rf-dot ${st.state === "online" ? "is-on" : st.state === "connecting" ? "is-busy" : st.state === "error" ? "is-warn" : ""}`} aria-hidden />
@@ -144,6 +144,11 @@ export function PhoneRemoteSettings({ client, notify }: { client: Client | null;
             <PairingQr text={st.pairingLink} />
             <div className="rf-remote-pair-side">
               <p className="rf-hint">The code holds this Mac's key. Anyone who scans it can follow your projects, so don't share or screenshot it.</p>
+              <p className="rf-hint">
+                {st.notifications > 0
+                  ? `Notifications on for ${st.notifications} ${st.notifications === 1 ? "phone" : "phones"}. They stop with a new pairing.`
+                  : "Notifications: turn them on in the phone app's Settings."}
+              </p>
               <button type="button" className="rf-btn" onClick={() => void copy("link", st.pairingLink!)}>
                 <Icon name={copied === "link" ? "check" : "copy"} size={14} /> {copied === "link" ? "Copied" : "Copy link"}
               </button>

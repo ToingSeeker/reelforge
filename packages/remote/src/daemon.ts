@@ -5,12 +5,15 @@
 // Commands are a whitelist (`switch` below), never a proxy: the phone names projects and jobs by id
 // and never sends a path.
 
+import { randomBytes } from "node:crypto";
 import { deriveKeys, seal, unseal, type RemoteKeys } from "./keys.ts";
 
 /** A command older or newer than this (by the Mac's clock) is refused, as is any id seen before. */
 export const COMMAND_MAX_AGE_MS = 5 * 60 * 1000;
 const OUTBOX_MAX = 500;
 const BATCH = 50;
+/** Project ids are UUIDs; anything else from the phone is refused before it reaches a store. */
+const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface RemoteProject {
   id: string;
@@ -33,11 +36,77 @@ export interface RemoteJob {
   createdAt: string;
 }
 
+/** An export that ended recently (Home shows it; it also drives notifications). */
+export interface RemoteFinishedJob {
+  id: string;
+  projectId: string;
+  kind: "export" | "preview";
+  state: "completed" | "failed" | "cancelled";
+  error: string | null;
+  finishedAt: string;
+  sizeBytes: number | null;
+}
+
 /** What the phone is shown; built fresh from the engine's stores each time. */
 export interface RemoteState {
   projects: RemoteProject[];
   /** Jobs still running or waiting. */
   jobs: RemoteJob[];
+  /** Exports that finished in the last day, newest first. */
+  recent: RemoteFinishedJob[];
+}
+
+/** One project opened on the phone: enough to draw the poster and a compact, read-only timeline. */
+export interface RemoteProjectDetail {
+  id: string;
+  name: string;
+  revision: number;
+  width: number;
+  height: number;
+  fps: number;
+  updatedAt: string;
+  durationFrames: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  /** Top track first. Clip positions in project frames. */
+  tracks: { kind: string; name: string; muted: boolean; hidden: boolean; clips: { start: number; duration: number }[] }[];
+  clips: number;
+  captions: number;
+  assets: { video: number; audio: number; image: number; offline: number };
+  proposals: { id: string; status: string; instruction: string; summary: string; changes: number; provider: string; model: string; createdAt: string }[];
+  jobs: { id: string; kind: string; state: string; progress: number; error: string | null; createdAt: string; finishedAt: string | null; sizeBytes: number | null }[];
+}
+
+export interface RemotePoster {
+  /** Changes when the picture does; the phone keeps the image under it. */
+  key: string;
+  type: "image/jpeg" | "image/png";
+  data: Buffer;
+}
+
+/** Notification choices for one phone. */
+export interface PushPrefs {
+  exports: boolean;
+  proposals: boolean;
+  failures: boolean;
+}
+
+export interface PushSubscribeInput {
+  endpoint: unknown;
+  keys: unknown;
+  prefs: unknown;
+}
+
+/** What the daemon may do for the phone beyond reading state. Each one is a named command, never a passthrough. */
+export interface RemoteHandlers {
+  project?(projectId: string): RemoteProjectDetail;
+  poster?(projectId: string): Promise<RemotePoster | null>;
+  push?: {
+    publicKey(): string;
+    subscribe(input: PushSubscribeInput): PushPrefs;
+    unsubscribe(endpoint: unknown): void;
+    test(endpoint: unknown): Promise<void>;
+  };
 }
 
 export interface RemoteDevice {
@@ -59,6 +128,7 @@ export interface RemoteDaemonOptions {
   secret: string;
   device: RemoteDevice;
   state: () => RemoteState;
+  handlers?: RemoteHandlers;
   log?: (line: string) => void;
   onStatus?: (s: DaemonStatus) => void;
   /** How often the state is compared with what the phone last got. Default 2 s. */
@@ -83,7 +153,9 @@ export class RemoteDaemon {
   #loop: Promise<void> | undefined;
   #watch: ReturnType<typeof setInterval> | undefined;
   #seen = new Set<string>();
+  /** What the phone last got: everything but the running jobs, and the running jobs. */
   #lastState = "";
+  #lastJobs = "";
   #status: DaemonStatus = { online: false, error: null, fatal: false };
 
   constructor(opts: RemoteDaemonOptions) {
@@ -107,8 +179,39 @@ export class RemoteDaemon {
 
   snapshot(): Record<string, unknown> {
     const state = this.#opts.state();
-    this.#lastState = JSON.stringify(state);
-    return { t: "snapshot", device: { ...this.#opts.device, at: Date.now() }, ...state };
+    this.#remember(state);
+    const pushKey = this.#opts.handlers?.push?.publicKey() ?? null;
+    return { t: "snapshot", device: { ...this.#opts.device, at: Date.now() }, pushKey, ...state };
+  }
+
+  #remember(state: RemoteState): void {
+    const { jobs, ...rest } = state;
+    this.#lastState = JSON.stringify(rest);
+    this.#lastJobs = JSON.stringify(jobs);
+  }
+
+  /** Called on a timer: a full snapshot when projects change, a small `jobs` event when only progress moved. */
+  #watchTick(): void {
+    const state = this.#opts.state();
+    const { jobs, ...rest } = state;
+    if (JSON.stringify(rest) !== this.#lastState) return this.#sendSnapshot();
+    const j = JSON.stringify(jobs);
+    if (j === this.#lastJobs) return;
+    this.#lastJobs = j;
+    this.send({ t: "jobs", jobs });
+  }
+
+  /** Puts one sealed file on the relay for the phone to fetch once; returns its id. */
+  async #putBlob(value: Record<string, unknown>): Promise<string> {
+    const id = randomBytes(18).toString("base64url");
+    const res = await fetch(`${this.#url}/agent/blob`, {
+      method: "POST",
+      headers: this.#headers(),
+      body: JSON.stringify({ id, c: seal(this.#keys.key, value) }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) throw new Error(`the relay refused the file (HTTP ${res.status})`);
+    return id;
   }
 
   /** Queue one event for the phone. A snapshot replaces everything still waiting (it contains it). */
@@ -157,7 +260,7 @@ export class RemoteDaemon {
 
   async #command(sealed: unknown): Promise<void> {
     if (typeof sealed !== "string") return;
-    let cmd: { id?: unknown; at?: unknown; type?: unknown };
+    let cmd: { id?: unknown; at?: unknown; type?: unknown; [field: string]: unknown };
     try {
       cmd = unseal(this.#keys.key, sealed) as typeof cmd;
     } catch {
@@ -171,17 +274,45 @@ export class RemoteDaemon {
     }
     this.#seen.add(cmd.id);
     if (this.#seen.size > 2000) this.#seen = new Set([...this.#seen].slice(-1000));
+    const h = this.#opts.handlers ?? {};
+    const id = cmd.id;
     try {
       switch (cmd.type) {
         case "sync":
           return this.#sendSnapshot();
         case "ping":
-          return this.send({ t: "pong", id: cmd.id, at: Date.now() });
-        default:
-          return this.send({ t: "error", id: cmd.id, message: `Unknown command: ${String(cmd.type).slice(0, 40)}` });
+          return this.send({ t: "pong", id, at: Date.now() });
+        case "project.open": {
+          if (!h.project) break;
+          return this.send({ t: "project", id, project: h.project(projectIdOf(cmd)) });
+        }
+        case "poster": {
+          if (!h.poster) break;
+          const projectId = projectIdOf(cmd);
+          const poster = await h.poster(projectId);
+          if (!poster) return this.send({ t: "poster", id, projectId, key: null, blob: null });
+          const blob = await this.#putBlob({ type: poster.type, data: poster.data.toString("base64") });
+          return this.send({ t: "poster", id, projectId, key: poster.key, blob });
+        }
+        case "push.subscribe": {
+          if (!h.push) break;
+          const prefs = h.push.subscribe({ endpoint: cmd.endpoint, keys: cmd.keys, prefs: cmd.prefs });
+          return this.send({ t: "push", id, subscribed: true, prefs });
+        }
+        case "push.unsubscribe": {
+          if (!h.push) break;
+          h.push.unsubscribe(cmd.endpoint);
+          return this.send({ t: "push", id, subscribed: false });
+        }
+        case "push.test": {
+          if (!h.push) break;
+          await h.push.test(cmd.endpoint);
+          return this.send({ t: "push", id, tested: true });
+        }
       }
+      return this.send({ t: "error", id, message: `Unknown command: ${String(cmd.type).slice(0, 40)}` });
     } catch (e) {
-      this.send({ t: "error", id: cmd.id, message: errText(e) });
+      this.send({ t: "error", id, message: errText(e) });
     }
   }
 
@@ -194,7 +325,7 @@ export class RemoteDaemon {
     this.#watch = setInterval(() => {
       if (!this.#status.online) return;
       try {
-        if (JSON.stringify(this.#opts.state()) !== this.#lastState) this.#sendSnapshot();
+        this.#watchTick();
       } catch (e) {
         this.#opts.log?.(`couldn't read the engine state: ${errText(e)}`);
       }
@@ -262,6 +393,11 @@ export class RemoteDaemon {
 }
 
 class FatalError extends Error {}
+
+function projectIdOf(cmd: Record<string, unknown>): string {
+  if (typeof cmd.projectId !== "string" || !PROJECT_ID.test(cmd.projectId)) throw new Error("That project id isn't valid.");
+  return cmd.projectId;
+}
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise<void>((resolve) => {
