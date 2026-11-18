@@ -28,6 +28,7 @@ import {
   TimelineStore,
   type Actor,
   type Database,
+  type RenderJob,
   type ErrorCode,
 } from "@reelforge/core";
 import { consentRecipient, defaultModelFor, listAIProviders, propose, providerFor } from "@reelforge/ai";
@@ -71,14 +72,31 @@ export interface ApiServerOptions {
   connector?: ConnectorControl;
   /** The phone remote (RemoteManager in @reelforge/remote), run by the same process. */
   remote?: RemoteControl;
+  /** The engine process itself: how it runs, the editor's heartbeat, credentials, stopping it. */
+  engine?: EngineControl;
 }
 
-/** What Settings → Phone remote needs from the remote manager. */
+/** What Settings → Remote Access needs from the remote manager. */
 export interface RemoteControl {
   status(): unknown;
   start(input: { url?: string | null }): Promise<unknown>;
   stop(): Promise<unknown>;
   rotate(): Promise<unknown>;
+  startPairing(): Promise<unknown>;
+  cancelPairing(): Promise<unknown>;
+  revokeDevice(deviceId: string): Promise<unknown>;
+  setRemoteReady(enabled: boolean): Promise<unknown>;
+}
+
+/** The engine process (`reelforge serve`), as the desktop shell and Settings see it. */
+export interface EngineControl {
+  info(): unknown;
+  /** The editor window says it is open or closed (a heartbeat while open). */
+  editor(state: "open" | "closed"): void;
+  /** An API key from the desktop's Keychain, kept in memory only (null clears it). */
+  credential(provider: string, apiKey: string | null): void;
+  /** Stop the remote and exit this process (Stop Engine & Disconnect). */
+  stop(): void;
 }
 
 /** What Settings needs from the remote connector (implemented by ConnectorManager in @reelforge/mcp). */
@@ -94,6 +112,13 @@ export interface RunningServer {
   url: string;
   port: number;
   server: Server;
+  /** Renders, for the phone remote (same runner the API uses, so one job runs at a time). */
+  render: {
+    exportJob(projectId: string, outputPath: string, opts: { scale: number; quality: "standard" | "small" }): RenderJob;
+    previewJob(projectId: string): RenderJob;
+    cancel(jobId: string): RenderJob;
+    retry(jobId: string): RenderJob;
+  };
   close(): Promise<void>;
 }
 
@@ -268,6 +293,11 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
   const connector = (): ConnectorControl => {
     if (!opts.connector) throw new ReelForgeError("UNAVAILABLE", "this engine was started without the connector");
     return opts.connector;
+  };
+
+  const engine = (): EngineControl => {
+    if (!opts.engine) throw new ReelForgeError("UNAVAILABLE", "this engine can't be controlled over the API");
+    return opts.engine;
   };
 
   const remote = (): RemoteControl => {
@@ -491,6 +521,52 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     },
     { method: "POST", pattern: re("/v1/remote/stop"), handle: async ({ res }) => send(res, 200, { remote: await remote().stop() }) },
     { method: "POST", pattern: re("/v1/remote/rotate"), handle: async ({ res }) => send(res, 200, { remote: await remote().rotate() }) },
+    { method: "POST", pattern: re("/v1/remote/pairing"), handle: async ({ res }) => send(res, 200, { remote: await remote().startPairing() }) },
+    { method: "POST", pattern: re("/v1/remote/pairing/cancel"), handle: async ({ res }) => send(res, 200, { remote: await remote().cancelPairing() }) },
+    {
+      method: "POST",
+      pattern: re(`/v1/remote/devices/${ID}/revoke`),
+      handle: async ({ res, params: [id] }) => send(res, 200, { remote: await remote().revokeDevice(id!) }),
+    },
+    {
+      method: "POST",
+      pattern: re("/v1/remote/ready"),
+      handle: async ({ req, res }) => {
+        const b = (await readJson(req)) as { enabled?: unknown };
+        if (typeof b.enabled !== "boolean") throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"enabled": true|false}');
+        return send(res, 200, { remote: await remote().setRemoteReady(b.enabled) });
+      },
+    },
+    { method: "GET", pattern: re("/v1/engine"), handle: ({ res }) => send(res, 200, { engine: engine().info() }) },
+    {
+      method: "POST",
+      pattern: re("/v1/engine/editor"),
+      handle: async ({ req, res }) => {
+        const b = (await readJson(req)) as { state?: unknown };
+        if (b.state !== "open" && b.state !== "closed") throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"state": "open"|"closed"}');
+        engine().editor(b.state);
+        return send(res, 200, { engine: engine().info() });
+      },
+    },
+    {
+      method: "POST",
+      pattern: re("/v1/engine/credentials"),
+      handle: async ({ req, res }) => {
+        const b = (await readJson(req)) as { provider?: unknown; apiKey?: unknown };
+        if (typeof b.provider !== "string" || (b.apiKey !== null && typeof b.apiKey !== "string")) throw new ReelForgeError("VALIDATION_ERROR", 'body must be {"provider": "anthropic", "apiKey": "…"|null}');
+        engine().credential(b.provider, b.apiKey as string | null);
+        return send(res, 200, { ok: true });
+      },
+    },
+    {
+      method: "POST",
+      pattern: re("/v1/engine/stop"),
+      handle: ({ res }) => {
+        const e = engine();
+        send(res, 202, { stopping: true });
+        res.once("finish", () => setTimeout(() => e.stop(), 50));
+      },
+    },
     {
       method: "GET",
       pattern: re(`/v1/projects/${ID}/ai-consent`),
@@ -772,6 +848,27 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         url: `http://127.0.0.1:${boundPort}`,
         port: boundPort,
         server,
+        render: {
+          exportJob: (projectId, outputPath, o) => {
+            const job = createRenderJob(opts.db, projectId, "export", outputPath, o);
+            runner.enqueue(job.id);
+            return job;
+          },
+          previewJob: (projectId) => {
+            const revision = projects.get(projectId).revision;
+            const existing = jobs.list(projectId, { kind: "preview", limit: 10 }).find((j) => j.revision === revision && !["failed", "cancelled"].includes(j.state));
+            if (existing) return existing;
+            const job = createRenderJob(opts.db, projectId, "preview");
+            runner.enqueue(job.id);
+            return job;
+          },
+          cancel: (jobId) => runner.cancel(jobId),
+          retry: (jobId) => {
+            const job = retryRenderJob(opts.db, jobId);
+            runner.enqueue(job.id);
+            return job;
+          },
+        },
         close: () =>
           new Promise((r, j) => {
             analysisRunner.stop();

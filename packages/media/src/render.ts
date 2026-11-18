@@ -44,9 +44,25 @@ function existsNoFollow(path: string): boolean {
   }
 }
 
-export function createRenderJob(db: Database, projectId: string, kind: JobKind, outputPath?: string): RenderJob {
+/**
+ * `opts` (exports only): `scale` < 1 renders smaller than the project (same aspect, even sizes);
+ * `quality: "small"` trades some picture quality for a smaller file. Frame rate is always the project's.
+ */
+export function createRenderJob(db: Database, projectId: string, kind: JobKind, outputPath?: string, opts: { scale?: number; quality?: "standard" | "small" } = {}): RenderJob {
   const jobs = new JobStore(db);
-  if (kind === "export") return jobs.create(projectId, kind, exportSettings, validateExportPath(db, projectId, outputPath ?? ""));
+  if (kind === "export") {
+    const scale = opts.scale && opts.scale > 0 && opts.scale < 1 ? opts.scale : 1;
+    const even = (x: number) => Math.max(2, Math.round((x * scale) / 2) * 2);
+    return jobs.create(
+      projectId,
+      kind,
+      (plan) => {
+        const base = exportSettings(plan);
+        return { ...base, width: scale === 1 ? base.width : even(plan.width), height: scale === 1 ? base.height : even(plan.height), crf: opts.quality === "small" ? 24 : base.crf };
+      },
+      validateExportPath(db, projectId, outputPath ?? ""),
+    );
+  }
   return jobs.create(projectId, kind, previewSettings, null);
 }
 

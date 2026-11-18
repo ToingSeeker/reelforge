@@ -3482,6 +3482,44 @@ select.rf-input {
   align-items: flex-start;
   gap: 8px;
 }
+.rf-connector .rf-remote-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 20px;
+  letter-spacing: 0.08em;
+  color: var(--text-primary);
+  user-select: all;
+}
+.rf-remote-devices {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rf-remote-devices li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.rf-remote-devices .rf-hint {
+  flex: 1;
+  min-width: 0;
+}
+.rf-remote-devices .rf-link-btn {
+  margin-left: auto;
+}
+.rf-remote-device-name {
+  color: var(--text-primary);
+}
+.rf-connector-advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
 /* M5: Automation Lab */
 .rf-run {
   padding: 12px 14px;

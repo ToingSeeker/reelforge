@@ -1,163 +1,55 @@
-// The Mac side of the phone remote. Only outgoing connections: it keeps GET /agent/stream open to the
-// relay for commands from the phone, and posts encrypted events to /agent/events. Nothing listens on
-// this machine.
+// The Mac side of the phone remote's transport. Only outgoing connections: it keeps GET /agent/stream open
+// to the relay (commands, queued instructions, pairing requests arrive there) and posts sealed events to
+// /agent/events. Nothing listens on this machine.
 //
-// Commands are a whitelist (`switch` below), never a proxy: the phone names projects and jobs by id
-// and never sends a path.
+// This file knows how to talk to the relay and how to seal and open messages; what a command *does* is the
+// manager's business (manager.ts): the daemon hands it already-opened, de-duplicated commands.
 
+import { createReadStream, type WriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { deriveKeys, seal, unseal, type RemoteKeys } from "./keys.ts";
+import { seal, sealBytes, unseal, unsealBytes } from "./keys.ts";
 
 /** A command older or newer than this (by the Mac's clock) is refused, as is any id seen before. */
 export const COMMAND_MAX_AGE_MS = 5 * 60 * 1000;
+/** Raw bytes per file piece (sealed and base64'd it stays well under the relay's 4 MB body limit). */
+export const PIECE_BYTES = 1024 * 1024;
 const OUTBOX_MAX = 500;
 const BATCH = 50;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const STUCK_MS = 120_000;
 
-export interface RemoteProject {
-  id: string;
-  name: string;
-  revision: number;
-  width: number;
-  height: number;
-  fps: number;
-  updatedAt: string;
-  /** AI proposals waiting for a decision. */
-  pendingProposals: number;
+/** Ids of commands and queued instructions already handled, kept across restarts (manager.ts stores it). */
+export interface HandledIds {
+  has(id: string): boolean;
+  add(id: string, keepUntil: number): void;
 }
 
-export interface RemoteJob {
+export interface KeyRing {
+  /** This Mac's relay token. */
+  agentToken: string;
+  /** Seals events every paired phone may read. */
+  broadcastKey(): Buffer;
+  /** Null for a device that isn't paired (or was revoked). */
+  deviceKey(deviceId: string): Buffer | null;
+  /** What the relay may let in. */
+  devices(): { id: string; tokenHash: string }[];
+}
+
+/** A command as the phone sent it, opened and checked. */
+export interface RemoteCommand {
   id: string;
+  at: number;
+  type: string;
+  [field: string]: unknown;
+}
+
+/** A queued instruction, opened and checked. */
+export interface QueuedInstruction {
+  id: string;
+  deviceId: string;
   projectId: string;
-  kind: "export" | "preview";
-  state: string;
-  progress: number;
-  createdAt: string;
-}
-
-/** An export that ended recently (Home shows it; it also drives notifications). */
-export interface RemoteFinishedJob {
-  id: string;
-  projectId: string;
-  kind: "export" | "preview";
-  state: "completed" | "failed" | "cancelled";
-  error: string | null;
-  finishedAt: string;
-  sizeBytes: number | null;
-}
-
-/** What the phone is shown; built fresh from the engine's stores each time. */
-export interface RemoteState {
-  projects: RemoteProject[];
-  /** Jobs still running or waiting. */
-  jobs: RemoteJob[];
-  /** Exports that finished in the last day, newest first. */
-  recent: RemoteFinishedJob[];
-}
-
-/** One project opened on the phone: enough to draw the poster and a compact, read-only timeline. */
-export interface RemoteProjectDetail {
-  id: string;
-  name: string;
-  revision: number;
-  width: number;
-  height: number;
-  fps: number;
-  updatedAt: string;
-  durationFrames: number;
-  canUndo: boolean;
-  canRedo: boolean;
-  /** Top track first. Clip positions in project frames. */
-  tracks: { kind: string; name: string; muted: boolean; hidden: boolean; clips: { start: number; duration: number }[] }[];
-  clips: number;
-  captions: number;
-  assets: { video: number; audio: number; image: number; offline: number };
-  /** Newest first, pending ones first; the pending ones carry what the phone needs to decide. */
-  proposals: RemoteProposal[];
-  /** A request from the phone the AI Director is still working on, or null. */
-  asking: RemoteAsk | null;
-  jobs: { id: string; kind: string; state: string; progress: number; error: string | null; createdAt: string; finishedAt: string | null; sizeBytes: number | null }[];
-}
-
-export interface RemoteProposal {
-  id: string;
-  status: string;
-  /** Pending, but the timeline moved on since it was made: it can't be applied any more. */
-  stale: boolean;
-  requestedBy: "user" | "mcp";
-  instruction: string;
-  summary: string;
-  changes: number;
-  /** The first changes, as the desktop's diff lists them. */
-  list: { kind: string; target: string; label: string; before: string | null; after: string | null }[];
-  warnings: string[];
-  provider: string;
-  model: string;
-  createdAt: string;
-}
-
-export interface RemoteAsk {
-  instruction: string;
-  provider: string;
-  model: string;
-  startedAt: string;
-}
-
-/** The phone's model picker. */
-export interface RemoteAiOptions {
-  providers: { id: string; label: string; models: string[]; defaultModel: string | null; ready: boolean; external: boolean; consented: boolean }[];
-  /** What this project used last (else any project), so the phone starts where the desktop left off. */
-  last: { provider: string; model: string } | null;
-}
-
-export interface RemotePoster {
-  /** Changes when the picture does; the phone keeps the image under it. */
-  key: string;
-  type: "image/jpeg" | "image/png";
-  data: Buffer;
-}
-
-/** Notification choices for one phone. */
-export interface PushPrefs {
-  exports: boolean;
-  proposals: boolean;
-  failures: boolean;
-}
-
-export interface PushSubscribeInput {
-  endpoint: unknown;
-  keys: unknown;
-  prefs: unknown;
-}
-
-/** What the daemon may do for the phone beyond reading state. Each one is a named command, never a passthrough. */
-export interface RemoteHandlers {
-  project?(projectId: string): RemoteProjectDetail;
-  poster?(projectId: string): Promise<RemotePoster | null>;
-  /**
-   * The AI Director. `ask` checks its input and claims the project before it returns, so a refusal
-   * (busy, empty prompt) arrives at once; the promise then settles when the model answers.
-   */
-  ai?: {
-    options(projectId: string): Promise<RemoteAiOptions>;
-    ask(projectId: string, input: { instruction: unknown; provider: unknown; model: unknown }): Promise<{ id: string }>;
-    cancel(projectId: string): boolean;
-    apply(proposalId: string): { projectId: string; revision: number };
-    reject(proposalId: string): { projectId: string };
-    undo(projectId: string, baseRevision: unknown): { revision: number };
-    redo(projectId: string, baseRevision: unknown): { revision: number };
-  };
-  push?: {
-    publicKey(): string;
-    subscribe(input: PushSubscribeInput): PushPrefs;
-    unsubscribe(endpoint: unknown): void;
-    test(endpoint: unknown): Promise<void>;
-  };
-}
-
-export interface RemoteDevice {
-  name: string;
-  version: string;
+  createdAt: number;
+  expiresAt: number;
+  body: Record<string, unknown>;
 }
 
 export interface DaemonStatus {
@@ -165,49 +57,58 @@ export interface DaemonStatus {
   online: boolean;
   /** Why it isn't (last failure), or null. */
   error: string | null;
-  /** True when retrying won't help (wrong auth value, locked out). */
+  /** True when retrying won't help (wrong auth value). */
   fatal: boolean;
+  /** When the stream was last open (ms), or null. */
+  lastConnected: number | null;
 }
 
 export interface RemoteDaemonOptions {
   url: string;
-  secret: string;
-  device: RemoteDevice;
-  state: () => RemoteState;
-  handlers?: RemoteHandlers;
+  keys: KeyRing;
+  handled: HandledIds;
+  /** The snapshot body (projects, jobs, …): compared every watchMs, sent again when it changes. */
+  state: () => Record<string, unknown>;
+  /** Fields of the snapshot that change often and small (job progress): sent as `{t:"jobs"}` alone. */
+  liveKey?: string;
+  onCommand(deviceId: string, cmd: RemoteCommand): Promise<void>;
+  onQueued(item: QueuedInstruction): Promise<void>;
+  onPair(lookup: string, hello: unknown): Promise<void>;
+  /** Called after each (re)connection, once the stream is open. */
+  onConnected?(): void;
   log?: (line: string) => void;
   onStatus?: (s: DaemonStatus) => void;
-  /** How often the state is compared with what the phone last got. Default 2 s. */
   watchMs?: number;
 }
 
-interface Sealed {
+interface Outgoing {
   c: string;
   snapshot: boolean;
+  to?: string;
 }
 
 export class RemoteDaemon {
   readonly #opts: RemoteDaemonOptions;
   readonly #url: string;
-  readonly #keys: RemoteKeys;
-  #outbox: Sealed[] = [];
+  #outbox: Outgoing[] = [];
   #sending = false;
   #running = false;
   #stream: AbortController | undefined;
-  /** Aborted by stop(), so a reconnect wait ends at once. */
+  /** Aborted by stop(), so waits end at once. */
   #stopper = new AbortController();
   #loop: Promise<void> | undefined;
   #watch: ReturnType<typeof setInterval> | undefined;
-  #seen = new Set<string>();
-  /** What the phone last got: everything but the running jobs, and the running jobs. */
   #lastState = "";
-  #lastJobs = "";
-  #status: DaemonStatus = { online: false, error: null, fatal: false };
+  #lastLive = "";
+  #status: DaemonStatus = { online: false, error: null, fatal: false, lastConnected: null };
+  /** Queued instructions being looked at, so a repeated `queue` event doesn't start one twice. */
+  #taking = new Set<string>();
+  /** Running file transfers (to the phone), by transfer id: false once cancelled. */
+  #transfers = new Map<string, { cancelled: boolean }>();
 
   constructor(opts: RemoteDaemonOptions) {
     this.#opts = opts;
     this.#url = opts.url.replace(/\/+$/, "");
-    this.#keys = deriveKeys(opts.secret);
   }
 
   get status(): DaemonStatus {
@@ -220,55 +121,63 @@ export class RemoteDaemon {
   }
 
   #headers(): Record<string, string> {
-    return { authorization: `Bearer ${this.#keys.token}`, "content-type": "application/json" };
+    return { authorization: `Bearer ${this.#opts.keys.agentToken}`, "content-type": "application/json" };
   }
 
-  snapshot(): Record<string, unknown> {
-    const state = this.#opts.state();
-    this.#remember(state);
-    const pushKey = this.#opts.handlers?.push?.publicKey() ?? null;
-    return { t: "snapshot", device: { ...this.#opts.device, at: Date.now() }, pushKey, ...state };
+  async #post(path: string, body: unknown, method = "POST"): Promise<Response> {
+    return fetch(`${this.#url}${path}`, { method, headers: this.#headers(), body: method === "DELETE" ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20_000) });
   }
 
-  #remember(state: RemoteState): void {
-    const { jobs, ...rest } = state;
-    this.#lastState = JSON.stringify(rest);
-    this.#lastJobs = JSON.stringify(jobs);
-  }
+  // ── events to the phones ─────────────────────────────────────────────────
 
-  /** Called on a timer: a full snapshot when projects change, a small `jobs` event when only progress moved. */
-  #watchTick(): void {
-    const state = this.#opts.state();
-    const { jobs, ...rest } = state;
-    if (JSON.stringify(rest) !== this.#lastState) return this.#sendSnapshot();
-    const j = JSON.stringify(jobs);
-    if (j === this.#lastJobs) return;
-    this.#lastJobs = j;
-    this.send({ t: "jobs", jobs });
-  }
-
-  /** Puts one sealed file on the relay for the phone to fetch once; returns its id. */
-  async #putBlob(value: Record<string, unknown>): Promise<string> {
-    const id = randomBytes(18).toString("base64url");
-    const res = await fetch(`${this.#url}/agent/blob`, {
-      method: "POST",
-      headers: this.#headers(),
-      body: JSON.stringify({ id, c: seal(this.#keys.key, value) }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!res.ok) throw new Error(`the relay refused the file (HTTP ${res.status})`);
-    return id;
-  }
-
-  /** Queue one event for the phone. A snapshot replaces everything still waiting (it contains it). */
-  send(event: Record<string, unknown>, { snapshot = false } = {}): void {
-    if (snapshot) this.#outbox = [];
-    this.#outbox.push({ c: seal(this.#keys.key, event), snapshot });
+  /** Queue one event for every paired phone. A snapshot replaces broadcasts still waiting (it contains them). */
+  broadcast(event: Record<string, unknown>, { snapshot = false } = {}): void {
+    if (snapshot) this.#outbox = this.#outbox.filter((e) => e.to);
+    this.#outbox.push({ c: seal(this.#opts.keys.broadcastKey(), event, "evt"), snapshot });
     void this.#drain();
   }
 
-  #sendSnapshot(): void {
-    this.send(this.snapshot(), { snapshot: true });
+  /** Queue one event only `deviceId` can open (answers to its commands, its new broadcast key, …). */
+  sendTo(deviceId: string, event: Record<string, unknown>): void {
+    const key = this.#opts.keys.deviceKey(deviceId);
+    if (!key) return;
+    this.#outbox.push({ c: seal(key, event, `evt:${deviceId}`), snapshot: false, to: deviceId });
+    void this.#drain();
+  }
+
+  /** Waits (up to `ms`) until everything queued has reached the relay. */
+  async flush(ms = 3000): Promise<void> {
+    const end = Date.now() + ms;
+    while ((this.#outbox.length || this.#sending) && Date.now() < end && this.#running) await sleep(50, this.#stopper.signal);
+  }
+
+  snapshotEvent(): Record<string, unknown> {
+    const state = this.#opts.state();
+    this.#remember(state);
+    return { t: "snapshot", at: Date.now(), ...state };
+  }
+
+  sendSnapshot(): void {
+    this.broadcast(this.snapshotEvent(), { snapshot: true });
+  }
+
+  #remember(state: Record<string, unknown>): void {
+    const live = this.#opts.liveKey;
+    const { [live ?? ""]: liveValue, ...rest } = state;
+    this.#lastState = JSON.stringify(rest);
+    this.#lastLive = JSON.stringify(liveValue ?? null);
+  }
+
+  /** On a timer: a full snapshot when anything but the live part changed, a small event when only it moved. */
+  #watchTick(): void {
+    const state = this.#opts.state();
+    const live = this.#opts.liveKey;
+    const { [live ?? ""]: liveValue, ...rest } = state;
+    if (JSON.stringify(rest) !== this.#lastState) return this.sendSnapshot();
+    const l = JSON.stringify(liveValue ?? null);
+    if (!live || l === this.#lastLive) return;
+    this.#lastLive = l;
+    this.broadcast({ t: "live", at: Date.now(), [live]: liveValue });
   }
 
   async #drain(): Promise<void> {
@@ -279,12 +188,7 @@ export class RemoteDaemon {
       while (this.#outbox.length && this.#running) {
         const batch = this.#outbox.slice(0, BATCH);
         try {
-          const res = await fetch(`${this.#url}/agent/events`, {
-            method: "POST",
-            headers: this.#headers(),
-            body: JSON.stringify({ events: batch }),
-            signal: AbortSignal.timeout(20_000),
-          });
+          const res = await this.#post("/agent/events", { events: batch });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           // Exactly what was sent: a snapshot may have replaced the queue meanwhile.
           const sent = new Set(batch);
@@ -293,10 +197,12 @@ export class RemoteDaemon {
         } catch (e) {
           if (!failing) this.#opts.log?.(`relay: couldn't send (${errText(e)}), retrying`);
           failing = true;
-          if (this.#outbox.length > OUTBOX_MAX) this.#outbox = [];
+          if (this.#outbox.length > OUTBOX_MAX) this.#outbox = this.#outbox.filter((e) => e.to).slice(-OUTBOX_MAX);
           await sleep(3000, this.#stopper.signal);
-          // Whatever piled up is replaced by one snapshot once the relay answers again.
-          if (this.#running && !this.#outbox.some((e) => e.snapshot)) this.#outbox = [{ c: seal(this.#keys.key, this.snapshot()), snapshot: true }];
+          // Piled-up broadcasts are replaced by one snapshot once the relay answers again.
+          if (this.#running && !this.#outbox.some((e) => e.snapshot)) {
+            this.#outbox = [...this.#outbox.filter((e) => e.to), { c: seal(this.#opts.keys.broadcastKey(), this.snapshotEvent(), "evt"), snapshot: true }];
+          }
         }
       }
     } finally {
@@ -304,104 +210,170 @@ export class RemoteDaemon {
     }
   }
 
-  async #command(sealed: unknown): Promise<void> {
-    if (typeof sealed !== "string") return;
-    let cmd: { id?: unknown; at?: unknown; type?: unknown; [field: string]: unknown };
+  // ── devices and pairing ──────────────────────────────────────────────────
+
+  /** Tells the relay which phones may come in. Revoking a phone = publishing the list without it. */
+  async publishDevices(): Promise<void> {
+    if (!this.#status.online) return;
+    const res = await this.#post("/agent/devices", { devices: this.#opts.keys.devices() });
+    if (!res.ok) throw new Error(`the relay refused the device list (HTTP ${res.status})`);
+  }
+
+  async openPairing(lookup: string, expiresAt: number): Promise<void> {
+    const res = await this.#post("/agent/pairing", { lookup, expiresAt });
+    if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error ?? `the relay refused the pairing code (HTTP ${res.status})`);
+  }
+
+  async closePairing(lookup: string): Promise<void> {
+    await this.#post(`/agent/pairing?lookup=${encodeURIComponent(lookup)}`, null, "DELETE").catch(() => {});
+  }
+
+  async answerPairing(lookup: string, msg: unknown): Promise<void> {
+    const res = await this.#post("/agent/pairing/answer", { lookup, msg });
+    if (!res.ok) throw new Error(`the relay refused the pairing answer (HTTP ${res.status})`);
+  }
+
+  // ── files ────────────────────────────────────────────────────────────────
+
+  /** Puts one small sealed value on the relay for `deviceId` to fetch once; returns its id. */
+  async putBlob(deviceId: string, value: Record<string, unknown>): Promise<string> {
+    const key = this.#opts.keys.deviceKey(deviceId);
+    if (!key) throw new Error("that phone isn't paired");
+    const id = randomBytes(18).toString("base64url");
+    const res = await this.#post("/agent/blob", { id, c: seal(key, value, `blob:${id}`) });
+    if (!res.ok) throw new Error(`the relay refused the file (HTTP ${res.status})`);
+    return id;
+  }
+
+  /**
+   * Sends a file to one phone in sealed pieces through the relay (which holds only a few at a time, so a
+   * phone that stops reading stalls this; it gives up after two minutes without progress).
+   */
+  async sendFile(deviceId: string, transferId: string, path: string, size: number): Promise<void> {
+    const key = this.#opts.keys.deviceKey(deviceId);
+    if (!key) throw new Error("that phone isn't paired");
+    const state = { cancelled: false };
+    this.#transfers.set(transferId, state);
     try {
-      cmd = unseal(this.#keys.key, sealed) as typeof cmd;
-    } catch {
-      this.#opts.log?.("ignored a command not sealed with this Mac's key");
-      return;
-    }
-    // A captured command must not work again later, or twice.
-    if (typeof cmd?.id !== "string" || this.#seen.has(cmd.id) || !(Math.abs(Date.now() - Number(cmd.at)) <= COMMAND_MAX_AGE_MS)) {
-      this.#opts.log?.("ignored a stale or repeated command");
-      return;
-    }
-    this.#seen.add(cmd.id);
-    if (this.#seen.size > 2000) this.#seen = new Set([...this.#seen].slice(-1000));
-    const h = this.#opts.handlers ?? {};
-    const id = cmd.id;
-    try {
-      switch (cmd.type) {
-        case "sync":
-          return this.#sendSnapshot();
-        case "ping":
-          return this.send({ t: "pong", id, at: Date.now() });
-        case "project.open": {
-          if (!h.project) break;
-          return this.send({ t: "project", id, project: h.project(projectIdOf(cmd)) });
+      let n = 0;
+      for await (const piece of createReadStream(path, { highWaterMark: PIECE_BYTES })) {
+        const c = sealBytes(key, piece as Buffer, `down:${transferId}:${n}`);
+        let since = Date.now();
+        for (;;) {
+          if (state.cancelled || !this.#running) throw new Error("cancelled");
+          const res = await this.#post("/agent/chunk", { id: transferId, n, c }).catch(() => null);
+          if (res?.ok) break;
+          if (res && res.status !== 507) throw new Error(`the relay refused a piece (HTTP ${res.status})`);
+          if (Date.now() - since > STUCK_MS) throw new Error("the phone stopped downloading");
+          await sleep(res ? 700 : 3000, this.#stopper.signal);
+          if (!res) since = Math.max(since, Date.now() - STUCK_MS / 2); // relay unreachable: give it a while
         }
-        case "poster": {
-          if (!h.poster) break;
-          const projectId = projectIdOf(cmd);
-          const poster = await h.poster(projectId);
-          if (!poster) return this.send({ t: "poster", id, projectId, key: null, blob: null });
-          const blob = await this.#putBlob({ type: poster.type, data: poster.data.toString("base64") });
-          return this.send({ t: "poster", id, projectId, key: poster.key, blob });
-        }
-        case "ai.options": {
-          if (!h.ai) break;
-          const projectId = projectIdOf(cmd);
-          return this.send({ t: "ai.options", id, projectId, ...(await h.ai.options(projectId)) });
-        }
-        case "ai.ask": {
-          if (!h.ai) break;
-          const projectId = projectIdOf(cmd);
-          // Not awaited: a model can take minutes, and other commands (cancel, ping) must still get through.
-          const run = h.ai.ask(projectId, { instruction: cmd.instruction, provider: cmd.provider, model: cmd.model });
-          this.send({ t: "ai", id, projectId, state: "planning" });
-          run.then(
-            (p) => this.send({ t: "ai", id, projectId, state: "done", proposalId: p.id }),
-            (e) => this.send({ t: "ai", id, projectId, state: "failed", code: codeOf(e), message: errText(e) }),
-          );
-          return;
-        }
-        case "ai.cancel": {
-          if (!h.ai) break;
-          const projectId = projectIdOf(cmd);
-          return this.send({ t: "ai", id, projectId, state: h.ai.cancel(projectId) ? "cancelling" : "idle" });
-        }
-        case "proposal.apply": {
-          if (!h.ai) break;
-          const r = h.ai.apply(uuidOf(cmd.proposalId, "proposal"));
-          return this.send({ t: "proposal", id, action: "applied", ...r });
-        }
-        case "proposal.reject": {
-          if (!h.ai) break;
-          const r = h.ai.reject(uuidOf(cmd.proposalId, "proposal"));
-          return this.send({ t: "proposal", id, action: "rejected", ...r });
-        }
-        case "undo":
-        case "redo": {
-          if (!h.ai) break;
-          const projectId = projectIdOf(cmd);
-          const r = h.ai[cmd.type](projectId, cmd.baseRevision);
-          return this.send({ t: "history", id, action: cmd.type, projectId, ...r });
-        }
-        case "push.subscribe": {
-          if (!h.push) break;
-          const prefs = h.push.subscribe({ endpoint: cmd.endpoint, keys: cmd.keys, prefs: cmd.prefs });
-          return this.send({ t: "push", id, subscribed: true, prefs });
-        }
-        case "push.unsubscribe": {
-          if (!h.push) break;
-          h.push.unsubscribe(cmd.endpoint);
-          return this.send({ t: "push", id, subscribed: false });
-        }
-        case "push.test": {
-          if (!h.push) break;
-          await h.push.test(cmd.endpoint);
-          return this.send({ t: "push", id, tested: true });
-        }
+        n += 1;
       }
-      return this.send({ t: "error", id, message: `Unknown command: ${String(cmd.type).slice(0, 40)}` });
-    } catch (e) {
-      this.send({ t: "error", id, type: String(cmd.type).slice(0, 40), code: codeOf(e), message: errText(e) });
+      if (n !== Math.max(1, Math.ceil(size / PIECE_BYTES)) && size > 0) throw new Error("the file changed while it was being sent");
+    } finally {
+      this.#transfers.delete(transferId);
     }
   }
 
-  /** Starts the connection loop; resolves once the loop is running (not once connected). */
+  cancelTransfer(transferId: string): boolean {
+    const t = this.#transfers.get(transferId);
+    if (t) t.cancelled = true;
+    return !!t;
+  }
+
+  /** Receives a file a phone is uploading, piece by piece, into `out`. */
+  async receiveFile(deviceId: string, uploadId: string, pieces: number, out: WriteStream, signal?: AbortSignal): Promise<number> {
+    const key = this.#opts.keys.deviceKey(deviceId);
+    if (!key) throw new Error("that phone isn't paired");
+    let bytes = 0;
+    for (let n = 0; n < pieces; n++) {
+      let waited = 0;
+      for (;;) {
+        if (signal?.aborted || !this.#running) throw new Error("cancelled");
+        const res = await fetch(`${this.#url}/agent/chunk?id=${encodeURIComponent(uploadId)}&n=${n}`, { headers: this.#headers(), signal: AbortSignal.timeout(40_000) }).catch(() => null);
+        if (res?.status === 200) {
+          const piece = unsealBytes(key, ((await res.json()) as { c: string }).c, `up:${uploadId}:${n}`);
+          bytes += piece.length;
+          if (!out.write(piece)) await new Promise((r) => out.once("drain", r));
+          break;
+        }
+        waited += res?.status === 204 ? 25_000 : 3000;
+        if (waited > STUCK_MS) throw new Error("the phone stopped uploading");
+        if (!res || res.status !== 204) await sleep(3000, this.#stopper.signal);
+      }
+    }
+    await new Promise<void>((resolve, reject) => out.end((e?: Error | null) => (e ? reject(e) : resolve())));
+    return bytes;
+  }
+
+  // ── commands and the queue ───────────────────────────────────────────────
+
+  async #command(raw: unknown): Promise<void> {
+    const { c, deviceId } = (raw ?? {}) as { c?: unknown; deviceId?: unknown };
+    if (typeof c !== "string" || typeof deviceId !== "string") return;
+    const key = this.#opts.keys.deviceKey(deviceId);
+    if (!key) return this.#opts.log?.("ignored a command from a phone that isn't paired");
+    let cmd: Partial<RemoteCommand>;
+    try {
+      cmd = unseal(key, c, `cmd:${deviceId}`) as Partial<RemoteCommand>;
+    } catch {
+      return this.#opts.log?.("ignored a command not sealed with that phone's key");
+    }
+    // A captured command must not work again later, or twice, even after this Mac restarts.
+    const at = Number(cmd?.at);
+    if (typeof cmd?.id !== "string" || typeof cmd.type !== "string" || this.#opts.handled.has(cmd.id) || !(Math.abs(Date.now() - at) <= COMMAND_MAX_AGE_MS)) {
+      return this.#opts.log?.("ignored a stale or repeated command");
+    }
+    this.#opts.handled.add(cmd.id, at + COMMAND_MAX_AGE_MS * 2);
+    await this.#opts.onCommand(deviceId, cmd as RemoteCommand);
+  }
+
+  /** Takes one waiting instruction: claim it on the relay (so only one Mac process ever runs it), open, run. */
+  async #take(item: { id?: unknown; deviceId?: unknown; projectId?: unknown; createdAt?: unknown; expiresAt?: unknown; c?: unknown }): Promise<void> {
+    const id = typeof item.id === "string" ? item.id : "";
+    if (!id || this.#taking.has(id)) return;
+    this.#taking.add(id);
+    try {
+      if (this.#opts.handled.has(id)) {
+        await this.#post("/agent/queue/done", { id }).catch(() => {});
+        return;
+      }
+      const res = await this.#post("/agent/queue/claim", { id });
+      if (!res.ok) return; // someone else took it, or the phone cancelled it just now
+      const deviceId = String(item.deviceId);
+      const key = this.#opts.keys.deviceKey(deviceId);
+      const expiresAt = Number(item.expiresAt);
+      let body: Record<string, unknown> | null = null;
+      try {
+        if (key && typeof item.c === "string") body = unseal(key, item.c, `queue:${id}`) as Record<string, unknown>;
+      } catch {
+        body = null;
+      }
+      // Recorded before it runs: at most once, even if this process dies halfway.
+      this.#opts.handled.add(id, Math.max(expiresAt, Date.now()) + 24 * 3600 * 1000);
+      if (!body || body.id !== id || body.projectId !== item.projectId) {
+        this.#opts.log?.("dropped a queued instruction that didn't open with its phone's key");
+      } else {
+        await this.#opts.onQueued({ id, deviceId, projectId: String(item.projectId), createdAt: Number(item.createdAt), expiresAt, body });
+      }
+      await this.#post("/agent/queue/done", { id }).catch(() => {});
+    } catch (e) {
+      this.#opts.log?.(`queue: ${errText(e)}`);
+    } finally {
+      this.#taking.delete(id);
+    }
+  }
+
+  async #takeWaiting(): Promise<void> {
+    const res = await fetch(`${this.#url}/agent/queue`, { headers: this.#headers(), signal: AbortSignal.timeout(20_000) });
+    if (!res.ok) return;
+    const { items } = (await res.json()) as { items: { createdAt: number }[] };
+    for (const item of items.sort((a, b) => a.createdAt - b.createdAt)) await this.#take(item);
+  }
+
+  // ── connection ───────────────────────────────────────────────────────────
+
   start(): void {
     if (this.#running) return;
     this.#running = true;
@@ -424,13 +396,16 @@ export class RemoteDaemon {
       this.#stream = new AbortController();
       try {
         const res = await fetch(`${this.#url}/agent/stream`, { headers: this.#headers(), signal: this.#stream.signal });
-        if (res.status === 401) throw new FatalError("The relay refused this Mac. Set REELFORGE_REMOTE_AUTH on the relay to the value shown in Settings → Phone remote.");
-        if (res.status === 429) throw new FatalError("The relay locked this address out after wrong attempts. Wait 15 minutes, then start again.");
+        if (res.status === 401) throw new FatalError("The relay refused this Mac. Set REELFORGE_REMOTE_AUTH on the relay to the value shown in Settings → Remote Access.");
+        // 429/5xx: the relay is busy or restarting. Keep trying (with backoff): it won't fix itself faster if we stop.
         if (!res.ok || !res.body) throw new Error(`relay answered HTTP ${res.status}`);
         wait = 1000;
-        this.#setStatus({ online: true, error: null, fatal: false });
+        this.#setStatus({ online: true, error: null, fatal: false, lastConnected: Date.now() });
         this.#opts.log?.("connected to the relay");
-        this.#sendSnapshot();
+        await this.publishDevices().catch((e) => this.#opts.log?.(errText(e)));
+        this.sendSnapshot();
+        this.#opts.onConnected?.();
+        void this.#takeWaiting().catch((e) => this.#opts.log?.(`queue: ${errText(e)}`));
         let buffer = "";
         const decoder = new TextDecoder();
         for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
@@ -439,13 +414,21 @@ export class RemoteDaemon {
           while ((end = buffer.indexOf("\n\n")) >= 0) {
             const block = buffer.slice(0, end);
             buffer = buffer.slice(end + 2);
+            const event = /^event: (.+)$/m.exec(block)?.[1];
             const data = /^data: (.*)$/m.exec(block)?.[1];
-            if (/^event: command$/m.test(block) && data) {
-              try {
-                await this.#command((JSON.parse(data) as { c?: unknown }).c);
-              } catch {
-                // not JSON: ignore
-              }
+            if (!event || !data) continue;
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            // Not awaited: a model can take minutes, and other commands (cancel, ping) must still get through.
+            if (event === "command") void this.#command(parsed).catch((e) => this.#opts.log?.(`command: ${errText(e)}`));
+            else if (event === "queue") void this.#take(parsed as Record<string, unknown>);
+            else if (event === "pair") {
+              const p = parsed as { lookup?: unknown; hello?: unknown };
+              if (typeof p.lookup === "string") void this.#opts.onPair(p.lookup, p.hello).catch((e) => this.#opts.log?.(`pairing: ${errText(e)}`));
             }
           }
         }
@@ -471,6 +454,7 @@ export class RemoteDaemon {
     clearInterval(this.#watch);
     this.#stopper.abort();
     this.#stream?.abort();
+    for (const t of this.#transfers.values()) t.cancelled = true;
     await this.#loop;
     this.#loop = undefined;
     this.#setStatus({ online: false });
@@ -479,36 +463,20 @@ export class RemoteDaemon {
 
 class FatalError extends Error {}
 
-function projectIdOf(cmd: Record<string, unknown>): string {
-  return uuidOf(cmd.projectId, "project");
-}
-
-/** Ids from the phone are UUIDs; anything else is refused before it reaches a store. */
-function uuidOf(value: unknown, what: string): string {
-  if (typeof value !== "string" || !UUID.test(value)) throw new Error(`That ${what} id isn't valid.`);
-  return value;
-}
-
-/** ReelForgeError's code (CONSENT_REQUIRED, REVISION_CONFLICT, …), so the phone can say what to do. */
-function codeOf(e: unknown): string | null {
-  const code = (e as { code?: unknown } | null)?.code;
-  return typeof code === "string" && /^[A-Z_]{2,40}$/.test(code) ? code : null;
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve) => {
-    if (signal.aborted) return resolve();
+    if (signal?.aborted) return resolve();
     const t = setTimeout(done, ms);
     function done() {
       clearTimeout(t);
-      signal.removeEventListener("abort", done);
+      signal?.removeEventListener("abort", done);
       resolve();
     }
-    signal.addEventListener("abort", done);
+    signal?.addEventListener("abort", done);
   });
 }
 
-function errText(e: unknown): string {
+export function errText(e: unknown): string {
   if (e instanceof Error) {
     const code = (e.cause as { code?: string } | undefined)?.code;
     return code ?? e.message;

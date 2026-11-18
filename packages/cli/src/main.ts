@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   AnalysisStore,
@@ -101,7 +101,8 @@ Usage:
                                                (remote MCP connector for Claude.ai / ChatGPT, with OAuth)
   reelforge connector status | revoke          (list connected apps | disconnect all of them)
 
-  reelforge serve [--port 0] [--allow-origin <origin>]... [--token-stdin]
+  reelforge serve [--port 0] [--allow-origin <origin>]... [--token-stdin | --background]
+                                               (--background: for launchd; writes <home>/engine.json, survives the editor)
 
 Times <t>: frames (90), seconds (2.5s), timecode (00:00:03:00) or MM:SS.FF (00:03.10).
 Edits accept --base-revision for strict conflict detection; without it the
@@ -147,6 +148,7 @@ const OPTIONS = {
   port: { type: "string" },
   "allow-origin": { type: "string", multiple: true },
   "token-stdin": { type: "boolean" },
+  background: { type: "boolean" },
   ops: { type: "string" },
   "ops-file": { type: "string" },
   track: { type: "string" },
@@ -677,74 +679,166 @@ async function connector(env: NodeJS.ProcessEnv, values: Values, io: Io): Promis
   return 0;
 }
 
+/** Where a background engine says how to reach it (0600; the desktop reads it to attach). */
+export const ENGINE_FILE = "engine.json";
+
+interface EngineFile {
+  pid: number;
+  url: string;
+  token: string;
+  version: string;
+  startedAt: string;
+  background: boolean;
+}
+
+/** A background engine already running for this home (its pid alive and its API answering), or null. */
+async function runningEngine(home: string): Promise<EngineFile | null> {
+  let f: EngineFile;
+  try {
+    f = JSON.parse(readFileSync(join(home, ENGINE_FILE), "utf8")) as EngineFile;
+  } catch {
+    return null;
+  }
+  try {
+    process.kill(f.pid, 0);
+  } catch {
+    return null;
+  }
+  try {
+    const res = await fetch(`${f.url}/v1/health`, { signal: AbortSignal.timeout(2000) });
+    return res.ok ? f : null;
+  } catch {
+    return null;
+  }
+}
+
 async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<number> {
+  // Two ways to run:
+  //  - foreground (the desktop's child, or a terminal): stops when stdin closes. With --token-stdin the
+  //    first stdin line carries the engine token, so it is never in the environment.
+  //  - --background (started by launchd for Remote Access): independent of any window or terminal. It
+  //    makes its own token and writes {url, token} to <home>/engine.json (0600) for the editor to attach;
+  //    it stops on SIGTERM or POST /v1/engine/stop (Stop Engine & Disconnect).
+  const background = values.background === true;
+  const home = resolveHome(env);
+  if (background) {
+    const other = await runningEngine(home);
+    if (other && other.pid !== process.pid) {
+      io.err(`[reelforge-server] an engine is already running for ${home} (pid ${other.pid})\n`);
+      return 0;
+    }
+  }
   // The desktop shell sends API keys from the OS keychain as JSON lines; they stay in memory only.
-  // With --token-stdin the first line carries the engine token, so it is never in the environment
-  // (where child processes inherit it and `ps -E` shows it).
   let gotToken: (token: string) => void = () => {};
   const tokenLine = new Promise<string | null>((resolve) => {
     gotToken = resolve;
-    process.stdin.once("end", () => resolve(null)); // parent gone before sending it
+    if (!background) process.stdin.once("end", () => resolve(null)); // parent gone before sending it
   });
-  let buf = "";
-  const onData = (chunk: Buffer) => {
-    buf += chunk.toString("utf8");
-    let nl: number;
-    while ((nl = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line) as { type?: string; provider?: string; apiKey?: string | null; token?: string };
-        if (msg.type === "credential" && typeof msg.provider === "string") setCredential(msg.provider, msg.apiKey ?? null);
-        else if (msg.type === "token" && typeof msg.token === "string" && msg.token.length >= 32) gotToken(msg.token);
-      } catch {
-        io.err("[reelforge-server] ignored a malformed control line on stdin\n");
+  if (!background) {
+    let buf = "";
+    const onData = (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line) as { type?: string; provider?: string; apiKey?: string | null; token?: string };
+          if (msg.type === "credential" && typeof msg.provider === "string") setCredential(msg.provider, msg.apiKey ?? null);
+          else if (msg.type === "token" && typeof msg.token === "string" && msg.token.length >= 32) gotToken(msg.token);
+        } catch {
+          io.err("[reelforge-server] ignored a malformed control line on stdin\n");
+        }
       }
-    }
-  };
-  process.stdin.on("data", onData);
-  process.stdin.resume();
+    };
+    process.stdin.on("data", onData);
+    process.stdin.resume();
+  }
 
   // Standalone runs get a fresh token; an env token (older shells, scripts) is read once and removed
   // so FFmpeg/whisper children don't inherit it.
-  const provided = values["token-stdin"] ? await tokenLine : env.REELFORGE_API_TOKEN;
+  const provided = !background && values["token-stdin"] ? await tokenLine : background ? undefined : env.REELFORGE_API_TOKEN;
   delete process.env.REELFORGE_API_TOKEN;
-  if (values["token-stdin"] && !provided) {
+  if (!background && values["token-stdin"] && !provided) {
     io.err("[reelforge-server] --token-stdin: stdin closed before a token line arrived\n");
     return 1;
   }
   const token = provided ?? randomBytes(32).toString("base64url");
+  const startedAt = new Date().toISOString();
+  // The editor window says it is open with a heartbeat; without one for a while, we no longer know.
+  let editor: { state: "open" | "closed"; at: number } | null = null;
+  const editorState = (): "open" | "closed" | "unknown" => {
+    if (!editor) return "unknown";
+    if (editor.state === "closed") return "closed";
+    return Date.now() - editor.at < 45_000 ? "open" : "unknown";
+  };
+  const engineInfo = () => ({ background, startedAt, version: VERSION });
   const db = openDatabase(resolveDbPath(env));
   const connectorManager = new ConnectorManager({
     db,
-    dir: join(resolveHome(env), "connector"),
+    dir: join(home, "connector"),
     cacheDir: resolveCacheDir(env),
     log: (line) => io.err(`[connector] ${line}\n`),
   });
   const remoteManager = new RemoteManager({
     db,
-    dir: join(resolveHome(env), "remote"),
+    dir: join(home, "remote"),
     version: VERSION,
     thumbnail: (asset) => ensureThumbnail(resolveCacheDir(env), asset),
     ai: {
       providers: async () => (await listAIProviders()).map((p) => ({ ...p, ready: providerReady(p), recipient: consentRecipient(p.id) })),
       propose: (projectId, input, signal) => propose(db, projectId, providerFor(input.provider), { instruction: input.instruction, model: input.model }, { signal }),
     },
+    media: {
+      importFile: async (projectId, path) => {
+        const r = await importMedia(db, projectId, [path], "api");
+        const asset = r.imported[0];
+        if (!asset) throw new Error(r.failed[0]?.error.message ?? "couldn't import that file");
+        return { assetId: asset.id, filename: asset.filename };
+      },
+    },
+    engine: engineInfo,
+    editor: editorState,
+    // Exports started from the phone: ~/Movies/ReelForge unless told otherwise (tests point it at a scratch dir).
+    ...(env.REELFORGE_EXPORT_DIR ? { exportDir: env.REELFORGE_EXPORT_DIR } : {}),
     log: (line) => io.err(`[remote] ${line}\n`),
   });
+  let stopRequested: () => void = () => {};
+  const stopped = new Promise<void>((resolve) => (stopRequested = resolve));
   const srv = await startApiServer({
     db,
     token,
     connector: connectorManager,
     remote: remoteManager,
+    engine: {
+      info: () => ({ ...engineInfo(), pid: process.pid, editor: editorState() }),
+      editor: (state) => {
+        editor = { state, at: Date.now() };
+      },
+      credential: (provider, apiKey) => setCredential(provider, apiKey),
+      stop: () => {
+        // Stop Engine & Disconnect: the remote stays off next time too, then this process exits.
+        void remoteManager.stop().finally(() => stopRequested());
+      },
+    },
     cacheDir: resolveCacheDir(env),
     port: int("port", values.port) ?? 0,
     allowedOrigins: values["allow-origin"] ?? [],
     ...(env.REELFORGE_DEBUG ? { log: (line: string) => io.err(`[reelforge-server] ${line}\n`) } : {}),
   });
-  // One machine-readable line; the sidecar parent waits for it.
-  io.out(JSON.stringify({ event: "ready", url: srv.url, ...(provided ? {} : { token }) }) + "\n");
+  remoteManager.attach({ render: srv.render });
+  const engineFile = join(home, ENGINE_FILE);
+  if (background) {
+    const f: EngineFile = { pid: process.pid, url: srv.url, token, version: VERSION, startedAt, background: true };
+    const tmp = `${engineFile}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(f), { mode: 0o600 });
+    renameSync(tmp, engineFile);
+    io.out(JSON.stringify({ event: "ready", url: srv.url, background: true }) + "\n");
+  } else {
+    // One machine-readable line; the sidecar parent waits for it.
+    io.out(JSON.stringify({ event: "ready", url: srv.url, ...(provided ? {} : { token }) }) + "\n");
+  }
   // Bring the Claude/ChatGPT connector back if the user left it on (never blocks the engine).
   void connectorManager.autoStart();
   // Same for the phone remote: reconnect to the relay if it was on.
@@ -754,11 +848,21 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     const stop = () => resolve();
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
-    // When the parent (desktop app) dies, stdin closes: exit instead of lingering.
-    process.stdin.once("end", stop);
+    void stopped.then(stop);
+    // When the parent (desktop app) dies, stdin closes: exit instead of lingering. Not in the background.
+    if (!background) process.stdin.once("end", stop);
   });
-  // stdin was only a liveness signal; release it or it keeps the event loop alive.
-  process.stdin.destroy();
+  if (background) {
+    // Only our own file: a newer engine may have replaced it.
+    try {
+      if ((JSON.parse(readFileSync(engineFile, "utf8")) as EngineFile).pid === process.pid) rmSync(engineFile, { force: true });
+    } catch {
+      // already gone
+    }
+  } else {
+    // stdin was only a liveness signal; release it or it keeps the event loop alive.
+    process.stdin.destroy();
+  }
   await connectorManager.close();
   await remoteManager.close();
   await srv.close();

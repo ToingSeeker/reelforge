@@ -124,6 +124,11 @@ export function createClient(info: ApiInfo) {
     startRemote: (body: { url?: string | null }) => request<{ remote: RemoteStatus }>("POST", "/v1/remote/start", body).then((r) => r.remote),
     stopRemote: () => request<{ remote: RemoteStatus }>("POST", "/v1/remote/stop").then((r) => r.remote),
     rotateRemote: () => request<{ remote: RemoteStatus }>("POST", "/v1/remote/rotate").then((r) => r.remote),
+    startPairing: () => request<{ remote: RemoteStatus }>("POST", "/v1/remote/pairing").then((r) => r.remote),
+    cancelPairing: () => request<{ remote: RemoteStatus }>("POST", "/v1/remote/pairing/cancel").then((r) => r.remote),
+    revokeDevice: (id: string) => request<{ remote: RemoteStatus }>("POST", `/v1/remote/devices/${encodeURIComponent(id)}/revoke`).then((r) => r.remote),
+    setRemoteReady: (enabled: boolean) => request<{ remote: RemoteStatus }>("POST", "/v1/remote/ready", { enabled }).then((r) => r.remote),
+    engine: () => request<{ engine: EngineInfo }>("GET", "/v1/engine").then((r) => r.engine),
     consent: (id: string) => request<{ consent: AIConsent | null }>("GET", `/v1/projects/${encodeURIComponent(id)}/ai-consent`).then((r) => r.consent),
     setConsent: (id: string, granted: boolean, provider?: string) =>
       request<{ consent: AIConsent | null }>("POST", `/v1/projects/${encodeURIComponent(id)}/ai-consent`, { granted, ...(provider ? { provider } : {}) }).then((r) => r.consent),
@@ -186,17 +191,52 @@ export interface AIProviderInfo {
   models: string[];
 }
 
-/** The phone remote the engine runs (GET /v1/remote). */
+/** The phone remote the engine runs (GET /v1/remote). Mirrors RemoteStatus in packages/remote/src/manager.ts. */
 export interface RemoteStatus {
   state: "stopped" | "connecting" | "online" | "error";
-  settings: { url: string | null; autoStart: boolean };
-  /** Value for REELFORGE_REMOTE_AUTH on the relay. */
+  settings: { url: string | null; autoStart: boolean; remoteReady: boolean };
+  /** Value for REELFORGE_REMOTE_AUTH on the relay (a hash; reveals nothing about this Mac's secret). */
   relayAuth: string;
-  /** Holds the pairing secret: show only to the owner, as a QR code or behind Copy. */
-  pairingLink: string | null;
+  macId: string;
+  macName: string;
   error: string | null;
+  lastConnected: string | null;
+  devices: RemoteDevice[];
+  /** A one-time pairing code (10 minutes, one phone), or null. */
+  pairing: RemotePairing | null;
+  remoteReady: { enabled: boolean; active: boolean; power: "ac" | "battery" | "unknown" };
+  engine: { background: boolean; startedAt: string; version: string };
+  editor: "open" | "closed" | "unknown";
   /** Phones that turned on notifications (sent from this Mac, not through the relay). */
   notifications: number;
+}
+
+export interface RemoteDevice {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastSeenAt: string | null;
+  confirmed: boolean;
+  notifications: boolean;
+}
+
+export interface RemotePairing {
+  code: string;
+  /** QR content: opens the phone app with the code filled in. Holds only the one-time code. */
+  link: string;
+  expiresAt: string;
+  state: "open" | "answered" | "paired" | "expired" | "cancelled" | "failed";
+  deviceName: string | null;
+  error: string | null;
+}
+
+/** The engine process (GET /v1/engine). */
+export interface EngineInfo {
+  background: boolean;
+  startedAt: string;
+  version: string;
+  pid: number;
+  editor: "open" | "closed" | "unknown";
 }
 
 /** The Claude.ai / ChatGPT connector the engine runs (GET /v1/connector). */

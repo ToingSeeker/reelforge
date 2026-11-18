@@ -75,3 +75,43 @@ export async function pickWorkflowFile(): Promise<string | null> {
   const picked = await open({ multiple: false, directory: false, title: "Run workflow", filters: [{ name: "ReelForge workflow", extensions: ["json"] }] });
   return typeof picked === "string" ? picked : null;
 }
+
+/** The background engine (Remote Access): a launchd agent the desktop shell installs and attaches to. */
+export interface BackgroundEngineStatus {
+  installed: boolean;
+  startAtLogin: boolean;
+  running: boolean;
+  attached: boolean;
+  pid: number | null;
+  logPath: string;
+}
+
+export const backgroundEngine = {
+  supported: () => isTauri(),
+  async status(): Promise<BackgroundEngineStatus | null> {
+    if (!isTauri()) return null;
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<BackgroundEngineStatus>("background_engine_status");
+  },
+  /** On: install the launchd agent and move the editor onto it. Off: remove it; the editor runs its own engine. */
+  async setEnabled(enabled: boolean, startAtLogin: boolean): Promise<void> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_remote_access", { enabled, startAtLogin });
+  },
+  async setStartAtLogin(enabled: boolean): Promise<void> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_start_at_login", { enabled });
+  },
+  async stop(): Promise<void> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("stop_engine_and_disconnect");
+  },
+  /** The shell asks for Settings → Remote Access (menu bar item), or swapped the engine (reload). */
+  async listen(onOpenSettings: () => void, onEngineChanged: () => void): Promise<() => void> {
+    if (!isTauri()) return () => {};
+    const { listen } = await import("@tauri-apps/api/event");
+    const a = await listen("open-remote-access", onOpenSettings);
+    const b = await listen("engine-changed", onEngineChanged);
+    return () => (a(), b());
+  },
+};

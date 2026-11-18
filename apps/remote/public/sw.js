@@ -11,7 +11,7 @@ self.addEventListener('push', (event) => {
   } catch {
     // not JSON: show the generic title
   }
-  const url = typeof data.url === 'string' && data.url.startsWith('/') ? data.url : '/';
+  const url = typeof data.url === 'string' && data.url.startsWith('/') ? data.url : '/#/projects';
   event.waitUntil(
     self.registration.showNotification(typeof data.title === 'string' ? data.title : 'ReelForge', {
       body: typeof data.body === 'string' ? data.body : '',
@@ -25,7 +25,7 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const url = event.notification.data?.url ?? '/';
+  const url = event.notification.data?.url ?? '/#/projects';
   event.waitUntil(
     (async () => {
       const open = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });

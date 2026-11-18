@@ -418,8 +418,24 @@ test("phone remote routes: unavailable without one, and pass through to it", asy
     start: async (input: unknown) => (calls.push(input), { state: "connecting" }),
     stop: async () => ({ state: "stopped" }),
     rotate: async () => ({ rotated: true }),
+    startPairing: async () => (calls.push("pair"), { pairing: { state: "open" } }),
+    cancelPairing: async () => (calls.push("unpair"), { pairing: { state: "cancelled" } }),
+    revokeDevice: async (id: string) => (calls.push(`revoke:${id}`), { devices: [] }),
+    setRemoteReady: async (enabled: boolean) => (calls.push(`ready:${enabled}`), { ready: enabled }),
   };
-  const withRemote = await startApiServer({ db, token: TOKEN, cacheDir: join(dir, "cache"), remote: fake });
+  const engineCalls: unknown[] = [];
+  const withRemote = await startApiServer({
+    db,
+    token: TOKEN,
+    cacheDir: join(dir, "cache"),
+    remote: fake,
+    engine: {
+      info: () => ({ background: true }),
+      editor: (state) => engineCalls.push(`editor:${state}`),
+      credential: (provider, key) => engineCalls.push(`key:${provider}:${key === null ? "null" : "set"}`),
+      stop: () => engineCalls.push("stop"),
+    },
+  });
   t.after(async () => {
     await withRemote.close();
     db.close();
@@ -429,7 +445,23 @@ test("phone remote routes: unavailable without one, and pass through to it", asy
   assert.equal((await call(withRemote, "POST", "/v1/remote/start", { body: { url: 42 } })).status, 400);
   assert.deepEqual(await (await call(withRemote, "POST", "/v1/remote/start", { body: { url: "https://relay.test" } })).json(), { remote: { state: "connecting" } });
   assert.equal((await call(withRemote, "POST", "/v1/remote/start", { body: {} })).status, 200);
-  assert.deepEqual(calls, [{ url: "https://relay.test" }, {}]);
   assert.deepEqual(await (await call(withRemote, "POST", "/v1/remote/rotate")).json(), { remote: { rotated: true } });
   assert.equal((await call(withRemote, "POST", "/v1/remote/stop", { auth: false })).status, 401);
+  await call(withRemote, "POST", "/v1/remote/pairing");
+  await call(withRemote, "POST", "/v1/remote/pairing/cancel");
+  await call(withRemote, "POST", "/v1/remote/devices/dev123/revoke");
+  assert.equal((await call(withRemote, "POST", "/v1/remote/ready", { body: { enabled: "yes" } })).status, 400);
+  await call(withRemote, "POST", "/v1/remote/ready", { body: { enabled: true } });
+  assert.deepEqual(calls, [{ url: "https://relay.test" }, {}, "pair", "unpair", "revoke:dev123", "ready:true"]);
+
+  // The engine: the editor's heartbeat, a Keychain key handed over, and Stop Engine & Disconnect.
+  assert.deepEqual(await (await call(withRemote, "GET", "/v1/engine")).json(), { engine: { background: true } });
+  assert.equal((await call(withRemote, "POST", "/v1/engine/editor", { body: { state: "maybe" } })).status, 400);
+  await call(withRemote, "POST", "/v1/engine/editor", { body: { state: "open" } });
+  await call(withRemote, "POST", "/v1/engine/credentials", { body: { provider: "anthropic", apiKey: "sk-test" } });
+  await call(withRemote, "POST", "/v1/engine/credentials", { body: { provider: "anthropic", apiKey: null } });
+  assert.equal((await call(withRemote, "POST", "/v1/engine/stop", { auth: false })).status, 401);
+  assert.equal((await call(withRemote, "POST", "/v1/engine/stop")).status, 202);
+  await new Promise((r) => setTimeout(r, 120));
+  assert.deepEqual(engineCalls, ["editor:open", "key:anthropic:set", "key:anthropic:null", "stop"]);
 });

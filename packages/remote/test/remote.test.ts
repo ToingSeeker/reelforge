@@ -1,12 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AssetStore, JobStore, openDatabase, ProjectStore, ProposalStore, TimelineStore } from "@reelforge/core";
-import { deriveKeys, normaliseUrl, RemoteManager, seal, unseal, type RemoteManagerOptions } from "@reelforge/remote";
+import { AssetStore, JobStore, openDatabase, ProjectStore, ProposalStore, TimelineStore, type RenderJob } from "@reelforge/core";
+import {
+  deriveDeviceKeys,
+  normalisePairingCode,
+  normaliseUrl,
+  pairPhone,
+  PIECE_BYTES,
+  RemoteManager,
+  seal,
+  sealBytes,
+  unseal,
+  unsealBytes,
+  type PairPayload,
+  type RemoteManagerOptions,
+} from "@reelforge/remote";
 import { browser, checkVapid } from "./webpush-browser.ts";
 
 // The relay that gets deployed, run in this process.
@@ -14,31 +27,52 @@ const { createRelay } = (await import(new URL("../../../apps/remote/server.mjs",
   createRelay(opts: { authHash: string }): Server;
 };
 
-async function listen(server: Server): Promise<string> {
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+async function listen(server: Server, port = 0): Promise<string> {
+  await new Promise<void>((r) => server.listen(port, "127.0.0.1", r));
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
-async function until<T>(what: string, fn: () => T | undefined | false, ms = 5000): Promise<T> {
+async function until<T>(what: string, fn: () => T | Promise<T>, ms = 6000): Promise<Exclude<NonNullable<T>, false>> {
   const end = Date.now() + ms;
   for (;;) {
-    const v = fn();
-    if (v) return v;
+    const v = await fn();
+    if (v) return v as Exclude<NonNullable<T>, false>;
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 25));
   }
 }
 
-/** A phone: reads the relay's stream (raw and decrypted) and sends sealed commands. */
-function phone(url: string, secret: string) {
-  const { token, key } = deriveKeys(secret);
+type Ev = { t: string; [k: string]: unknown };
+
+/** Pairs a phone with the code the Mac shows, the way the phone app does (hello, answer, then device.hello). */
+async function pair(url: string, code: string, name = "Test iPhone"): Promise<PairPayload> {
+  const c = normalisePairingCode(code)!;
+  const ph = pairPhone(c.slice(4), name);
+  const hello = await fetch(`${url}/pair/hello`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ lookup: c.slice(0, 4), msg: ph.hello }) });
+  assert.equal(hello.status, 200, await hello.clone().text());
+  for (;;) {
+    const res = await fetch(`${url}/pair/answer?lookup=${c.slice(0, 4)}`);
+    if (res.status === 204) continue;
+    assert.equal(res.status, 200);
+    return ph.open((await res.json()) as never);
+  }
+}
+
+/** A paired phone: reads the stream (raw and opened), sends sealed commands, queues instructions. */
+function phone(url: string, creds: PairPayload) {
+  const { token, key } = deriveDeviceKeys(creds.deviceSecret);
+  let broadcast = Buffer.from(creds.broadcastKey, "base64");
+  const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
   const abort = new AbortController();
   const raw: string[] = [];
-  const events: { t: string; [k: string]: unknown }[] = [];
+  const events: Ev[] = [];
+  const queue: Record<string, unknown>[] = [];
   const agent: boolean[] = [];
+  let status = 0;
   const done = (async () => {
-    const res = await fetch(`${url}/api/stream?since=0`, { headers: { authorization: `Bearer ${token}` }, signal: abort.signal });
-    assert.equal(res.status, 200);
+    const res = await fetch(`${url}/api/stream?since=0`, { headers: auth, signal: abort.signal }).catch(() => null);
+    status = res?.status ?? -1;
+    if (!res?.ok) return;
     let buffer = "";
     try {
       for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
@@ -50,29 +84,60 @@ function phone(url: string, secret: string) {
           raw.push(block);
           const name = /^event: (.+)$/m.exec(block)?.[1];
           const data = /^data: (.*)$/m.exec(block)?.[1];
-          if (name === "agent" && data) agent.push((JSON.parse(data) as { online: boolean }).online);
-          if (name === "entry" && data) events.push(unseal(key, (JSON.parse(data) as { c: string }).c) as (typeof events)[number]);
+          if (!data) continue;
+          const d = JSON.parse(data);
+          if (name === "agent") agent.push(d.online);
+          if (name === "queue") queue.push(d);
+          if (name === "entry") {
+            const ev = (d.to ? unseal(key, d.c, `evt:${creds.deviceId}`) : unseal(broadcast, d.c, "evt")) as Ev;
+            if (ev.t === "rekey") broadcast = Buffer.from(String(ev.broadcastKey), "base64");
+            events.push(ev);
+          }
         }
       }
     } catch {
       // aborted
     }
   })();
-  const post = (c: string) => fetch(`${url}/api/command`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ c }) });
+  const send = (type: string, extra: Record<string, unknown> = {}) => {
+    const id = crypto.randomUUID();
+    const c = seal(key, { id, at: Date.now(), type, ...extra }, `cmd:${creds.deviceId}`);
+    return fetch(`${url}/api/command`, { method: "POST", headers: auth, body: JSON.stringify({ c }) }).then((r) => ({ id, status: r.status, c }));
+  };
+  const enqueue = (id: string, projectId: string, body: Record<string, unknown>, ttl = 3600_000) => {
+    const createdAt = Date.now();
+    const c = seal(key, { id, projectId, type: "ai.ask", ...body }, `queue:${id}`);
+    return fetch(`${url}/api/queue`, { method: "POST", headers: auth, body: JSON.stringify({ id, projectId, createdAt, expiresAt: createdAt + ttl, c }) });
+  };
   return {
+    url,
+    /** One piece of a file the Mac is sending, opened. */
+    piece: async (transferId: string, n: number) => {
+      for (;;) {
+        const r = await fetch(`${url}/api/chunk?id=${transferId}&n=${n}`, { headers: auth });
+        if (r.status === 204) continue;
+        assert.equal(r.status, 200);
+        return unsealBytes(key, ((await r.json()) as { c: string }).c, `down:${transferId}:${n}`);
+      }
+    },
+    putPiece: (uploadId: string, n: number, bytes: Buffer) =>
+      fetch(`${url}/api/chunk`, { method: "POST", headers: auth, body: JSON.stringify({ id: uploadId, n, c: sealBytes(key, bytes, `up:${uploadId}:${n}`) }) }),
     raw,
     events,
+    queue,
     agent,
-    /** A file the Mac left on the relay, opened. */
+    status: () => status,
+    key,
+    auth,
+    send,
+    enqueue,
+    reply: <T = Ev>(id: string, t?: string) => events.find((e) => e.id === id && (!t || e.t === t)) as T | undefined,
     blob: async (id: string) => {
-      const res = await fetch(`${url}/api/blob?id=${encodeURIComponent(id)}`, { headers: { authorization: `Bearer ${token}` } });
+      const res = await fetch(`${url}/api/blob?id=${encodeURIComponent(id)}`, { headers: auth });
       assert.equal(res.status, 200);
       const { c } = (await res.json()) as { c: string };
-      return { sealed: c, value: unseal(key, c) as Record<string, unknown> };
+      return { sealed: c, value: unseal(key, c, `blob:${id}`) as Record<string, unknown> };
     },
-    sealCommand: (cmd: Record<string, unknown>) => seal(key, cmd),
-    post,
-    send: (type: string, extra: Record<string, unknown> = {}) => post(seal(key, { id: crypto.randomUUID(), at: Date.now(), type, ...extra })),
     close: async () => {
       abort.abort();
       await done;
@@ -85,15 +150,15 @@ function setup(t: { after: (fn: () => unknown) => void }, extra: Partial<RemoteM
   const db = openDatabase(join(home, "reelforge.db"));
   const servers: Server[] = [];
   const managers: RemoteManager[] = [];
-  const make = () => {
-    const m = new RemoteManager({ db, dir: join(home, "remote"), version: "test", deviceName: "Test Mac", watchMs: 100, ...extra });
+  const make = (more: Partial<RemoteManagerOptions> = {}) => {
+    const m = new RemoteManager({ db, dir: join(home, "remote"), version: "test", deviceName: "Test Mac", watchMs: 100, noPower: true, exportDir: join(home, "exports"), ...extra, ...more });
     managers.push(m);
     return m;
   };
-  const relay = async (authHash: string) => {
+  const relay = async (authHash: string, port = 0) => {
     const s = createRelay({ authHash });
     servers.push(s);
-    return listen(s);
+    return listen(s, port);
   };
   t.after(async () => {
     for (const m of managers) await m.close();
@@ -107,356 +172,258 @@ function setup(t: { after: (fn: () => unknown) => void }, extra: Partial<RemoteM
   return { home, db, make, relay, servers };
 }
 
-test("the phone sees the Mac's projects through the relay, which only ever holds ciphertext", async (t) => {
-  const { home, db, make, relay } = setup(t);
-  const projects = new ProjectStore(db);
-  projects.create({ name: "Café Opening", settings: { width: 1080, height: 1920 } }, "desktop");
+/** A Mac connected to a fresh relay with one phone paired. */
+async function paired(t: Parameters<typeof setup>[0], extra: Partial<RemoteManagerOptions> = {}) {
+  const env = setup(t, extra);
+  const m = env.make();
+  const url = await env.relay(m.status().relayAuth);
+  await m.start({ url });
+  await until("online", () => m.status().state === "online");
+  const { pairing } = await m.startPairing();
+  const creds = await pair(url, pairing!.code);
+  const p = phone(url, creds);
+  t.after(() => p.close());
+  const hello = await p.send("device.hello", { name: "Test iPhone" });
+  await until("paired", () => p.reply(hello.id, "device"));
+  return { ...env, m, url, creds, p };
+}
 
+function addClip(db: ReturnType<typeof openDatabase>, home: string, projectId: string) {
+  writeFileSync(join(home, "pour.mp4"), "fake");
+  const st = statSync(join(home, "pour.mp4"));
+  const asset = new AssetStore(db).add(projectId, { path: join(home, "pour.mp4"), sizeBytes: st.size, mtimeMs: st.mtimeMs }, {
+    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: false, hasAlpha: false,
+    videoCodec: "h264", audioCodec: null, sampleRate: null, channels: null, rotation: 0,
+  }, "desktop").asset;
+  const timeline = new TimelineStore(db);
+  const tl = timeline.get(projectId);
+  const v1 = tl.tracks.find((x) => x.kind === "video")!.id;
+  return { asset, clip: timeline.apply(projectId, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0, duration: 90 }] }, "desktop").clips[0]! };
+}
+
+test("pairing: a one-time code, credentials only inside ECDH, per-phone tokens the relay learns from the Mac", async (t) => {
+  const { home, db, make, relay } = setup(t);
+  new ProjectStore(db).create({ name: "Café Opening", settings: { width: 1080, height: 1920 } }, "desktop");
   const m = make();
   const before = m.status();
   assert.equal(before.state, "stopped");
-  assert.equal(before.pairingLink, null, "no link until the relay address is known");
-  assert.equal(make().status().relayAuth, before.relayAuth, "the secret persists across restarts");
+  assert.equal(before.devices.length, 0);
+  assert.equal(make().status().relayAuth, before.relayAuth, "the Mac's secret persists across restarts");
   assert.equal(statSync(join(home, "remote", "settings.json")).mode & 0o777, 0o600);
-  const secret = JSON.parse(readFileSync(join(home, "remote", "settings.json"), "utf8")).secret as string;
-  assert.equal(before.relayAuth, deriveKeys(secret).authHash);
+  await assert.rejects(m.startPairing(), /Connect to the relay first/);
 
   const url = await relay(before.relayAuth);
-  const on = await m.start({ url: `${url}/` });
-  assert.equal(on.settings.url, url);
-  assert.equal(on.pairingLink, `${url}/#k=${secret}`);
+  await m.start({ url: `${url}/` });
   await until("online", () => m.status().state === "online");
+  const st = await m.startPairing();
+  const code = st.pairing!.code;
+  assert.match(code, /^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+  assert.equal(st.pairing!.link, `${url}/#pair=${code}`, "the QR holds only the one-time code");
+  assert.equal(st.pairing!.state, "open");
 
-  const p = phone(url, secret);
+  // A wrong code (right slot, wrong secret part) burns the slot; the real code then no longer works.
+  const wrong = `${code.slice(0, 5)}${code.slice(5).split("").reverse().join("")}`;
+  if (normalisePairingCode(wrong) !== normalisePairingCode(code)) {
+    const lookup = normalisePairingCode(code)!.slice(0, 4);
+    const bad = pairPhone(normalisePairingCode(wrong)!.slice(4), "Mallory");
+    assert.equal((await fetch(`${url}/pair/hello`, { method: "POST", body: JSON.stringify({ lookup, msg: bad.hello }) })).status, 200);
+    await until("the failed pairing", () => m.status().pairing?.state === "failed");
+    assert.equal(m.status().devices.length, 0, "a wrong code makes no device");
+    assert.equal((await fetch(`${url}/pair/hello`, { method: "POST", body: JSON.stringify({ lookup, msg: bad.hello }) })).status, 404, "one hello per code");
+  }
+
+  const fresh = (await m.startPairing()).pairing!.code;
+  const creds = await pair(url, fresh);
+  assert.equal(creds.macName, "Test Mac");
+  assert.equal(m.status().pairing?.state, "answered");
+  assert.equal(m.status().devices[0]?.confirmed, false);
+  // The code is used up.
+  const lookup = normalisePairingCode(fresh)!.slice(0, 4);
+  assert.equal((await fetch(`${url}/pair/answer?lookup=${lookup}`)).status, 404);
+
+  const p = phone(url, creds);
   t.after(() => p.close());
+  const hello = await p.send("device.hello");
+  const answer = await until("paired", () => p.reply(hello.id, "device"));
+  assert.equal(answer.state, "paired");
+  assert.equal(m.status().pairing?.state, "paired");
+  const dev = m.status().devices[0]!;
+  assert.deepEqual([dev.name, dev.confirmed], ["Test iPhone", true]);
+
   const snap = await until("a snapshot", () => p.events.find((e) => e.t === "snapshot"));
-  assert.deepEqual(snap.device, { name: "Test Mac", version: "test", at: (snap.device as { at: number }).at });
-  const list = snap.projects as { name: string; width: number; height: number; fps: number; pendingProposals: number }[];
-  assert.deepEqual(
-    list.map((x) => [x.name, x.width, x.height, x.pendingProposals]),
-    [["Café Opening", 1080, 1920, 0]],
-  );
-  assert.deepEqual(snap.jobs, []);
-  assert.ok(p.agent.includes(true), "the phone is told the Mac is online");
-  assert.ok(!p.raw.join("\n").includes("Café"), "nothing readable passes through the relay");
+  assert.deepEqual((snap.projects as { name: string }[]).map((x) => x.name), ["Café Opening"]);
+  assert.deepEqual((snap.mac as { name: string }).name, "Test Mac");
+  assert.equal((snap.engine as { editor: string }).editor, "unknown");
+  assert.ok(p.raw.every((b) => !b.includes("Café")), "the relay never sees a project name");
 
-  // A round trip, and a replayed or stale command does nothing.
-  const ping = p.sealCommand({ id: "ping-1", at: Date.now(), type: "ping" });
-  assert.equal((await p.post(ping)).status, 200);
-  await until("a pong", () => p.events.some((e) => e.t === "pong"));
-  assert.equal((await p.post(ping)).status, 200);
-  await p.send("ping", { at: Date.now() - 10 * 60 * 1000 });
-  await p.post(seal(deriveKeys("someone-else-entirely-0123456789abcdef").key, { id: "x", at: Date.now(), type: "ping" }));
-  await p.send("sync");
-  await until("the sync answer", () => p.events.filter((e) => e.t === "snapshot").length >= 2);
-  assert.equal(p.events.filter((e) => e.t === "pong").length, 1, "replayed, stale and foreign commands are ignored");
-  await p.send("project.delete", { projectId: "anything" });
-  const refused = await until("the refusal", () => p.events.find((e) => e.t === "error"));
-  assert.match(String(refused.message), /Unknown command/);
+  // The Mac's own token is not a phone token, and a phone token can't act as the Mac.
+  assert.equal((await fetch(`${url}/agent/events`, { method: "POST", headers: p.auth, body: '{"events":[]}' })).status, 401);
 
-  // A change made on the Mac reaches the phone without it asking.
-  projects.create({ name: "Product Demo", settings: { width: 1920, height: 1080 } }, "desktop");
-  await until("the new project", () => p.events.some((e) => e.t === "snapshot" && (e.projects as unknown[]).length === 2));
-
-  // Stop: the phone is told, and the choice is remembered.
-  const off = await m.stop();
-  assert.equal(off.state, "stopped");
-  assert.equal(off.settings.autoStart, false);
-  await until("offline", () => p.agent.at(-1) === false);
-});
-
-test("a new pairing locks out the old one; addresses are checked; auto-start follows the last choice", async (t) => {
-  const { make, relay } = setup(t);
-  const m = make();
-  const first = m.status();
-  const url = await relay(first.relayAuth);
-
-  await assert.rejects(m.start(), /relay's address/);
-  await assert.rejects(m.start({ url: "http://relay.example.com" }), /https origin/);
-  await assert.rejects(m.start({ url: "https://relay.example.com/path" }), /https origin/);
-  assert.equal(normaliseUrl("https://forge-remote-production.up.railway.app/"), "https://forge-remote-production.up.railway.app");
-  assert.equal(normaliseUrl("http://localhost:8787"), "http://localhost:8787");
-
-  await m.start({ url });
-  await until("online", () => m.status().state === "online");
-  assert.equal(make().status().settings.autoStart, true);
-
-  // The relay still knows the old value, so it now refuses this Mac: a clear error, no retry loop.
-  const rotated = await m.rotate();
-  assert.notEqual(rotated.relayAuth, first.relayAuth);
-  const failed = await until("the refusal", () => (m.status().state === "error" ? m.status() : undefined));
-  assert.match(failed.error ?? "", /REELFORGE_REMOTE_AUTH/);
-
-  // After a restart of the engine it comes back by itself, against a relay that has the new value.
-  const url2 = await relay(rotated.relayAuth);
-  await m.start({ url: url2 });
+  // Commands from the phone are bound to it: a replay is ignored, also by a Mac that restarted.
+  const ping = await p.send("ping");
+  await until("pong", () => p.reply(ping.id, "pong"));
   await m.close();
   const again = make();
-  await again.autoStart();
-  await until("back online", () => again.status().state === "online");
+  await again.start();
+  await until("online again", () => again.status().state === "online");
+  await fetch(`${url}/api/command`, { method: "POST", headers: p.auth, body: JSON.stringify({ c: ping.c }) });
+  const second = await p.send("ping");
+  await until("the next pong", () => p.reply(second.id, "pong"));
+  assert.equal(p.events.filter((e) => e.id === ping.id).length, 1, "the replayed command was not run again");
+
+  // Revoking cuts the phone off at once, and the relay forgets its token.
+  await again.revokeDevice(dev.id);
+  await until("cut off", () => p.status() === 200 && p.raw.length > 0 && again.status().devices.length === 0);
+  await until("refused", async () => (await fetch(`${url}/api/queue`, { headers: p.auth })).status === 401);
+  assert.equal((await fetch(`${url}/api/queue`, { headers: p.auth })).status, 401);
 });
 
-test("stage 2: project detail, poster, live job progress and notifications straight from the Mac", async (t) => {
-  // A push service on this machine: records what it is sent, answers with `answer`.
-  const pushed: { path: string; headers: Record<string, string | string[] | undefined>; body: Buffer }[] = [];
-  let answer = 201;
-  const pushService = createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => {
-      pushed.push({ path: req.url ?? "", headers: req.headers, body: Buffer.concat(chunks) });
-      res.writeHead(answer).end();
-    });
-  });
-  const pushUrl = await listen(pushService);
-
-  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 0xff, 0xd9]);
-  const { home, db, make, relay, servers } = setup(t, {
-    notifyMs: 100,
-    allowLocalPush: true,
-    thumbnail: async (asset) => {
-      const path = join(home, `${asset.id}.jpg`);
-      writeFileSync(path, jpeg);
-      return { path, contentType: "image/jpeg" };
-    },
-  });
-  servers.push(pushService);
-
-  const project = new ProjectStore(db).create({ name: "Café Opening", settings: { width: 1080, height: 1920 } }, "desktop");
-  writeFileSync(join(home, "pour.mp4"), "fake");
-  const st = statSync(join(home, "pour.mp4"));
-  const asset = new AssetStore(db).add(project.id, { path: join(home, "pour.mp4"), sizeBytes: st.size, mtimeMs: st.mtimeMs }, {
-    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: false, hasAlpha: false,
-    videoCodec: "h264", audioCodec: null, sampleRate: null, channels: null, rotation: 0,
-  }, "desktop").asset;
-  const timeline = new TimelineStore(db);
-  const tl = timeline.get(project.id);
-  const v1 = tl.tracks.find((x) => x.kind === "video")!.id;
-  const clip = timeline.apply(project.id, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0, duration: 90 }] }, "desktop").clips[0]!;
-
-  const m = make();
-  const url = await relay(m.status().relayAuth);
-  await m.start({ url });
-  await until("online", () => m.status().state === "online");
-  const secret = JSON.parse(readFileSync(join(home, "remote", "settings.json"), "utf8")).secret as string;
-  const p = phone(url, secret);
-  t.after(() => p.close());
-  const snap = await until("a snapshot", () => p.events.find((e) => e.t === "snapshot"));
-  assert.equal(Buffer.from(String(snap.pushKey), "base64url").length, 65, "the phone gets this Mac's VAPID key");
-  assert.deepEqual(snap.recent, []);
-
-  // Detail: a read-only summary of the timeline.
-  await p.send("project.open", { projectId: project.id });
-  const opened = await until("the project", () => p.events.find((e) => e.t === "project"));
-  const detail = opened.project as { name: string; clips: number; durationFrames: number; assets: Record<string, number>; tracks: { kind: string; clips: { start: number; duration: number }[] }[] };
-  assert.equal(detail.name, "Café Opening");
-  assert.equal(detail.clips, 1);
-  assert.equal(detail.durationFrames, 90);
-  assert.deepEqual(detail.assets, { video: 1, audio: 0, image: 0, offline: 0 });
-  assert.deepEqual(detail.tracks.find((x) => x.kind === "video")?.clips, [{ start: 0, duration: 90 }]);
-  await p.send("project.open", { projectId: "../../etc/passwd" });
-  await until("the refusal", () => p.events.some((e) => e.t === "error" && /isn't valid/.test(String(e.message))));
-
-  // Poster: a sealed file on the relay, fetched once.
-  await p.send("poster", { projectId: project.id });
-  const poster = await until("the poster", () => p.events.find((e) => e.t === "poster"));
-  assert.equal(typeof poster.key, "string");
-  const file = await p.blob(String(poster.blob));
-  assert.deepEqual(file.value, { type: "image/jpeg", data: jpeg.toString("base64") });
-  assert.ok(!file.sealed.includes(jpeg.toString("base64")), "the relay holds the picture encrypted");
-
-  // A running export moves as small `jobs` events, not whole snapshots.
-  const jobs = new JobStore(db);
-  const job = jobs.create(project.id, "export", { width: 1080, height: 1920, useProxies: false, crf: 20, preset: "fast", audioBitrateK: 192 }, join(home, "out.mp4"));
-  await until("the queued job", () => p.events.some((e) => e.t === "jobs" && (e.jobs as { id: string }[]).some((j) => j.id === job.id)));
-  jobs.claim(job.id);
-  jobs.advance(job.id, "rendering", 0.5);
-  await until("progress", () => p.events.some((e) => e.t === "jobs" && (e.jobs as { progress: number }[])[0]?.progress === 0.5));
-
-  // Notifications: the phone subscribes; a test notification arrives encrypted and signed.
-  const b = browser();
-  const endpoint = `${pushUrl}/push/phone-1`;
-  await p.send("push.subscribe", { endpoint, keys: b.keys, prefs: { exports: true, proposals: true, failures: true } });
-  await until("subscribed", () => p.events.some((e) => e.t === "push" && e.subscribed === true));
-  assert.equal(m.status().notifications, 1);
-  await p.send("push.test", { endpoint });
-  const first = await until("the test push", () => pushed[0]);
-  assert.equal(first.path, "/push/phone-1");
-  assert.equal(first.headers["content-encoding"], "aes128gcm");
-  const claims = checkVapid(String(first.headers.authorization), String(snap.pushKey));
-  assert.equal(claims.aud, pushUrl);
-  assert.match(String((b.decrypt(first.body) as { body: string }).body), /working/);
-  await p.send("push.subscribe", { endpoint: "https://192.168.1.1/x", keys: b.keys });
-  await until("the refusal", () => p.events.some((e) => e.t === "error" && /push endpoints/.test(String(e.message))));
-
-  // The export finishes: Home lists it and the phone is told, with the project's name only inside the encryption.
-  jobs.complete(job.id, { path: join(home, "out.mp4"), sizeBytes: 38_200_000, frames: 90, width: 1080, height: 1920, videoCodec: "h264", audioCodec: null });
-  const done = await until("the export push", () => pushed.find((x) => (b.decrypt(x.body) as { title: string }).title === "Export ready"));
-  assert.deepEqual(b.decrypt(done.body), { title: "Export ready", body: "“Café Opening” · 38.2 MB", tag: `job-${job.id}`, url: `/#/p/${project.id}` });
-  assert.ok(!done.body.includes(Buffer.from("Café")));
-  await until("recent on Home", () => p.events.some((e) => e.t === "snapshot" && (e.recent as { id: string; sizeBytes: number }[]).some((j) => j.id === job.id && j.sizeBytes === 38_200_000)));
-
-  // A proposal from the AI Director.
-  new ProposalStore(db).create(project.id, { instruction: "punch in", selection: [], provider: "fake", model: "m", summary: "Zoom in on the pour", operations: [{ type: "clip.update", clipId: clip.id, props: { scale: 1.2 } }], explanations: ["closer"], warnings: [] });
-  const proposal = await until("the proposal push", () => pushed.find((x) => (b.decrypt(x.body) as { title: string }).title === "AI Director has a proposal"));
-  assert.match((b.decrypt(proposal.body) as { body: string }).body, /“Café Opening”: Zoom in on the pour/);
-
-  // The push service says the subscription is gone: it is forgotten.
-  answer = 410;
-  const second = jobs.create(project.id, "export", { width: 1080, height: 1920, useProxies: false, crf: 20, preset: "fast", audioBitrateK: 192 }, join(home, "out2.mp4"));
-  jobs.claim(second.id);
-  jobs.fail(second.id, "RENDER_FAILED", "ffmpeg exited");
-  await until("the failure push", () => pushed.some((x) => (b.decrypt(x.body) as { title: string }).title === "Export failed"));
-  await until("forgotten", () => m.status().notifications === 0);
-
-  // A new pairing drops every phone's notifications.
-  await p.send("push.subscribe", { endpoint, keys: b.keys });
-  await until("subscribed again", () => m.status().notifications === 1);
-  await m.rotate();
-  assert.equal(m.status().notifications, 0);
-});
-
-test("stage 3: ask the AI Director from the phone, apply or reject, undo and redo", async (t) => {
-  // A model that answers when the test says so, and stops when the request is cancelled.
-  const asked: { provider: string; model: string; instruction: string }[] = [];
+test("queue: instructions wait on the relay while the Mac is away, run once, can be edited or cancelled first", async (t) => {
+  const asked: string[] = [];
   let release: (() => void) | undefined;
-  const { home, db, make, relay } = setup(t, {
+  const { db, m, url, p, creds, make, home } = await paired(t, {
     ai: {
-      providers: async () => [
-        { id: "anthropic", label: "Claude API", external: true, models: ["claude-x"], defaultModel: "claude-x", ready: true, recipient: "anthropic" },
-        { id: "ollama", label: "Local (Ollama)", external: false, models: ["qwen-local"], defaultModel: "qwen-local", ready: true, recipient: "ollama" },
-        { id: "codex", label: "Codex", external: true, models: ["gpt-x"], defaultModel: "gpt-x", ready: false, recipient: "openai" },
-      ],
-      propose: async (projectId, input, signal) => {
-        asked.push(input);
-        await new Promise<void>((resolve, reject) => {
-          release = resolve;
-          signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
-        });
-        const clipId = new TimelineStore(db).get(projectId).clips[0]!.id;
-        return new ProposalStore(db).create(projectId, { instruction: input.instruction, selection: [], provider: input.provider, model: input.model, summary: "Zoom in on the pour", operations: [{ type: "clip.update", clipId, props: { scale: 1.2 } }], explanations: ["closer"], warnings: ["Only the first clip."] });
+      providers: async () => [{ id: "ollama", label: "Local", external: false, models: ["q"], defaultModel: "q", ready: true, recipient: "ollama" }],
+      propose: async (projectId, input) => {
+        asked.push(input.instruction);
+        await new Promise<void>((r) => (release = r));
+        const tl = new TimelineStore(db).get(projectId);
+        return new ProposalStore(db).create(projectId, { instruction: input.instruction, selection: [], provider: "ollama", model: "q", summary: `Did: ${input.instruction}`, operations: [{ type: "track.update", trackId: tl.tracks[0]!.id, muted: true }], explanations: ["x"], warnings: [] });
       },
     },
   });
+  const project = new ProjectStore(db).create({ name: "Weekend recap", settings: { width: 1080, height: 1920 } }, "desktop");
+  addClip(db, home, project.id);
+  const rev = new ProjectStore(db).get(project.id).revision;
 
-  const project = new ProjectStore(db).create({ name: "Café Opening", settings: { width: 1080, height: 1920 } }, "desktop");
-  writeFileSync(join(home, "pour.mp4"), "fake");
-  const st = statSync(join(home, "pour.mp4"));
-  const asset = new AssetStore(db).add(project.id, { path: join(home, "pour.mp4"), sizeBytes: st.size, mtimeMs: st.mtimeMs }, {
-    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: false, hasAlpha: false,
-    videoCodec: "h264", audioCodec: null, sampleRate: null, channels: null, rotation: 0,
-  }, "desktop").asset;
-  const timeline = new TimelineStore(db);
-  const tl = timeline.get(project.id);
-  const v1 = tl.tracks.find((x) => x.kind === "video")!.id;
-  timeline.apply(project.id, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0, duration: 90 }] }, "desktop");
+  // The Mac goes away (the engine quits). The phone queues two instructions and edits/cancels them.
+  await m.close();
+  await until("offline", () => p.agent.at(-1) === false);
+  const a = crypto.randomUUID();
+  const b = crypto.randomUUID();
+  const res = await p.enqueue(a, project.id, { instruction: "tighten the intro", provider: "ollama", model: "q", baseRevision: rev });
+  assert.equal(res.status, 201);
+  assert.equal((await p.enqueue(a, project.id, { instruction: "tighten the intro", provider: "ollama", model: "q", baseRevision: rev })).status, 200, "the same id again is the same instruction");
+  await p.enqueue(b, project.id, { instruction: "add music", provider: "ollama", model: "q", baseRevision: rev });
+  const list = (await (await fetch(`${url}/api/queue`, { headers: p.auth })).json()) as { items: { id: string; status: string }[] };
+  assert.deepEqual(list.items.map((i) => [i.id, i.status]).sort(), [[a, "queued"], [b, "queued"]].sort());
+  // Edit a: new sealed text under the same id.
+  const edited = seal(p.key, { id: a, projectId: project.id, type: "ai.ask", instruction: "tighten the intro to 3s", provider: "ollama", model: "q", baseRevision: rev }, `queue:${a}`);
+  assert.equal((await fetch(`${url}/api/queue/${a}`, { method: "PUT", headers: p.auth, body: JSON.stringify({ c: edited }) })).status, 200);
+  assert.equal((await fetch(`${url}/api/queue/${b}`, { method: "DELETE", headers: p.auth })).status, 200);
 
-  const m = make();
-  const url = await relay(m.status().relayAuth);
-  await m.start({ url });
-  await until("online", () => m.status().state === "online");
-  const secret = JSON.parse(readFileSync(join(home, "remote", "settings.json"), "utf8")).secret as string;
-  const p = phone(url, secret);
-  t.after(() => p.close());
-  await until("a snapshot", () => p.events.find((e) => e.t === "snapshot"));
-  const last = <T>(type: string, fn: (e: Record<string, unknown>) => boolean = () => true) => p.events.findLast((e) => e.t === type && fn(e)) as T | undefined;
-  const count = (type: string) => p.events.filter((e) => e.t === type).length;
-  const detail = async () => {
-    const n = count("project");
-    await p.send("project.open", { projectId: project.id });
-    await until("the project", () => count("project") > n);
-    return last<{ project: { revision: number; canUndo: boolean; canRedo: boolean; asking: unknown; proposals: { id: string; status: string; stale: boolean; list: { label: string }[]; warnings: string[] }[] } }>("project")!.project;
-  };
-
-  // The model picker: what this Mac offers, and which providers this project allows already.
-  await p.send("ai.options", { projectId: project.id });
-  const options = await until("the options", () => last<{ providers: { id: string; ready: boolean; consented: boolean }[]; last: unknown }>("ai.options"));
-  assert.deepEqual(options.providers.map((x) => [x.id, x.ready, x.consented]), [["anthropic", true, false], ["ollama", true, true], ["codex", false, false]]);
-  assert.equal(options.last, null);
-
-  // Only what this Mac offers can be asked for.
-  await p.send("ai.ask", { projectId: project.id, instruction: "punch in", provider: "ollama", model: "--dangerously-skip-permissions" });
-  await until("refused model", () => last("ai", (e) => e.state === "failed" && /isn't available/.test(String(e.message))));
-  await p.send("ai.ask", { projectId: project.id, instruction: "punch in", provider: "codex", model: "gpt-x" });
-  await until("not set up", () => last("ai", (e) => e.state === "failed" && /isn't set up/.test(String(e.message))));
-  await p.send("ai.ask", { projectId: project.id, instruction: "   ", provider: "ollama", model: "qwen-local" });
-  await until("empty prompt", () => p.events.some((e) => e.t === "error" && e.type === "ai.ask" && /Write what to change/.test(String(e.message))));
-  assert.equal(asked.length, 0);
-
-  // A request runs in the background: the phone sees it in progress, and other commands still get through.
-  await p.send("ai.ask", { projectId: project.id, instruction: "punch in on the pour", provider: "ollama", model: "qwen-local" });
-  await until("planning", () => last("ai", (e) => e.state === "planning"));
-  await until("the model is asked", () => asked.length === 1);
-  assert.deepEqual(asked[0], { instruction: "punch in on the pour", provider: "ollama", model: "qwen-local" });
-  assert.deepEqual((await detail()).asking && Object.keys((await detail()).asking as object).sort(), ["instruction", "model", "provider", "startedAt"]);
-  const pongs = count("pong");
-  await p.send("ping");
-  await until("a pong while planning", () => count("pong") > pongs);
-  await p.send("ai.ask", { projectId: project.id, instruction: "again", provider: "ollama", model: "qwen-local" });
-  await until("one at a time", () => p.events.some((e) => e.t === "error" && /still working/.test(String(e.message))));
-
+  // The Mac comes back: it takes what's waiting, once.
+  const back = make();
+  await back.start();
+  await until("running", () => asked.length === 1);
+  assert.deepEqual(asked, ["tighten the intro to 3s"], "the edit counts; the cancelled one never runs");
+  await until("accepted", () => p.events.some((e) => e.t === "queue" && e.id === a && e.state === "running"));
+  assert.equal((await fetch(`${url}/api/queue/${a}`, { method: "DELETE", headers: p.auth })).status, 409, "taken: no longer cancellable from the queue");
   release!();
-  const done = await until("done", () => last<{ proposalId: string }>("ai", (e) => e.state === "done"));
-  let d = await detail();
-  assert.equal(d.asking, null);
-  const shown = d.proposals.find((x) => x.id === done.proposalId)!;
-  assert.equal(shown.status, "pending");
-  assert.equal(shown.stale, false);
-  assert.deepEqual(shown.warnings, ["Only the first clip."]);
-  assert.equal(shown.list.length, 1);
-  await p.send("ai.options", { projectId: project.id });
-  await until("remembers the model", () => last<{ last: unknown }>("ai.options", (e) => e.last !== null)?.last);
-  assert.deepEqual(last<{ last: unknown }>("ai.options")!.last, { provider: "ollama", model: "qwen-local" });
+  const done = await until("done", () => p.events.find((e) => e.t === "queue" && e.id === a && e.state === "done"));
+  assert.ok(typeof done.proposalId === "string");
+  // Posting the same id again after it ran: still not a second run.
+  assert.equal((await p.enqueue(a, project.id, { instruction: "tighten the intro", provider: "ollama", model: "q", baseRevision: rev })).status, 200);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(asked.length, 1);
 
-  // Apply from the phone: the same approval as the desktop button, recorded as coming from the phone.
-  const before = d.revision;
-  await p.send("proposal.apply", { proposalId: done.proposalId });
-  const applied = await until("applied", () => last<{ projectId: string; revision: number }>("proposal", (e) => e.action === "applied"));
-  assert.equal(applied.projectId, project.id);
-  assert.equal(applied.revision, before + 1);
-  const stored = new ProposalStore(db).get(done.proposalId);
-  assert.equal(stored.status, "applied");
-  assert.equal(stored.approval?.channel, "phone-remote:apply");
-  await p.send("proposal.apply", { proposalId: done.proposalId });
-  await until("not twice", () => p.events.some((e) => e.t === "error" && /already applied/.test(String(e.message))));
-  await p.send("proposal.apply", { proposalId: "../x" });
-  await until("bad id", () => p.events.some((e) => e.t === "error" && /proposal id isn't valid/.test(String(e.message))));
+  // An instruction written against an older timeline is held for the user to look at again.
+  new ProposalStore(db).apply(String(done.proposalId), { by: "desktop", channel: "test" });
+  const c = crypto.randomUUID();
+  await p.enqueue(c, project.id, { instruction: "make it pop", provider: "ollama", model: "q", baseRevision: rev });
+  const held = await until("needs review", () => p.events.find((e) => e.t === "queue" && e.id === c));
+  assert.equal(held.state, "needs_review");
+  assert.equal(held.currentRevision, new ProjectStore(db).get(project.id).revision);
+  assert.equal(asked.length, 1);
 
-  // Undo and redo, against the revision the phone saw.
-  await p.send("undo", { projectId: project.id, baseRevision: before });
-  await until("stale undo", () => p.events.some((e) => e.t === "error" && e.type === "undo" && e.code === "REVISION_CONFLICT"));
-  await p.send("undo", { projectId: project.id, baseRevision: applied.revision });
-  const undone = await until("undone", () => last<{ revision: number }>("history", (e) => e.action === "undo"));
-  assert.notEqual(timeline.get(project.id).clips[0]!.props.scale, 1.2);
-  await p.send("redo", { projectId: project.id, baseRevision: undone.revision });
-  await until("redone", () => last("history", (e) => e.action === "redo"));
-  assert.equal(timeline.get(project.id).clips[0]!.props.scale, 1.2);
+  // Expired before the Mac saw it: dropped.
+  const e = crypto.randomUUID();
+  const createdAt = Date.now();
+  const sealed = seal(p.key, { id: e, projectId: project.id, type: "ai.ask", instruction: "late", provider: "ollama", model: "q" }, `queue:${e}`);
+  assert.equal((await fetch(`${url}/api/queue`, { method: "POST", headers: p.auth, body: JSON.stringify({ id: e, projectId: project.id, createdAt, expiresAt: createdAt - 1, c: sealed }) })).status, 400);
+  assert.ok(creds.deviceId);
+});
 
-  // Cancel stops the model.
-  await p.send("ai.ask", { projectId: project.id, instruction: "slower", provider: "ollama", model: "qwen-local" });
-  await until("asked again", () => asked.length === 2);
-  await p.send("ai.cancel", { projectId: project.id });
-  await until("cancelled", () => last("ai", (e) => e.state === "failed" && e.message === "Cancelled."));
-  assert.equal((await detail()).asking, null);
+test("exports: approve a version at a named revision, render, download in sealed pieces; uploads import", async (t) => {
+  const jobs: RenderJob[] = [];
+  const imported: string[] = [];
+  const { db, home, p, m } = await paired(t, {
+    render: {
+      exportJob: (projectId, outputPath, opts) => {
+        const job = new JobStore(db).create(projectId, "export", (plan) => ({ width: Math.round(plan.width * opts.scale), height: Math.round(plan.height * opts.scale), useProxies: false, crf: opts.quality === "small" ? 24 : 18, preset: "medium", audioBitrateK: 192 }), outputPath);
+        jobs.push(job);
+        return job;
+      },
+      previewJob: (projectId) => new JobStore(db).create(projectId, "preview", { width: 540, height: 960, useProxies: true, crf: 28, preset: "veryfast", audioBitrateK: 96 }, null),
+      cancel: (jobId) => new JobStore(db).cancel(jobId),
+      retry: (jobId) => new JobStore(db).retry(jobId),
+    },
+    media: {
+      importFile: async (_projectId, path) => {
+        imported.push(readFileSync(path, "utf8"));
+        return { assetId: "a1", filename: "clip.mov" };
+      },
+    },
+  });
+  const project = new ProjectStore(db).create({ name: "Spider trade", settings: { width: 1080, height: 1920 } }, "desktop");
+  const { clip } = addClip(db, home, project.id);
+  const proposal = new ProposalStore(db).create(project.id, { instruction: "punch in", selection: [], provider: "fake", model: "m", summary: "Zoom in", operations: [{ type: "clip.update", clipId: clip.id, props: { scale: 1.2 } }], explanations: ["closer"], warnings: [] });
 
-  // Reject, and a proposal the timeline has moved past is marked stale and can't be applied.
-  await p.send("ai.ask", { projectId: project.id, instruction: "a third idea", provider: "ollama", model: "qwen-local" });
-  await until("asked a third time", () => asked.length === 3);
-  release!();
-  const third = await until("third", () => last<{ proposalId: string }>("ai", (e) => e.state === "done" && e.proposalId !== done.proposalId));
-  await p.send("proposal.reject", { proposalId: third.proposalId });
-  await until("rejected", () => last("proposal", (e) => e.action === "rejected"));
-  assert.equal(new ProposalStore(db).get(third.proposalId).status, "rejected");
+  const opts = await p.send("export.options", { projectId: project.id });
+  const o = await until("options", () => p.reply<Ev & { resolutions: { id: string; width: number; height: number }[]; fps: number; format: string }>(opts.id, "export.options"));
+  assert.deepEqual(o.resolutions.map((r) => [r.id, r.width, r.height]), [["full", 1080, 1920], ["half", 540, 960]]);
+  assert.equal(o.fps, 30);
+  assert.equal(o.format, "MP4");
 
-  await p.send("ai.ask", { projectId: project.id, instruction: "a fourth idea", provider: "ollama", model: "qwen-local" });
-  await until("asked a fourth time", () => asked.length === 4);
-  release!();
-  const fourth = await until("fourth", () => last<{ proposalId: string }>("ai", (e) => e.state === "done" && e.proposalId !== third.proposalId && e.proposalId !== done.proposalId));
-  const now = timeline.get(project.id);
-  timeline.apply(project.id, { baseRevision: now.project.revision, operations: [{ type: "clip.update", clipId: now.clips[0]!.id, props: { opacity: 0.5 } }] }, "desktop");
-  d = await detail();
-  assert.equal(d.proposals.find((x) => x.id === fourth.proposalId)?.stale, true);
-  await p.send("proposal.apply", { proposalId: fourth.proposalId });
-  await until("stale apply", () => p.events.some((e) => e.t === "error" && e.type === "proposal.apply" && e.code === "REVISION_CONFLICT"));
-  assert.ok(!p.raw.join("\n").includes("pour"), "prompts and summaries cross the relay encrypted");
+  // Approval names the revision it approves: a stale one is refused, nothing is applied.
+  const stale = await p.send("export.start", { projectId: project.id, proposalId: proposal.id, revision: proposal.baseRevision - 1 });
+  const refused = await until("refused", () => p.reply(stale.id, "error"));
+  assert.equal(refused.code, "REVISION_CONFLICT");
+  assert.equal(new ProposalStore(db).get(proposal.id).status, "pending");
+
+  const go = await p.send("export.start", { projectId: project.id, proposalId: proposal.id, revision: proposal.baseRevision, resolution: "half", quality: "standard" });
+  const started = await until("export queued", () => p.reply(go.id, "export"));
+  assert.equal(new ProposalStore(db).get(proposal.id).status, "applied");
+  assert.equal((started.applied as { revision: number }).revision, started.revision);
+  const job = jobs[0]!;
+  assert.equal(job.settings.width, 540);
+  assert.match(job.outputPath!, /Spider trade r\d+ half\.mp4$/);
+
+  // Finished: the phone sees it on the Mac, with version and file details, and downloads it.
+  const bytes = Buffer.alloc(PIECE_BYTES + 1234, 7);
+  writeFileSync(job.outputPath!, bytes);
+  const store = new JobStore(db);
+  store.claim(job.id);
+  store.complete(job.id, { path: job.outputPath!, sizeBytes: bytes.length, frames: 90, width: 540, height: 960, videoCodec: "h264", audioCodec: null });
+  const listed = await until("listed", () => p.events.find((e) => e.t === "snapshot" && (e.exports as { id: string; onMac: boolean }[]).some((x) => x.id === job.id && x.onMac)));
+  const ex = (listed.exports as { id: string; version: number; fileName: string; sizeBytes: number; folder: string }[]).find((x) => x.id === job.id)!;
+  assert.equal(ex.version, 1);
+  assert.equal(ex.sizeBytes, bytes.length);
+  assert.match(ex.fileName, /\.mp4$/);
+
+  const transferId = "t_".padEnd(24, "x");
+  const get = await p.send("file.get", { jobId: job.id, transferId });
+  const meta = await until("file meta", () => p.reply<Ev & { pieces: number; size: number }>(get.id, "file"));
+  assert.equal(meta.pieces, 2);
+  const parts: Buffer[] = [];
+  for (let n = 0; n < meta.pieces; n++) parts.push(await p.piece(transferId, n));
+  assert.deepEqual(Buffer.concat(parts), bytes, "the file arrives whole, opened with this phone's key");
+  await until("sent", () => p.events.some((e) => e.id === get.id && e.t === "file" && e.state === "sent"));
+
+  // A file attached on the phone goes up in sealed pieces and is imported into the project.
+  const uploadId = "u_".padEnd(24, "y");
+  const content = Buffer.from("a phone clip");
+  const up = await p.send("upload.start", { projectId: project.id, uploadId, name: "../../clip.mov", size: content.length });
+  await p.putPiece(uploadId, 0, content);
+  const got = await until("imported", () => p.events.find((e) => e.id === up.id && e.t === "upload" && (e.state === "imported" || e.state === "failed")));
+  assert.equal(got.state, "imported", String(got.message));
+  assert.deepEqual(imported, ["a phone clip"]);
+
+  // Cancel and retry go to the engine's runner.
+  const second = await p.send("export.start", { projectId: project.id, revision: new ProjectStore(db).get(project.id).revision });
+  await until("second export", () => p.reply(second.id, "export"));
+  const cancel = await p.send("job.cancel", { jobId: jobs[1]!.id });
+  assert.equal((await until("cancelled", () => p.reply(cancel.id, "job"))).state, "cancelled");
+  void m;
+  assert.ok(existsSync(job.outputPath!));
 });

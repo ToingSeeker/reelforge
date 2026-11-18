@@ -1,257 +1,1166 @@
-// ReelForge Remote, the phone app. Talks only to the relay that served it; everything it sends and
-// receives is sealed with a key derived from the pairing secret, which arrives in the link's
-// fragment (#k=…) and so never reaches the relay. Views are built with textContent, never innerHTML,
-// so nothing from a project name can become markup.
-import { deriveKeys, fromBase64, seal, unseal } from './crypto.js';
-import { secretFromText } from './pairing.js';
+// ReelForge Remote, the phone app: direct the agent editing on your Mac from anywhere.
+// Talks only to the relay that served it (core.js); everything it sends and receives is sealed with keys
+// the relay never has. Screens: Projects, Session, Exports (dock), Review, and pairing.
+import * as core from './core.js';
+import { codeFromText, formatCode } from './pairing.js';
+import { ago, aspect, button, clock, closeSheet, duration, h, icon, iconButton, logo, pill, plural, progress, sheet, sheetIsOpen, size } from './ui.js';
 
-const SECRET_KEY = 'reelforge.remote.secret';
-const PREFS_KEY = 'reelforge.remote.notify';
-const MODEL_KEY = 'reelforge.remote.model';
+const { saved, live } = core;
 const app = document.getElementById('app');
 const toastEl = document.getElementById('toast');
 
-const state = {
-  token: null,
-  key: null,
-  since: 0,
-  connected: false, // our stream to the relay is open
-  online: false, // the Mac's stream to the relay is open
-  snapshot: null,
-  rtt: null,
-  problem: null, // 'unpaired' | 'locked' | null
-  details: new Map(), // projectId → detail from the Mac
-  posters: new Map(), // projectId → { key, url, revision }
-  push: { ready: false, subscribed: false, busy: false },
-  ai: new Map(), // projectId → { options, draft, error, asked }
-  mine: new Set(), // ids of commands this page sent: only their answers raise toasts (the relay replays its log on reload)
-  busy: new Map(), // command id → what is waiting for an answer, e.g. { kind: 'apply', target: proposalId }
-};
-
-// ── pairing ────────────────────────────────────────────────────────────────
-function takeSecretFromLink() {
-  const m = /(?:^#|&)k=([A-Za-z0-9_-]{32,})/.exec(location.hash);
-  if (m) {
-    localStorage.setItem(SECRET_KEY, m[1]);
-    history.replaceState(null, '', location.pathname); // out of the address bar and history
-  }
-  return localStorage.getItem(SECRET_KEY);
-}
-
-/** Pair from a pasted link or key (see pairing.js for why pasting, not only the QR). */
-function pairWith(text) {
-  const secret = secretFromText(text);
-  if (!secret) return toast('That isn’t a pairing link. On your Mac, use Copy link and paste it here.');
-  // A link for another relay would store a key this relay can't use (and that this app would then
-  // send there as a token): refuse it and say where it points.
-  let link = null;
-  try {
-    if (/^https?:\/\//i.test(String(text).trim())) link = new URL(String(text).trim());
-  } catch {}
-  if (link && link.origin !== location.origin) return toast(`That link is for another relay (${link.host}). Open it there instead.`);
-  localStorage.setItem(SECRET_KEY, secret);
-  location.replace('/'); // start over with the new key
-}
-
-async function unpair() {
-  await pushOff({ quiet: true }).catch(() => {});
-  localStorage.removeItem(SECRET_KEY);
-  location.replace('/');
-}
-
-// ── small DOM helpers ──────────────────────────────────────────────────────
-function h(tag, props = {}, ...children) {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (v === undefined || v === null || v === false) continue;
-    if (k === 'class') el.className = v;
-    else if (k === 'text') el.textContent = v;
-    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
-    else el.setAttribute(k, v === true ? '' : String(v));
-  }
-  for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) el.append(c instanceof Node ? c : document.createTextNode(String(c)));
-  return el;
-}
-
-/** Tab icons, drawn as SVG paths (no inline styles: the relay's CSP forbids them). */
-function icon(d) {
-  const NS = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(NS, 'svg');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS(NS, 'path');
-  path.setAttribute('d', d);
-  svg.append(path);
-  return svg;
-}
-const ICONS = {
-  home: 'M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z',
-  projects: 'M4 5h7v6H4zM13 5h7v6h-7zM4 13h7v6H4zM13 13h7v6h-7z',
-  settings: 'M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8',
-};
-
-let toastTimer;
-function toast(text) {
-  toastEl.textContent = text;
-  toastEl.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (toastEl.hidden = true), 3500);
-}
-
-function ago(iso) {
-  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
-  if (!Number.isFinite(s)) return '—';
-  if (s < 60) return 'just now';
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
-  if (s < 172800) return 'yesterday';
-  return new Date(iso).toLocaleDateString();
-}
-
-function aspect(w, h) {
-  const g = (a, b) => (b ? g(b, a % b) : a);
-  const d = g(w, h) || 1;
-  const a = `${w / d}:${h / d}`;
-  return ['9:16', '16:9', '1:1', '4:5', '4:3', '3:4'].includes(a) ? a : `${w}×${h}`;
-}
-
-function length(frames, fps) {
-  const s = Math.round(frames / (fps || 30));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
-
-function size(bytes) {
-  if (!bytes) return null;
-  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${(bytes / 1e6).toFixed(1)} MB`;
-}
-
-function plural(n, word) {
-  return `${n} ${word}${n === 1 ? '' : 's'}`;
-}
-
-const JOB_WORDS = { queued: 'Waiting', analyzing: 'Preparing', rendering: 'Rendering', muxing: 'Finishing', completed: 'Done', failed: 'Failed', cancelled: 'Cancelled' };
-
-// ── routes: #/ (Home), #/projects, #/p/<id>, #/settings ────────────────────
+// ── routes ──────────────────────────────────────────────────────────────────
+// #/projects · #/session[/<id>] · #/review/<project>/<version> · #/exports · #/pair[=CODE]
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 function route() {
-  const p = /^#\/p\/([0-9a-f-]{36})$/i.exec(location.hash);
-  if (p) return { name: 'project', id: p[1].toLowerCase() };
-  if (location.hash === '#/projects') return { name: 'projects' };
-  if (location.hash === '#/settings') return { name: 'settings' };
-  return { name: 'home' };
+  const hash = location.hash;
+  let m;
+  if (/^#\/?pair/.test(hash) || /[#&]pair=/.test(hash)) return { name: 'pair', code: codeFromText(hash) };
+  if ((m = new RegExp(`^#/session/(${UUID})$`, 'i').exec(hash))) return { name: 'session', id: m[1] };
+  if (hash === '#/session') return { name: 'session', id: null };
+  if ((m = new RegExp(`^#/review/(${UUID})/(${UUID})$`, 'i').exec(hash))) return { name: 'review', id: m[1], version: m[2] };
+  if (hash === '#/exports') return { name: 'exports' };
+  return { name: 'projects' };
 }
-
-function go(hash) {
+const go = (hash) => {
   if (location.hash !== hash) location.hash = hash;
+  else render();
+};
+
+// ── helpers over the cached snapshot ────────────────────────────────────────
+const pairing = () => core.activePairing();
+const cache = () => (pairing() ? core.macCache(pairing().macId) : null);
+const snap = () => cache()?.snapshot ?? null;
+const projects = () => snap()?.projects ?? [];
+const projectById = (id) => projects().find((p) => p.id === id) ?? null;
+const detailOf = (id) => cache()?.details?.[id] ?? null;
+const jobsOf = (id) => (snap()?.jobs ?? []).filter((j) => j.projectId === id);
+const askOf = (id) => (snap()?.asks ?? []).find((a) => a.projectId === id) ?? null;
+const isLive = () => core.status().live;
+
+function lastProjectId() {
+  const c = cache();
+  const id = c?.lastProject;
+  if (id && projectById(id)) return id;
+  return null;
+}
+function rememberProject(id) {
+  const c = cache();
+  if (c && c.lastProject !== id) {
+    c.lastProject = id;
+    core.persist();
+  }
 }
 
-// ── shared pieces ──────────────────────────────────────────────────────────
-function statusPill() {
-  if (state.problem === 'locked') return h('span', { class: 'pill err' }, h('span', { class: 'dot' }), 'Locked out');
-  if (!state.connected) return h('span', { class: 'pill' }, h('span', { class: 'dot' }), 'Connecting…');
-  return state.online ? h('span', { class: 'pill ok' }, h('span', { class: 'dot' }), 'Online') : h('span', { class: 'pill wait' }, h('span', { class: 'dot' }), 'Mac offline');
+/** One line about a project: what the agent or a render is doing, or what's waiting for the user. */
+function projectState(p) {
+  const ask = askOf(p.id);
+  const job = jobsOf(p.id)[0];
+  const queued = core.instructionsFor(p.id).filter((x) => ['local', 'queued'].includes(x.state)).length;
+  if (ask) return { text: 'Agent editing', tone: 'mint', icon: 'director', busy: true };
+  if (job) return { text: job.kind === 'export' ? `Exporting ${Math.round(job.progress * 100)}%` : 'Rendering preview', tone: 'orange', icon: 'film', busy: true };
+  if (p.pendingProposals) return { text: 'Review ready', tone: 'mint', icon: 'checkCircle' };
+  if (queued) return { text: `${plural(queued, 'instruction')} queued`, tone: 'neutral', icon: 'queue' };
+  return { text: 'Ready', tone: 'ok', icon: null };
 }
 
-function header(title, sub, { back } = {}) {
+// ── header, connection strip, dock ──────────────────────────────────────────
+function header({ back = null, menu = null } = {}) {
+  const st = core.status();
+  const agentBusy = projects().some((p) => askOf(p.id)) ? 'edit' : (snap()?.jobs ?? []).length ? 'render' : 'idle';
   return h(
     'header',
     { class: 'top' },
-    back ? h('button', { class: 'back', type: 'button', 'aria-label': 'Back', onclick: () => (history.length > 1 ? history.back() : go(back)), text: '‹' }) : h('img', { src: '/mark.svg', alt: '' }),
-    h('div', { class: 'head' }, h('div', { class: 't', text: title }), sub),
-    h('div', { class: 'grow' }),
-    statusPill(),
+    back ? iconButton('back', 'Back', () => (history.length > 1 ? history.back() : go(back))) : h('span', { class: 'top-spacer' }),
+    h('div', { class: 'brand' }, logo(st.live ? agentBusy : 'idle'), h('div', { class: 'wordmark' }, h('b', { text: 'ReelForge' }), h('span', { text: 'Remote' }))),
+    menu ? iconButton('more', 'More actions', menu) : h('span', { class: 'top-spacer' }),
   );
 }
 
-function tabs(current) {
-  const pending = (state.snapshot?.projects ?? []).filter((p) => p.pendingProposals > 0).length;
-  const tab = (name, hash, label, badge) =>
-    h('a', { class: `tab${current === name ? ' on' : ''}`, href: hash, 'aria-current': current === name ? 'page' : null }, h('span', { class: 'ic' }, icon(ICONS[name]), badge ? h('span', { class: 'badge', text: String(badge) }) : null), label);
-  return h('nav', { class: 'tabs', 'aria-label': 'Sections' }, tab('home', '#/', 'Home'), tab('projects', '#/projects', 'Projects', pending), tab('settings', '#/settings', 'Settings'));
+function statusWords() {
+  const st = core.status();
+  if (live.revoked) return { word: 'Not paired', tone: 'error', detail: null };
+  if (st.transport === 'connecting') return { word: 'Connecting', tone: 'neutral', detail: null };
+  if (st.transport === 'reconnecting' || st.transport === 'disconnected') return { word: 'Reconnecting', tone: 'warn', detail: st.lastSeen ? `Last seen ${ago(st.lastSeen)}` : null };
+  if (st.engine === 'stopped') return { word: 'Stopped', tone: 'neutral', detail: 'Engine stopped on the Mac' };
+  if (st.engine === 'unavailable') return { word: 'Unavailable', tone: 'warn', detail: st.lastSeen ? `Last seen ${ago(st.lastSeen)}` : null };
+  if (st.engine === 'busy') return { word: 'Editing', tone: 'orange', detail: st.editor === 'closed' ? 'Editor closed · engine on' : null };
+  return { word: 'Ready', tone: 'ok', detail: st.editor === 'closed' ? 'Editor closed · engine on' : null };
 }
 
-function thumb(p) {
-  const shape = p.width > p.height ? 'landscape' : p.width === p.height ? 'square' : '';
-  const poster = state.posters.get(p.id);
-  const el = h('div', { class: `thumb ${shape}`, 'aria-hidden': 'true' });
-  if (poster?.url) el.append(h('img', { src: poster.url, alt: '' }));
-  return el;
+function connectionStrip() {
+  const p = pairing();
+  const w = statusWords();
+  return h(
+    'button',
+    { class: `strip ${w.tone}`, type: 'button', onclick: openDeviceSheet, 'aria-label': `${p?.macName ?? 'Mac'}: ${w.word}${w.detail ? `, ${w.detail}` : ''}. Device and pairing` },
+    h('span', { class: `dot ${w.tone}`, 'aria-hidden': 'true' }),
+    h(
+      'span',
+      { class: 'strip-text' },
+      h('span', { class: 'strip-main' }, h('span', { class: 'strip-name', text: p?.macName ?? 'Mac' }), h('span', { class: 'sep', text: '·' }), h('span', { class: 'strip-word', text: w.word })),
+      w.detail ? h('span', { class: 'strip-detail', text: w.detail }) : null,
+    ),
+    icon('chevronRight', { size: 16 }),
+  );
 }
 
-function bar(progress) {
-  const pct = Math.round(progress * 100);
-  const fill = h('span');
-  fill.style.width = `${pct}%`; // CSSOM: allowed by the relay's CSP, unlike style=""
-  return h('div', { class: 'bar mt', role: 'progressbar', 'aria-valuenow': pct, 'aria-valuemin': 0, 'aria-valuemax': 100 }, fill);
+function dock(current) {
+  const tab = (name, label, hash, iconName, badge) =>
+    h(
+      'a',
+      { class: `tab${current === name ? ' on' : ''}`, href: hash, 'aria-current': current === name ? 'page' : null },
+      h('span', { class: 'tab-ic' }, icon(iconName, { size: 22 }), badge ? h('span', { class: 'badge', text: String(badge), 'aria-label': `${badge} new` }) : null),
+      h('span', { class: 'tab-label', text: label }),
+    );
+  const reviews = projects().reduce((n, p) => n + (p.pendingProposals || 0), 0);
+  const running = (snap()?.jobs ?? []).filter((j) => j.kind === 'export').length;
+  const sessionId = lastProjectId();
+  return h(
+    'nav',
+    { class: 'dock', 'aria-label': 'Sections' },
+    tab('projects', 'Projects', '#/projects', 'projects'),
+    tab('session', 'Session', sessionId ? `#/session/${sessionId}` : '#/session', 'session', reviews || null),
+    tab('exports', 'Exports', '#/exports', 'exports', running || null),
+  );
+}
+
+/** Shown in place of live status when the Mac can't be reached: what we know, and what to check. */
+function unavailableCard({ compact = false } = {}) {
+  const st = core.status();
+  const w = statusWords();
+  if (st.live || st.transport === 'connecting') return null;
+  const stopped = st.engine === 'stopped';
+  return h(
+    'section',
+    { class: 'card notice warn' },
+    h('div', { class: 'row gap' }, icon(stopped ? 'power' : 'wifiOff'), h('div', { class: 'grow' }, h('b', { text: `${pairing()?.macName ?? 'Your Mac'} is ${stopped ? 'stopped' : w.word.toLowerCase()}` }), h('p', { class: 'muted', text: w.detail ?? 'Waiting for it to connect.' }))),
+    compact
+      ? null
+      : h(
+          'ul',
+          { class: 'help' },
+          stopped
+            ? h('li', { text: 'ReelForge Engine was stopped on the Mac (Stop Engine & Disconnect). Start it again from ReelForge there.' })
+            : [
+                h('li', { text: 'Is the Mac on and connected to the internet? A Mac that sleeps can’t be reached.' }),
+                h('li', { text: 'Is ReelForge Engine running? On the Mac: Settings → Remote Access. Start Engine at Login keeps it there after a restart.' }),
+                h('li', { text: 'On a laptop, Remote Ready keeps it awake while it’s on power. A closed lid still sleeps it.' }),
+              ],
+        ),
+    h('p', { class: 'muted small', text: 'You can still look at what was synced and queue instructions; they run when the Mac is back.' }),
+    h('div', { class: 'row gap mt' }, button('Retry connection', { iconName: 'refresh', small: true, onclick: () => core.connect() })),
+  );
+}
+
+// ── Projects ────────────────────────────────────────────────────────────────
+let projectQuery = '';
+function projectsScreen() {
+  const s = snap();
+  const list = projects();
+  const st = core.status();
+  const body = [];
+  body.push(h('h1', { class: 'title', text: 'Your projects' }));
+  if (s && !st.live && cache()?.syncedAt) body.push(h('p', { class: 'synced', text: `Last synced ${ago(cache().syncedAt)} · saved on this phone` }));
+  if (!st.live) body.push(unavailableCard({ compact: true }));
+  if (!s) {
+    if (st.transport === 'connecting' || (st.transport === 'connected' && !live.relayWaiting && live.agentOnline)) return [...body, skeleton()];
+    return [...body, h('section', { class: 'card empty' }, h('p', { text: 'Nothing synced from your Mac yet. It will appear here once the Mac connects.' }), button('Retry', { iconName: 'refresh', small: true, onclick: () => core.connect() }))];
+  }
+  if (!list.length) return [...body, h('section', { class: 'card empty' }, icon('projects', { size: 28 }), h('p', { text: 'No projects yet. Create one in ReelForge on your Mac.' }))];
+
+  if (list.length > 6) {
+    const input = h('input', { class: 'search', type: 'search', placeholder: 'Search projects', value: projectQuery, 'aria-label': 'Search projects', oninput: (e) => ((projectQuery = e.target.value), render()) });
+    body.push(h('label', { class: 'search-wrap' }, icon('search', { size: 18 }), input));
+  }
+  const q = projectQuery.trim().toLowerCase();
+  const filtered = q ? list.filter((p) => p.name.toLowerCase().includes(q)) : list;
+  const activeId = lastProjectId() ?? [...list].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]?.id;
+  const active = !q ? filtered.find((p) => p.id === activeId) : null;
+  if (active) body.push(heroCard(active));
+  const rest = filtered.filter((p) => p !== active);
+  if (rest.length) body.push(h('div', { class: 'list' }, rest.map(projectRow)));
+  if (!filtered.length) body.push(h('p', { class: 'muted', text: 'No project matches.' }));
+
+  const exps = (s.exports ?? []).filter((e) => e.state === 'completed').slice(0, 2);
+  if (exps.length) {
+    body.push(h('div', { class: 'section-head' }, h('h2', { text: 'Recent exports' }), h('a', { class: 'link', href: '#/exports' }, 'See all', icon('chevronRight', { size: 16 }))));
+    body.push(h('div', { class: 'list' }, exps.map((e) => exportRow(e, { compact: true }))));
+  }
+  return body;
+}
+
+function poster(projectId, cls = '') {
+  const url = live.posters.get(projectId)?.url;
+  return h('div', { class: `poster ${cls}` }, url ? h('img', { src: url, alt: '' }) : icon('film', { size: 26 }));
+}
+
+function heroCard(p) {
+  const s = projectState(p);
+  const meta = [
+    h('span', { class: 'meta' }, icon('phone', { size: 16 }), `${aspect(p.width, p.height)}`),
+    p.durationFrames ? h('span', { class: 'meta tabular' }, icon('clock', { size: 16 }), duration(p.durationFrames, p.fps)) : null,
+    h('span', { class: 'meta' }, icon('history', { size: 16 }), `Updated ${ago(p.updatedAt)}`),
+  ];
+  return h(
+    'section',
+    { class: 'card hero' },
+    h('div', { class: 'hero-art' }, poster(p.id, 'wide'), s.tone !== 'ok' ? h('span', { class: `badge-float ${s.tone}` }, s.icon ? icon(s.icon, { size: 15 }) : null, s.text) : null),
+    h('h3', { class: 'hero-name', text: p.name }),
+    h('div', { class: 'meta-row' }, meta),
+    button('Open session', { kind: 'primary', iconName: 'play', full: true, onclick: () => openSession(p.id) }),
+  );
 }
 
 function projectRow(p) {
-  const job = (state.snapshot?.jobs ?? []).find((j) => j.projectId === p.id);
-  const badge = job
-    ? h('span', { class: 'pill run' }, h('span', { class: 'dot' }), `${Math.round(job.progress * 100)}%`)
-    : p.pendingProposals > 0
-      ? h('span', { class: 'pill wait', text: 'Review' })
-      : h('span', { class: 'pill', text: 'Idle' });
+  const s = projectState(p);
   return h(
-    'a',
-    { class: 'proj', href: `#/p/${p.id}` },
-    thumb(p),
-    h('div', { class: 'info' }, h('div', { class: 'n', text: p.name }), h('div', { class: 'm', text: `${aspect(p.width, p.height)} · ${p.fps} fps · edited ${ago(p.updatedAt)}` })),
-    h('div', { class: 'grow' }),
-    badge,
+    'button',
+    { class: 'row-card', type: 'button', onclick: () => openSession(p.id), 'aria-label': `${p.name}, ${s.text}. Open session` },
+    poster(p.id, 'thumb'),
+    h('span', { class: 'row-text' }, h('b', { text: p.name }), h('span', { class: `state ${s.tone}` }, s.icon ? icon(s.icon, { size: 14 }) : h('span', { class: `dot ${s.tone}` }), s.text)),
+    icon('chevronRight', { size: 18 }),
   );
 }
 
-// ── views ──────────────────────────────────────────────────────────────────
-function viewUnpaired(reason) {
-  const input = h('input', {
-    class: 'pair-input',
-    type: 'text',
-    placeholder: 'Paste the pairing link',
-    autocomplete: 'off',
-    autocapitalize: 'off',
-    autocorrect: 'off',
-    spellcheck: 'false',
-    'aria-label': 'Pairing link',
-  });
-  // Pasting a whole link is the whole job: pair at once, no extra tap.
-  input.addEventListener('paste', (e) => {
-    const text = e.clipboardData?.getData('text');
-    if (secretFromText(text)) {
-      e.preventDefault();
-      pairWith(text);
-    }
-  });
-  const pasteFromClipboard = async () => {
-    try {
-      pairWith(await navigator.clipboard.readText());
-    } catch {
-      input.focus();
-      toast('Couldn’t read the clipboard. Long-press the box and choose Paste.');
-    }
-  };
+function skeleton() {
+  return h('div', { class: 'skeleton', 'aria-busy': 'true', 'aria-label': 'Loading projects' }, h('div', { class: 'sk hero-sk' }), h('div', { class: 'sk row-sk' }), h('div', { class: 'sk row-sk' }));
+}
+
+function openSession(id) {
+  rememberProject(id);
+  go(`#/session/${id}`);
+}
+
+// ── Session ─────────────────────────────────────────────────────────────────
+function sessionScreen(r) {
+  const id = r.id ?? lastProjectId();
+  if (!id || !projectById(id)) {
+    return [
+      h('h1', { class: 'title', text: 'Session' }),
+      h('section', { class: 'card empty' }, icon('session', { size: 28 }), h('p', { text: 'Pick a project to direct. Its preview, the agent’s work and your conversation live here.' }), button('Choose project', { kind: 'primary', onclick: chooseProjectSheet })),
+    ];
+  }
+  if (r.id !== id) history.replaceState(null, '', `#/session/${id}`);
+  rememberProject(id);
+  core.openProject(id);
+  void core.restorePreview(id);
+  const p = projectById(id);
+  const d = detailOf(id);
+  return [
+    h('div', { class: 'title-row' }, h('button', { class: 'title-switch', type: 'button', onclick: chooseProjectSheet, 'aria-label': `${p.name}. Switch project` }, h('h1', { class: 'title', text: p.name }), icon('chevronDown', { size: 18 }))),
+    unavailableCard({ compact: false }),
+    previewCard(p, d),
+    activityCard(p, d),
+    conversation(p, d),
+  ];
+}
+
+function chooseProjectSheet() {
+  const list = projects();
+  sheet(
+    'Choose project',
+    list.length
+      ? h('div', { class: 'list' }, list.map((p) => h('button', { class: 'row-card', type: 'button', onclick: () => (closeSheet(), openSession(p.id)) }, poster(p.id, 'thumb'), h('span', { class: 'row-text' }, h('b', { text: p.name }), h('span', { class: 'muted', text: `${aspect(p.width, p.height)} · updated ${ago(p.updatedAt)}` })), icon('chevronRight', { size: 18 }))))
+      : h('p', { class: 'muted', text: 'No projects synced yet.' }),
+  );
+}
+
+// The player is kept between redraws so playback isn't interrupted every time the state changes.
+const players = new Map(); // projectId → { root, video, url, ... }
+let previewCollapsed = false;
+
+function player(projectId, pv) {
+  let pl = players.get(projectId);
+  if (!pl) {
+    const video = h('video', { playsinline: true, preload: 'metadata', class: 'video' });
+    const playBtn = iconButton('play', 'Play', () => (video.paused ? video.play() : video.pause()), { cls: 'ctl' });
+    const time = h('span', { class: 'time tabular', text: '00:00 / 00:00' });
+    const seek = h('input', { class: 'seek', type: 'range', min: 0, max: 1000, value: 0, step: 1, 'aria-label': 'Seek' });
+    const muteBtn = iconButton('volume', 'Mute', () => (video.muted = !video.muted), { cls: 'ctl' });
+    const fullBtn = iconButton('maximize', 'Full screen', () => (video.requestFullscreen ? video.requestFullscreen() : video.webkitEnterFullscreen?.()), { cls: 'ctl' });
+    const sync = () => {
+      const dur = Number.isFinite(video.duration) ? video.duration : 0;
+      time.textContent = `${clock(video.currentTime)} / ${clock(dur)}`;
+      if (!seeking) seek.value = String(dur ? Math.round((video.currentTime / dur) * 1000) : 0);
+      seek.style.setProperty('--p', `${dur ? (video.currentTime / dur) * 100 : 0}%`);
+      playBtn.replaceChildren(icon(video.paused ? 'play' : 'pause'));
+      playBtn.setAttribute('aria-label', video.paused ? 'Play' : 'Pause');
+      muteBtn.replaceChildren(icon(video.muted ? 'mute' : 'volume'));
+      muteBtn.setAttribute('aria-label', video.muted ? 'Unmute' : 'Mute');
+    };
+    let seeking = false;
+    seek.addEventListener('pointerdown', () => (seeking = true));
+    seek.addEventListener('input', () => {
+      if (Number.isFinite(video.duration)) video.currentTime = (Number(seek.value) / 1000) * video.duration;
+    });
+    seek.addEventListener('change', () => (seeking = false));
+    for (const ev of ['timeupdate', 'play', 'pause', 'loadedmetadata', 'volumechange', 'ended']) video.addEventListener(ev, sync);
+    video.addEventListener('click', () => (video.paused ? video.play() : video.pause()));
+    const root = h('div', { class: 'player' }, h('div', { class: 'frame' }, video), h('div', { class: 'controls' }, playBtn, time, seek, muteBtn, fullBtn));
+    pl = { root, video, url: null, sync };
+    players.set(projectId, pl);
+  }
+  if (pv?.url && pl.url !== pv.url) {
+    // A newer preview arrived: swap it in, keeping the position, never starting playback by itself.
+    const at = pl.video.currentTime;
+    pl.video.src = pv.url;
+    pl.url = pv.url;
+    pl.video.addEventListener('loadedmetadata', () => (pl.video.currentTime = Math.min(at, pl.video.duration || 0)), { once: true });
+  }
+  const w = pv?.width ?? 9;
+  const hh = pv?.height ?? 16;
+  pl.root.querySelector('.frame').style.setProperty('--arw', String(w));
+  pl.root.querySelector('.frame').style.setProperty('--arh', String(hh));
+  return pl.root;
+}
+
+function previewCard(p, d) {
+  const pv = live.previews.get(p.id);
+  const remote = d?.preview ?? null; // what the Mac has
+  const st = core.status();
+  const rendering = jobsOf(p.id).find((j) => j.kind === 'preview');
+  let label;
+  let tone = 'neutral';
+  if (pv?.url) {
+    const current = pv.revision === p.revision;
+    if (!st.live) label = `Last preview · Updated ${ago(pv.updatedAt)}`;
+    else if (current) (label = `Preview · revision ${pv.revision}`), (tone = 'ok');
+    else label = `Older preview · revision ${pv.revision} (timeline changed since)`;
+  } else if (pv?.state === 'loading') label = 'Loading preview…';
+  else label = st.live ? 'No preview of this timeline yet' : 'No preview saved on this phone';
+
+  const actions = [];
+  if (st.live && !rendering && (!remote || !remote.current) && (!pv?.url || pv.revision !== p.revision)) {
+    actions.push(button('Render preview', { small: true, iconName: 'film', onclick: () => startPreview(p.id) }));
+  }
+  if (st.live && remote?.state === 'completed' && remote.current && pv?.jobId !== remote.jobId && pv?.state !== 'loading') {
+    actions.push(button(`Load latest preview${remote.sizeBytes ? ` (${size(remote.sizeBytes)})` : ''}`, { small: true, iconName: 'exports', onclick: () => core.loadPreview(p.id, remote) }));
+  }
+  const body = [];
+  if (!previewCollapsed) {
+    if (pv?.url) body.push(player(p.id, pv));
+    else body.push(h('div', { class: 'player placeholder' }, h('div', { class: 'frame', vars: { '--arw': p.width, '--arh': p.height } }, live.posters.get(p.id)?.url ? h('img', { src: live.posters.get(p.id).url, alt: '' }) : icon('film', { size: 30 }))));
+    if (pv?.state === 'loading') body.push(progress(pv.progress, 'Loading preview'));
+    if (rendering) body.push(h('div', { class: 'row gap small' }, h('span', { text: `Rendering preview ${rendering.state === 'queued' ? '(waiting)' : `${Math.round(rendering.progress * 100)}%`}` })), progress(rendering.state === 'queued' ? null : rendering.progress, 'Rendering preview'));
+  }
   return h(
-    'main',
-    { class: 'pair' },
-    h('img', { src: '/mark.svg', alt: '' }),
-    h('div', {}, h('h1', { text: 'ReelForge Remote' }), h('p', { class: 'mt', text: 'Your Mac edits. Your phone directs.' })),
+    'section',
+    { class: 'card preview' },
     h(
       'div',
-      { class: 'card' },
-      h('div', { class: 'label', text: reason === 'unpaired' ? 'Pairing no longer valid' : 'Pair with your Mac' }),
-      reason === 'unpaired' ? h('p', { text: 'Your Mac doesn’t accept this pairing: it’s from an older pairing or the link was cut short. Pair again below.' }) : null,
-      h('p', { class: 'mt', text: 'On your Mac, open ReelForge → Settings → Phone remote. Then scan its QR code here, or press Copy link there and paste it here.' }),
-      h('button', { class: 'btn mint mt', type: 'button', onclick: openScanner, text: 'Scan QR code' }),
-      h('button', { class: 'btn mt', type: 'button', onclick: pasteFromClipboard, text: 'Paste from Mac' }),
-      h('p', { class: 'muted mt', text: 'Paste from Mac needs both on the same Apple ID with Handoff on. Otherwise send the link to yourself (AirDrop, Notes) and paste it below.' }),
-      h('div', { class: 'pair-row mt' }, input, h('button', { class: 'btn sm', type: 'button', onclick: () => pairWith(input.value), text: 'Pair' })),
+      { class: 'card-head' },
+      h('span', { class: `small ${tone === 'ok' ? 'ok-text' : 'muted'}`, text: label }),
+      iconButton(previewCollapsed ? 'chevronDown' : 'chevronUp', previewCollapsed ? 'Show preview' : 'Hide preview', () => ((previewCollapsed = !previewCollapsed), render())),
     ),
-    reason === 'unpaired' ? h('button', { class: 'btn', type: 'button', onclick: unpair, text: 'Forget this pairing' }) : null,
+    body,
+    actions.length ? h('div', { class: 'row gap wrap mt' }, actions) : null,
   );
 }
 
-// ── QR scanner (pairing) ────────────────────────────────────────────────────
-// The camera stays on this phone: frames are read here by jsQR (vendor/, loaded only when asked
-// for) and never leave it. Only a QR holding a pairing link pairs; anything else is ignored.
+async function startPreview(projectId) {
+  const r = await core.command('preview.start', { projectId });
+  if (!r) return toast('Your Mac isn’t connected.');
+  if (r.t === 'error') return toast(r.message);
+  core.openProject(projectId, true);
+}
+
+/** What the agent (or a render) is doing on this project right now, from real events only. */
+function activityCard(p, d) {
+  const ask = askOf(p.id) ?? d?.asking ?? null;
+  const st = core.status();
+  const pending = core.instructionsFor(p.id).find((x) => ['accepted', 'running'].includes(x.state));
+  const job = jobsOf(p.id).find((j) => j.kind === 'export');
+  if (!ask && !pending && !job) return null;
+  if (ask || pending) {
+    const since = ask?.startedAt ? ago(ask.startedAt) : null;
+    const steps = [
+      { label: 'Queued', state: 'done' },
+      { label: 'Accepted', state: 'done' },
+      { label: 'Planning', state: 'active' },
+      { label: 'Review', state: 'pending' },
+    ];
+    return h(
+      'section',
+      { class: 'card activity', 'aria-live': 'polite' },
+      h(
+        'div',
+        { class: 'card-head' },
+        h('div', { class: 'row gap' }, icon('director'), h('div', {}, h('b', { text: 'Agent is planning changes' }), h('p', { class: 'muted small', text: `${clipText(ask?.instruction ?? pending?.instruction ?? '', 70)}${since ? ` · started ${since}` : ''}` }))),
+      ),
+      h('ol', { class: 'steps' }, steps.map((s) => h('li', { class: s.state }, h('span', { class: 'step-dot', 'aria-hidden': 'true' }, s.state === 'done' ? icon('check', { size: 12 }) : null), h('span', { text: s.label }), h('span', { class: 'sr', text: s.state === 'done' ? ' complete' : s.state === 'active' ? ' in progress' : ' pending' })))),
+      progress(null, 'Planning'),
+      st.live
+        ? h('div', { class: 'row between mt' }, h('p', { class: 'muted small', text: 'Cancel stops the request. Nothing on your timeline changes.' }), button('Cancel', { small: true, kind: 'ghost', iconName: 'x', onclick: () => cancelAsk(p.id) }))
+        : h('p', { class: 'muted small mt', text: 'Status from before the connection dropped. It’s confirmed once your Mac is back.' }),
+    );
+  }
+  return h(
+    'section',
+    { class: 'card activity' },
+    h('div', { class: 'card-head' }, h('div', { class: 'row gap' }, icon('exports'), h('div', {}, h('b', { text: 'Exporting' }), h('p', { class: 'muted small tabular', text: job.state === 'queued' ? 'Waiting for the renderer' : `${capital(job.state)} · ${Math.round(job.progress * 100)}%` })))),
+    progress(job.state === 'queued' ? null : job.progress, 'Export progress'),
+    h('div', { class: 'row between mt' }, h('a', { class: 'link', href: '#/exports' }, 'Open Exports', icon('chevronRight', { size: 16 }))),
+  );
+}
+
+async function cancelAsk(projectId) {
+  const r = await core.command('ai.cancel', { projectId });
+  if (!r) toast('Your Mac isn’t connected.');
+}
+
+/** User messages and the agent's answers (versions), plus instructions not answered yet. */
+function conversation(p, d) {
+  const items = [];
+  const versions = [...(d?.versions ?? [])].reverse(); // oldest first
+  for (const v of versions) {
+    items.push({ at: Date.parse(v.createdAt) - 1, node: userBubble(stripAbout(v.instruction), v.createdAt, v.requestedBy === 'mcp' ? 'From an AI app' : null) });
+    items.push({ at: Date.parse(v.createdAt), node: versionCard(p, v) });
+  }
+  const shown = new Set(versions.map((v) => v.id));
+  for (const it of core.instructionsFor(p.id)) {
+    if (it.state === 'done' && (!it.proposalId || shown.has(it.proposalId))) continue;
+    if (it.state === 'cancelled' && Date.now() - (it.finishedAt ?? 0) > 60_000) continue;
+    items.push({ at: it.createdAt, node: instructionCard(p, it) });
+  }
+  const techs = live.activity.filter((a) => a.projectId === p.id);
+  if (techs.length) items.push({ at: techs.at(-1).at, node: h('details', { class: 'tech' }, h('summary', { text: `Activity · ${plural(techs.length, 'update')}` }), h('ul', {}, techs.map((a) => h('li', { text: `${ago(a.at)} · ${a.text}` })))) });
+  items.sort((a, b) => a.at - b.at);
+  return h(
+    'section',
+    { class: 'conversation', 'aria-label': 'Conversation' },
+    items.length ? items.map((i) => i.node) : h('p', { class: 'muted center', text: d ? 'Tell the agent what to change. It proposes; you review before anything is applied.' : isLive() ? 'Loading the conversation…' : 'The conversation appears once your Mac has synced this project.' }),
+  );
+}
+
+const stripAbout = (text) => String(text ?? '').replace(/\n\n\(About the earlier proposal[\s\S]*\)$/, '');
+
+function userBubble(text, when, note) {
+  return h('div', { class: 'msg user' }, h('p', { text }), h('span', { class: 'msg-meta', text: [note, when ? ago(when) : null].filter(Boolean).join(' · ') }));
+}
+
+const VERSION_STATUS = {
+  pending: ['Waiting for review', 'mint', 'checkCircle'],
+  applied: ['Applied', 'ok', 'check'],
+  rejected: ['Dismissed', 'neutral', 'x'],
+  stale: ['Out of date', 'warn', 'alert'],
+};
+
+function versionCard(p, v) {
+  const [text, tone, ic] = v.stale ? VERSION_STATUS.stale : (VERSION_STATUS[v.status] ?? [capital(v.status), 'neutral', null]);
+  return h(
+    'div',
+    { class: 'msg agent' },
+    h('div', { class: 'agent-head' }, icon('director', { size: 16 }), h('b', { text: `Version ${v.version}` }), pill(text, tone, ic)),
+    h('p', { text: v.summary || 'No changes proposed.' }),
+    v.changes ? h('p', { class: 'muted small', text: `${plural(v.changes, 'change')}${v.warnings.length ? ` · ${plural(v.warnings.length, 'warning')}` : ''}` }) : null,
+    h('div', { class: 'row gap mt' }, button(v.status === 'pending' && !v.stale ? 'Review' : 'Details', { small: true, kind: v.status === 'pending' && !v.stale ? 'mint' : 'secondary', iconName: 'chevronRight', onclick: () => go(`#/review/${p.id}/${v.id}`) })),
+  );
+}
+
+const INSTRUCTION_STATE = {
+  local: ['Saved on this phone', 'neutral', 'phone', 'It goes to the relay as soon as there’s a connection.'],
+  queued: ['Queued', 'neutral', 'queue', 'Waiting on the relay. It runs when your Mac takes it.'],
+  accepted: ['Accepted', 'mint', 'check', 'Your Mac took it.'],
+  running: ['Running', 'orange', 'director', 'The agent is working on it.'],
+  needs_review: ['Needs review', 'warn', 'alert', null],
+  done: ['Review ready', 'mint', 'checkCircle', null],
+  failed: ['Failed', 'error', 'alert', null],
+  expired: ['Expired', 'neutral', 'clock', 'It waited too long and was not run.'],
+  cancelled: ['Cancelled', 'neutral', 'x', null],
+};
+
+function instructionCard(p, it) {
+  const [text, tone, ic, hint] = INSTRUCTION_STATE[it.state] ?? [capital(it.state), 'neutral', null, null];
+  const editable = ['local', 'queued'].includes(it.state);
+  const actions = [];
+  if (editable) {
+    actions.push(button('Edit', { small: true, iconName: 'pencil', onclick: () => editInstructionSheet(it) }));
+    actions.push(button('Cancel', { small: true, kind: 'ghost', iconName: 'x', onclick: () => core.cancelInstruction(it.id) }));
+  }
+  if (it.state === 'needs_review') {
+    actions.push(button('Run on current timeline', { small: true, kind: 'mint', onclick: () => core.rerunInstruction(it.id) }));
+    actions.push(button('Cancel', { small: true, kind: 'ghost', iconName: 'x', onclick: () => core.cancelInstruction(it.id) }));
+  }
+  if (it.state === 'failed' || it.state === 'expired') actions.push(button('Try again', { small: true, iconName: 'refresh', onclick: () => core.rerunInstruction(it.id) }));
+  if (it.state === 'done' && it.proposalId) actions.push(button('Review', { small: true, kind: 'mint', onclick: () => go(`#/review/${p.id}/${it.proposalId}`) }));
+  const why =
+    it.state === 'needs_review'
+      ? `The timeline changed on your Mac since you wrote this (revision ${it.baseRevision} → ${it.currentRevision}). Run it on the timeline as it is now, or cancel it.`
+      : it.state === 'failed'
+        ? it.error ?? 'The agent couldn’t do that.'
+        : hint;
+  return h(
+    'div',
+    { class: 'msg-group' },
+    userBubble(it.instruction, it.createdAt, it.about ? 'About a version' : null),
+    h('div', { class: `msg status ${tone}` }, h('div', { class: 'agent-head' }, pill(text, tone, ic)), why ? h('p', { class: 'small', text: why }) : null, actions.length ? h('div', { class: 'row gap wrap mt' }, actions) : null),
+  );
+}
+
+function editInstructionSheet(it) {
+  const area = h('textarea', { class: 'field', rows: 4, 'aria-label': 'Instruction', value: it.instruction });
+  sheet(
+    'Edit instruction',
+    h(
+      'div',
+      { class: 'stack' },
+      area,
+      h('p', { class: 'muted small', text: 'You can change it until your Mac takes it.' }),
+      button('Save', {
+        kind: 'mint',
+        full: true,
+        onclick: async () => {
+          const text = area.value.trim();
+          if (!text) return;
+          if (await core.editInstruction(it.id, text)) closeSheet();
+        },
+      }),
+    ),
+  );
+}
+
+// ── composer ────────────────────────────────────────────────────────────────
+const composers = new Map(); // projectId → element (kept so typing isn't interrupted by redraws)
+let pendingAbout = null; // { projectId, versionId, version }
+
+function composer(projectId) {
+  let c = composers.get(projectId);
+  const st = core.status();
+  if (!c) {
+    const area = h('textarea', { class: 'composer-input', rows: 1, placeholder: 'Tell the agent what to change…', 'aria-label': 'Instruction for the agent', enterkeyhint: 'send', autocapitalize: 'sentences' });
+    area.value = saved.drafts[core.draftKey(projectId)] ?? '';
+    const file = h('input', { type: 'file', accept: 'video/*,image/*,audio/*', class: 'visually-hidden', tabindex: '-1', 'aria-hidden': 'true' });
+    const attach = iconButton('attach', 'Attach a clip or photo', () => {
+      if (!isLive()) return toast('Attachments go straight to your Mac, so it needs to be online.');
+      file.click();
+    }, { cls: 'attach' });
+    const sendBtn = h('button', { class: 'send', type: 'button', 'aria-label': 'Send' }, icon('send', { size: 20 }));
+    const about = h('div', { class: 'about', hidden: true });
+    const hint = h('p', { class: 'composer-hint', hidden: true });
+    const uploads = h('div', { class: 'uploads' });
+    const grow = () => {
+      area.style.height = 'auto';
+      const want = area.scrollHeight;
+      area.style.height = area.value && want > 44 ? `${Math.min(want, 132)}px` : '';
+    };
+    area.addEventListener('input', () => {
+      core.setDraft(projectId, area.value);
+      grow();
+    });
+    area.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(hover: hover)').matches) {
+        e.preventDefault();
+        submit();
+      }
+    });
+    file.addEventListener('change', () => {
+      const f = file.files?.[0];
+      file.value = '';
+      if (f) void core.upload(projectId, f);
+    });
+    const submit = () => {
+      const text = area.value.trim();
+      if (!text) return area.focus();
+      const ab = pendingAbout?.projectId === projectId ? pendingAbout.versionId : null;
+      core.addInstruction(projectId, text, { about: ab });
+      pendingAbout = null;
+      area.value = '';
+      core.setDraft(projectId, '');
+      grow();
+      maybeAskForNotifications('instruction');
+      render();
+    };
+    sendBtn.addEventListener('click', submit);
+    const root = h('div', { class: 'composer', role: 'form', 'aria-label': 'Message the agent' }, about, uploads, hint, h('div', { class: 'composer-row' }, attach, area, sendBtn), file);
+    c = { root, area, sendBtn, hint, about, uploads, grow };
+    composers.set(projectId, c);
+    requestAnimationFrame(grow);
+  }
+  // Label and hint follow where the instruction will go.
+  const offline = !st.live;
+  const relayDown = st.transport !== 'connected';
+  c.sendBtn.setAttribute('aria-label', offline ? 'Queue instruction' : 'Send');
+  c.area.placeholder = offline ? 'Instruction to queue…' : 'Tell the agent what to change…';
+  c.sendBtn.classList.toggle('queue', offline);
+  c.sendBtn.replaceChildren(offline ? h('span', { class: 'send-label', text: 'Queue' }) : icon('send', { size: 20 }));
+  c.hint.hidden = !offline;
+  c.hint.textContent = relayDown ? 'Queue instruction · no connection: saved on this phone, sent when you’re back online.' : 'Queue instruction · your Mac is away: it waits in the queue and runs when the Mac connects.';
+  const ab = pendingAbout?.projectId === projectId ? pendingAbout : null;
+  c.about.hidden = !ab;
+  c.about.replaceChildren(...(ab ? [icon('history', { size: 14 }), h('span', { text: `About version ${ab.version}` }), iconButton('x', 'Don’t refer to this version', () => ((pendingAbout = null), render()))] : []));
+  const ups = [...live.uploads.entries()].filter(([, u]) => u.projectId === projectId && !(u.state === 'imported' && Date.now() - (u.doneAt ??= Date.now()) > 8000));
+  c.uploads.replaceChildren(
+    ...ups.map(([uid, u]) =>
+      h(
+        'div',
+        { class: `upload ${u.state}` },
+        icon(u.state === 'imported' ? 'checkCircle' : u.state === 'failed' ? 'alert' : 'attach', { size: 16 }),
+        h('span', { class: 'grow ellipsis', text: u.state === 'failed' ? `${u.name}: ${u.error ?? 'failed'}` : u.state === 'imported' ? `${u.filename ?? u.name} added to the project` : u.state === 'importing' ? `${u.name} · importing on your Mac` : `${u.name} · ${Math.round((u.progress ?? 0) * 100)}%` }),
+        u.state === 'sending' ? iconButton('x', 'Cancel upload', () => core.cancelUpload(uid)) : null,
+      ),
+    ),
+  );
+  return c.root;
+}
+
+// ── Review ──────────────────────────────────────────────────────────────────
+const reviewOpened = new Map(); // `${project}:${version}` → newest version number when opened
+const exportChoice = { resolution: 'full', quality: 'standard' };
+
+function reviewScreen(r) {
+  const p = projectById(r.id);
+  if (!p) return [h('h1', { class: 'title', text: 'Review & export' }), h('section', { class: 'card empty' }, h('p', { text: 'That project isn’t synced on this phone.' }), button('Projects', { onclick: () => go('#/projects') }))];
+  rememberProject(p.id);
+  core.openProject(p.id);
+  const d = detailOf(p.id);
+  const v = d?.versions?.find((x) => x.id === r.version);
+  if (!v) return [h('h1', { class: 'title', text: 'Review & export' }), d ? h('section', { class: 'card empty' }, h('p', { text: 'This version isn’t in the recent history any more.' })) : skeleton()];
+  const key = `${p.id}:${v.id}`;
+  const newest = d.versions[0];
+  if (!reviewOpened.has(key)) reviewOpened.set(key, newest.version);
+  const newer = newest.version > reviewOpened.get(key) && newest.id !== v.id ? newest : null;
+  if (!live.exportOptions.has(p.id) && isLive()) void core.command('export.options', { projectId: p.id }, { wait: false });
+  const opts = live.exportOptions.get(p.id);
+  const pending = v.status === 'pending' && !v.stale;
+  const appliedCurrent = v.status === 'applied' && v.appliedRevision === p.revision;
+  const exportRevision = pending ? v.baseRevision : v.appliedRevision;
+  let cannot = null;
+  if (v.stale) cannot = 'The timeline changed since this version was made, so it can’t be applied. Ask the agent again.';
+  else if (v.status === 'rejected') cannot = 'This version was dismissed.';
+  else if (v.status === 'applied' && !appliedCurrent) cannot = `The timeline changed after this version was applied (now revision ${p.revision}). Export the latest version instead.`;
+  else if (!isLive()) cannot = 'Approving and exporting run on your Mac, so it needs to be online.';
+
+  const res = opts?.resolutions?.find((x) => x.id === exportChoice.resolution) ?? opts?.resolutions?.[0];
+  const pv = live.previews.get(p.id);
+  const requestInput = h('input', {
+    class: 'field request',
+    type: 'text',
+    placeholder: 'Request a change…',
+    'aria-label': 'Request a change to this version',
+    enterkeyhint: 'go',
+    onkeydown: (e) => e.key === 'Enter' && requestChange(p, v, e.target.value),
+  });
+  return [
+    h('h1', { class: 'title', text: 'Review & export' }),
+    newer ? h('section', { class: 'card notice mint' }, h('p', { text: `Version ${newer.version} arrived while you were reviewing. You are still looking at version ${v.version}.` }), button(`Open version ${newer.version}`, { small: true, kind: 'mint', onclick: () => go(`#/review/${p.id}/${newer.id}`) })) : null,
+    h(
+      'section',
+      { class: 'card review' },
+      h(
+        'div',
+        { class: 'review-top' },
+        h('button', { class: 'review-art', type: 'button', 'aria-label': 'Open the preview in Session', onclick: () => openSession(p.id) }, poster(p.id, 'tall'), h('span', { class: 'play-badge' }, icon('play', { size: 18 }))),
+        h(
+          'div',
+          { class: 'review-text' },
+          h('h2', { text: `${p.name} · Version ${v.version}` }),
+          pill(...(v.stale ? VERSION_STATUS.stale : (VERSION_STATUS[v.status] ?? [v.status, 'neutral', null]))),
+          h('p', { class: 'muted small mt', text: 'Agent summary' }),
+          h('p', { text: v.summary || 'No changes proposed.' }),
+        ),
+      ),
+      // The change list as the desktop shows it: what changed, then before → after, from the proposal itself.
+      v.list.length
+        ? h(
+            'ul',
+            { class: 'changes' },
+            v.list.map((c) =>
+              h(
+                'li',
+                {},
+                icon(c.kind === 'removed' ? 'x' : c.kind === 'added' ? 'plus' : 'check', { size: 16 }),
+                h(
+                  'span',
+                  { class: 'grow' },
+                  h('span', { class: 'block', text: `${capital(c.kind)} ${c.target}: ${c.label}` }),
+                  c.before ? h('span', { class: 'block muted small diff', text: `− ${c.before}` }) : null,
+                  c.after ? h('span', { class: 'block small diff', text: `+ ${c.after}` }) : null,
+                ),
+              ),
+            ),
+          )
+        : null,
+      v.changes > v.list.length ? h('p', { class: 'muted small', text: `and ${v.changes - v.list.length} more on your Mac` }) : null,
+      v.warnings.length ? h('ul', { class: 'warnings' }, v.warnings.map((w) => h('li', {}, icon('alert', { size: 16 }), h('span', { text: w })))) : null,
+      h('p', { class: 'muted small', text: pv?.url ? `The preview in Session shows revision ${pv.revision}${pending ? ', before this version is applied' : ''}.` : pending ? 'There is no preview of this version yet: it is rendered once it is applied.' : '' }),
+      h('label', { class: 'request-wrap' }, icon('director', { size: 18 }), requestInput),
+    ),
+    h('h2', { class: 'section-title', text: 'Export settings' }),
+    h(
+      'section',
+      { class: 'card settings' },
+      settingRow('file', 'Format', opts ? `${opts.format}` : 'MP4', null),
+      settingRow('crop', 'Resolution', res ? `${res.width} × ${res.height}` : `${p.width} × ${p.height}`, opts ? () => pickSheet('Resolution', opts.resolutions.map((x) => ({ id: x.id, label: `${x.width} × ${x.height}`, note: x.id === 'full' ? 'Project size' : 'Half size, smaller file' })), exportChoice.resolution, (id) => (exportChoice.resolution = id)) : null),
+      settingRow('layers', 'Frame rate', `${opts?.fps ?? p.fps} fps`, null),
+      settingRow('film', 'Quality', exportChoice.quality === 'small' ? 'Smaller file' : 'Standard', opts ? () => pickSheet('Quality', opts.qualities.map((x) => ({ id: x.id, label: x.label })), exportChoice.quality, (id) => (exportChoice.quality = id)) : null),
+      h('p', { class: 'muted small', text: `Saved on ${pairing()?.macName ?? 'your Mac'} in ${opts?.folder ?? 'Movies › ReelForge'}. Frame rate follows the project.` }),
+    ),
+    cannot ? h('p', { class: 'notice-line', text: cannot }) : null,
+    button(pending ? 'Approve & export' : 'Export this version', {
+      kind: 'primary',
+      iconName: 'exports',
+      full: true,
+      disabled: Boolean(cannot) || exportBusy,
+      onclick: () => approveAndExport(p, v, pending ? v.id : v.status === 'applied' ? v.id : null, exportRevision),
+    }),
+    pending && isLive() ? button('Dismiss this version', { kind: 'ghost', full: true, onclick: () => dismissVersion(v) }) : null,
+    h('div', { class: 'row between mt' }, button('Version history', { small: true, iconName: 'history', onclick: () => versionHistorySheet(p, d) })),
+    projectExports(p.id),
+  ];
+}
+
+function settingRow(iconName, label, value, onclick) {
+  const inner = [icon(iconName, { size: 20 }), h('span', { class: 'grow', text: label }), h('span', { class: 'value tabular', text: value }), onclick ? icon('chevronRight', { size: 16 }) : null];
+  return onclick ? h('button', { class: 'setting', type: 'button', onclick, 'aria-label': `${label}: ${value}. Change` }, inner) : h('div', { class: 'setting static', 'aria-label': `${label}: ${value}` }, inner);
+}
+
+function pickSheet(title, options, current, set) {
+  sheet(
+    title,
+    h(
+      'div',
+      { class: 'list', role: 'radiogroup', 'aria-label': title },
+      options.map((o) =>
+        h('button', { class: `option${o.id === current ? ' on' : ''}`, type: 'button', role: 'radio', 'aria-checked': o.id === current ? 'true' : 'false', onclick: () => (set(o.id), closeSheet(), render()) }, h('span', { class: 'grow' }, h('b', { text: o.label }), o.note ? h('span', { class: 'muted small block', text: o.note }) : null), o.id === current ? icon('check', { size: 18 }) : null),
+      ),
+    ),
+  );
+}
+
+function versionHistorySheet(p, d) {
+  sheet(
+    'Version history',
+    h(
+      'div',
+      { class: 'list' },
+      (d?.versions ?? []).map((v) => {
+        const [text, tone, ic] = v.stale ? VERSION_STATUS.stale : (VERSION_STATUS[v.status] ?? [v.status, 'neutral', null]);
+        return h('button', { class: 'row-card', type: 'button', onclick: () => (closeSheet(), go(`#/review/${p.id}/${v.id}`)) }, h('span', { class: 'row-text' }, h('b', { text: `Version ${v.version}` }), h('span', { class: 'muted small ellipsis', text: v.summary }), h('span', { class: 'muted small', text: ago(v.createdAt) })), pill(text, tone, ic));
+      }),
+    ),
+  );
+}
+
+function requestChange(p, v, text) {
+  const t = String(text ?? '').trim();
+  pendingAbout = { projectId: p.id, versionId: v.id, version: v.version };
+  if (t) {
+    const draft = saved.drafts[core.draftKey(p.id)];
+    const next = draft ? `${draft}\n${t}` : t;
+    core.setDraft(p.id, next);
+    const c = composers.get(p.id);
+    if (c) c.area.value = next;
+  }
+  openSession(p.id);
+  requestAnimationFrame(() => composers.get(p.id)?.area.focus());
+}
+
+let exportBusy = false;
+async function approveAndExport(p, v, proposalId, revision) {
+  exportBusy = true;
+  render();
+  try {
+    const r = await core.command('export.start', { projectId: p.id, proposalId, revision, resolution: exportChoice.resolution, quality: exportChoice.quality });
+    if (!r) return toast('Your Mac isn’t connected.');
+    if (r.t === 'error') return toast(r.code === 'REVISION_CONFLICT' ? r.message : `Couldn’t start the export: ${r.message}`);
+    toast(r.applied ? 'Approved. The export is queued on your Mac.' : 'Export queued on your Mac.');
+    core.openProject(p.id, true);
+    maybeAskForNotifications('export');
+    go('#/exports');
+  } finally {
+    exportBusy = false;
+    render();
+  }
+}
+
+async function dismissVersion(v) {
+  const r = await core.command('proposal.reject', { proposalId: v.id });
+  if (!r) return toast('Your Mac isn’t connected.');
+  if (r.t === 'error') return toast(r.message);
+  toast('Version dismissed.');
+  core.openProject(r.projectId ?? route().id, true);
+}
+
+function projectExports(projectId) {
+  const exps = (snap()?.exports ?? []).filter((e) => e.projectId === projectId).slice(0, 2);
+  if (!exps.length) return null;
+  return h('div', { class: 'list mt' }, exps.map((e) => exportRow(e, { compact: true })));
+}
+
+// ── Exports ─────────────────────────────────────────────────────────────────
+function exportsScreen() {
+  const all = snap()?.exports ?? [];
+  const jobs = new Map((snap()?.jobs ?? []).map((j) => [j.id, j]));
+  const groups = [
+    ['Queued', all.filter((e) => e.state === 'queued')],
+    ['Rendering', all.filter((e) => ['analyzing', 'rendering', 'muxing'].includes(e.state))],
+    ['Completed', all.filter((e) => e.state === 'completed')],
+    ['Failed', all.filter((e) => e.state === 'failed' || e.state === 'cancelled')],
+  ];
+  const body = [h('h1', { class: 'title', text: 'Exports' })];
+  if (!isLive() && snap()) body.push(h('p', { class: 'synced', text: `Last synced ${ago(cache().syncedAt)} · renders in progress are unconfirmed until your Mac is back` }));
+  if (!all.length) body.push(h('section', { class: 'card empty' }, icon('exports', { size: 28 }), h('p', { text: snap() ? 'No exports yet. Approve a version in Review to export it.' : 'Nothing synced from your Mac yet.' })));
+  for (const [title, list] of groups) {
+    if (!list.length) continue;
+    body.push(h('h2', { class: 'section-title', text: `${title} · ${list.length}` }));
+    body.push(h('div', { class: 'list' }, list.map((e) => exportRow(e, { job: jobs.get(e.id) }))));
+  }
+  return body;
+}
+
+function exportRow(e, { compact = false, job = null } = {}) {
+  const st = core.status();
+  const dl = live.downloads.get(e.id);
+  const res = e.width && e.height ? `${e.width} × ${e.height}` : null;
+  const facts = [e.version ? `Version ${e.version}` : `Revision ${e.revision}`, e.format, res, size(e.sizeBytes)].filter(Boolean).join(' · ');
+  const running = ['queued', 'analyzing', 'rendering', 'muxing'].includes(e.state);
+  const parts = [];
+  let state = null;
+  if (running) {
+    const pr = job?.progress ?? null;
+    if (!st.live) state = pill(`Unconfirmed${pr !== null ? ` · last seen at ${Math.round(pr * 100)}%` : ''}`, 'warn', 'alert');
+    else state = pill(e.state === 'queued' ? 'Queued' : `${capital(e.state)} ${pr !== null ? `${Math.round(pr * 100)}%` : ''}`, 'orange');
+    if (!compact) {
+      parts.push(progress(e.state === 'queued' || !st.live ? null : pr, 'Export progress'));
+      if (st.live) parts.push(h('div', { class: 'row between mt' }, h('p', { class: 'muted small', text: 'Closing this app doesn’t stop the render.' }), button('Cancel', { small: true, kind: 'ghost', iconName: 'x', onclick: () => cancelExport(e) })));
+    }
+  } else if (e.state === 'completed') {
+    // "Ready to download" only while the Mac is there to send it; otherwise the file is just on the Mac.
+    if (dl?.state === 'ready') state = pill('Downloaded to this phone', 'ok', 'checkCircle');
+    else if (!e.onMac) state = pill('No longer on the Mac', 'neutral', 'info');
+    else if (st.live) state = pill('Ready to download', 'mint', 'exports');
+    else state = pill('Available on Mac', 'neutral', 'monitor');
+  } else state = pill(e.state === 'cancelled' ? 'Cancelled' : 'Failed', e.state === 'cancelled' ? 'neutral' : 'error', 'alert');
+
+  let action = null;
+  if (e.state === 'completed' && e.onMac) {
+    if (dl?.state === 'loading') action = h('span', { class: 'tabular small', text: `${Math.round((dl.progress ?? 0) * 100)}%` });
+    else if (dl?.state === 'ready') action = null;
+    else if (st.live) action = iconButton('exports', `Download ${e.fileName ?? 'export'}`, () => core.downloadExport(e), { cls: 'boxed' });
+  }
+  if (!compact) {
+    if (e.state === 'completed') parts.push(h('p', { class: 'muted small', text: `${e.fileName ?? ''}${e.folder ? ` · ${e.folder} on ${pairing()?.macName ?? 'your Mac'}` : ''}` }));
+    if (dl?.state === 'loading') parts.push(progress(dl.progress, 'Download progress'));
+    if (dl?.state === 'failed') parts.push(h('p', { class: 'error-text small', text: `Download stopped: ${dl.error}` }));
+    if (dl?.state === 'ready') parts.push(h('div', { class: 'row gap wrap mt' }, h('a', { class: 'btn secondary sm', href: dl.url, download: dl.name ?? 'export.mp4' }, icon('exports', { size: 16 }), h('span', { text: 'Save' })), canShare(dl) ? button('Share', { small: true, iconName: 'share', onclick: () => shareFile(dl) }) : null));
+    if ((e.state === 'failed' || e.state === 'cancelled') && e.error) parts.push(h('p', { class: 'error-text small', text: e.error }));
+    if ((e.state === 'failed' || e.state === 'cancelled') && st.live) parts.push(h('div', { class: 'row gap mt' }, button('Retry', { small: true, iconName: 'refresh', onclick: () => retryExport(e) })));
+  }
+  return h(
+    'div',
+    { class: `export-card${compact ? ' compact' : ''}` },
+    h('div', { class: 'export-main' }, poster(e.projectId, 'thumb'), h('div', { class: 'row-text' }, h('b', { text: `${e.projectName}${e.version ? ` · v${e.version}` : ''}` }), h('span', { class: 'muted small tabular', text: facts }), compact ? null : state), compact ? (action ?? (e.state === 'completed' ? null : state)) : action),
+    parts,
+  );
+}
+
+const canShare = (dl) => dl?.blob && navigator.canShare?.({ files: [new File([dl.blob], dl.name ?? 'export.mp4', { type: 'video/mp4' })] });
+async function shareFile(dl) {
+  try {
+    await navigator.share({ files: [new File([dl.blob], dl.name ?? 'export.mp4', { type: 'video/mp4' })] });
+  } catch {
+    // dismissed
+  }
+}
+
+async function cancelExport(e) {
+  if (!confirm('Cancel this export? Nothing is written; your timeline is unchanged.')) return;
+  const r = await core.command('job.cancel', { jobId: e.id });
+  if (!r) return toast('Your Mac isn’t connected.');
+  if (r.t === 'error') toast(r.message);
+}
+
+async function retryExport(e) {
+  const r = await core.command('job.retry', { jobId: e.id });
+  if (!r) return toast('Your Mac isn’t connected.');
+  if (r.t === 'error') toast(r.message);
+}
+
+// ── device sheet ────────────────────────────────────────────────────────────
+function openDeviceSheet() {
+  const body = h('div', { class: 'stack' });
+  const fill = () => {
+    const st = core.status();
+    const w = statusWords();
+    const p = pairing();
+    const snapEngine = snap()?.engine;
+    const rr = st.remoteReady;
+    const rows = [
+      ['Connection', st.transport === 'connected' ? 'Connected to the relay' : capital(st.transport)],
+      ['Engine', { ready: 'Ready', busy: 'Busy', stopped: 'Stopped', unavailable: 'Unavailable', unknown: 'Unknown' }[st.engine]],
+      ['Runs', st.live && snapEngine ? (snapEngine.background ? 'In the background (no window needed)' : 'Inside the editor app') : 'Unknown'],
+      ['Desktop editor', { open: 'Open', closed: 'Closed', unknown: 'Unknown' }[st.editor]],
+      ['Last seen', st.live ? 'Now' : st.lastSeen ? ago(st.lastSeen) : 'Unknown'],
+      ['Remote Ready', !st.live || !rr ? 'Unknown' : !rr.enabled ? 'Off' : rr.power === 'battery' ? 'On · on battery, so macOS may still sleep' : rr.active ? 'On · keeping the Mac awake on power' : 'On'],
+      ...(st.live && live.rtt !== null ? [['Round trip', `${live.rtt} ms`]] : []),
+    ];
+    body.replaceChildren(
+      h('div', { class: 'list' }, saved.pairings.map((x) =>
+        h(
+          'button',
+          { class: `row-card device${x.macId === p?.macId ? ' on' : ''}`, type: 'button', 'aria-current': x.macId === p?.macId ? 'true' : null, onclick: () => (x.macId === p?.macId ? null : core.switchMac(x.macId).then(fill)) },
+          icon('monitor'),
+          h('span', { class: 'row-text' }, h('b', { text: x.macName }), h('span', { class: 'muted small', text: x.macId === p?.macId ? `${w.word}${w.detail ? ` · ${w.detail}` : ''}` : 'Tap to switch' })),
+          x.macId === p?.macId ? icon('check', { size: 18 }) : null,
+        ),
+      )),
+      h('dl', { class: 'facts' }, rows.map(([k, v]) => [h('dt', { text: k }), h('dd', { text: v })])),
+      notificationsCard(),
+      button('Pair another Mac', { iconName: 'plus', full: true, onclick: () => (closeSheet(), go('#/pair')) }),
+      h('p', { class: 'muted small', text: 'Other phones are managed on the Mac: ReelForge → Settings → Remote Access → Paired devices.' }),
+      p ? button(`Remove this phone from ${p.macName}`, { kind: 'danger', full: true, iconName: 'trash', onclick: () => removeThisPhone(p) }) : null,
+    );
+  };
+  fill();
+  const { close } = sheet(pairing()?.macName ?? 'Your Mac', body);
+  sheetUpdate = fill;
+  return close;
+}
+let sheetUpdate = null;
+
+async function removeThisPhone(p) {
+  if (!confirm(`Remove this phone from ${p.macName}? You’ll need a new pairing code to connect again.`)) return;
+  await core.forgetPairing(p.macId);
+  closeSheet();
+  go(saved.pairings.length ? '#/projects' : '#/pair');
+}
+
+// ── notifications ───────────────────────────────────────────────────────────
+function pushSupport() {
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return ios && !standalone ? 'install' : 'unsupported';
+  if (Notification.permission === 'denied') return 'denied';
+  return 'ok';
+}
+
+const push = { subscribed: false, busy: false };
+
+function notificationsCard() {
+  const sup = pushSupport();
+  const head = h('div', { class: 'row gap' }, icon('bell'), h('b', { class: 'grow', text: 'Notifications' }));
+  if (sup === 'install') return h('section', { class: 'card' }, head, h('p', { class: 'muted small', text: 'On iPhone, notifications need the app on your Home Screen: Share → Add to Home Screen, then open ReelForge from there.' }));
+  if (sup === 'unsupported') return h('section', { class: 'card' }, head, h('p', { class: 'muted small', text: 'This browser can’t show notifications. You’ll still see updates while the app is open.' }));
+  if (sup === 'denied') return h('section', { class: 'card' }, head, h('p', { class: 'muted small', text: 'Notifications are blocked for this site. Allow them in the browser’s settings.' }));
+  const toggle = h('input', { type: 'checkbox', role: 'switch', checked: push.subscribed || null, disabled: push.busy || !isLive() || null, 'aria-label': 'Notifications from your Mac', onchange: (e) => (e.target.checked ? pushOn() : pushOff()) });
+  return h(
+    'section',
+    { class: 'card' },
+    h('label', { class: 'row gap' }, icon('bell'), h('span', { class: 'grow' }, h('b', { text: 'Notifications' }), h('span', { class: 'muted small block', text: 'Review ready, export completed, failures. Sent by your Mac, readable only on this phone.' })), toggle),
+    !isLive() ? h('p', { class: 'muted small', text: 'Turning them on or off needs your Mac online.' }) : null,
+    push.subscribed && isLive() ? button('Send a test', { small: true, onclick: pushTest }) : null,
+  );
+}
+
+async function registration() {
+  if (!('serviceWorker' in navigator)) return null;
+  await navigator.serviceWorker.register('/sw.js');
+  return navigator.serviceWorker.ready;
+}
+
+function urlBase64(text) {
+  return Uint8Array.from(atob(text.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(text.length / 4) * 4, '=')), (c) => c.charCodeAt(0));
+}
+
+async function pushOn() {
+  const key = snap()?.pushKey;
+  if (!key || !isLive()) return toast('Your Mac isn’t connected. Try again once it’s online.');
+  push.busy = true;
+  sheetUpdate?.();
+  try {
+    if ((await Notification.requestPermission()) !== 'granted') throw new Error('Notifications weren’t allowed.');
+    const reg = await registration();
+    const want = urlBase64(key);
+    let sub = await reg.pushManager.getSubscription();
+    const have = sub?.options?.applicationServerKey ? new Uint8Array(sub.options.applicationServerKey) : null;
+    if (sub && have && (have.length !== want.length || have.some((b, i) => b !== want[i]))) {
+      await sub.unsubscribe();
+      sub = null;
+    }
+    sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: want });
+    const json = sub.toJSON();
+    const r = await core.command('push.subscribe', { endpoint: json.endpoint, keys: json.keys, prefs: saved.prefs.notify });
+    if (!r || r.t === 'error') throw new Error(r?.message ?? 'Your Mac isn’t connected.');
+    push.subscribed = true;
+    toast('Notifications are on.');
+  } catch (e) {
+    toast(e instanceof Error ? e.message : String(e));
+  } finally {
+    push.busy = false;
+    sheetUpdate?.();
+  }
+}
+
+async function pushOff() {
+  const reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null;
+  const sub = await reg?.pushManager.getSubscription();
+  push.busy = true;
+  sheetUpdate?.();
+  try {
+    if (sub) {
+      await core.command('push.unsubscribe', { endpoint: sub.endpoint }).catch(() => null);
+      await sub.unsubscribe();
+    }
+    push.subscribed = false;
+  } finally {
+    push.busy = false;
+    sheetUpdate?.();
+  }
+}
+
+async function pushTest() {
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = await reg?.pushManager.getSubscription();
+  if (!sub) return;
+  const r = await core.command('push.test', { endpoint: sub.endpoint });
+  toast(r && r.t !== 'error' ? 'Test sent. It should arrive in a moment.' : (r?.message ?? 'Your Mac isn’t connected.'));
+}
+
+async function pushInit() {
+  try {
+    if (pushSupport() !== 'ok') return;
+    const reg = await navigator.serviceWorker.getRegistration();
+    push.subscribed = Boolean(await reg?.pushManager.getSubscription());
+  } catch {}
+}
+
+/** Asked at a moment it's useful (after starting an export or sending an instruction), once. */
+function maybeAskForNotifications(why) {
+  if (saved.prefs.askedNotify || push.subscribed || pushSupport() !== 'ok' || !isLive()) return;
+  saved.prefs.askedNotify = true;
+  core.persist();
+  sheet(
+    'Get notified?',
+    h(
+      'div',
+      { class: 'stack' },
+      h('p', { text: why === 'export' ? 'Your Mac can tell you when this export is ready, even with this app closed.' : 'Your Mac can tell you when the agent’s proposal is ready to review, even with this app closed.' }),
+      button('Turn on notifications', { kind: 'mint', full: true, iconName: 'bell', onclick: () => (closeSheet(), pushOn()) }),
+      button('Not now', { kind: 'ghost', full: true, onclick: closeSheet }),
+    ),
+  );
+}
+
+// ── pairing (onboarding) ────────────────────────────────────────────────────
+const pairState = { step: 'code', code: '', busy: false, error: null, answer: null };
+
+function pairScreen(r) {
+  if (r.code && !pairState.code && pairState.step === 'code') pairState.code = formatCode(r.code);
+  const steps = ['Turn on Remote Access', 'Scan or enter the code', 'Confirm', 'Connected'];
+  const at = { code: 1, confirm: 2, done: 4 }[pairState.step] ?? 1;
+  const stepper = h('ol', { class: 'onboard-steps', 'aria-label': 'Pairing steps' }, steps.map((s, i) => h('li', { class: i < at ? 'done' : i === at ? 'active' : '', 'aria-current': i === at ? 'step' : null }, h('span', { class: 'n', text: String(i + 1) }), h('span', { text: s }))));
+  const titleText = pairState.step === 'done' ? 'You’re connected' : saved.pairings.length ? 'Pair another Mac' : 'Direct your Mac from here';
+  const intro = [h('h1', { class: 'title', text: titleText }), h('p', { class: 'muted', text: 'Your Mac edits. This phone sends instructions, reviews versions and starts exports. Pairing takes a minute.' }), stepper];
+  if (live.revoked && pairState.step === 'code') intro.push(h('section', { class: 'card notice warn' }, h('p', { text: `${pairing()?.macName ?? 'Your Mac'} no longer accepts this phone. Pair again with a new code.` })));
+
+  if (pairState.step === 'confirm') {
+    const a = pairState.answer;
+    return [
+      ...intro,
+      h(
+        'section',
+        { class: 'card' },
+        h('div', { class: 'row gap' }, icon('monitor', { size: 28 }), h('div', {}, h('b', { text: `Pair with ${a.payload.macName}?` }), h('p', { class: 'muted small', text: `This phone will show up on the Mac as “${a.deviceName}”. You can remove it there at any time.` }))),
+        h('div', { class: 'row gap mt' }, button('Pair', { kind: 'mint', iconName: 'check', disabled: pairState.busy, onclick: confirmPair }), button('Cancel', { kind: 'ghost', onclick: () => Object.assign(pairState, { step: 'code', answer: null, code: '' }) && render() })),
+        pairState.error ? h('p', { class: 'error-text small mt', text: pairState.error }) : null,
+      ),
+    ];
+  }
+  if (pairState.step === 'done') {
+    const p = pairing();
+    return [
+      ...intro,
+      h(
+        'section',
+        { class: 'card' },
+        h('div', { class: 'row gap ok-text' }, icon('checkCircle', { size: 28 }), h('div', {}, h('b', { class: 'text', text: `Connected to ${p?.macName}` }), h('p', { class: 'muted small', text: core.status().live ? 'Your Mac is online.' : 'Paired. Waiting for your Mac to come online.' }))),
+        h('ul', { class: 'help' }, h('li', { text: 'ReelForge Engine runs in the background on your Mac, so this works with the editor window closed.' }), h('li', { text: 'On the Mac, turn on Start Engine at Login (Settings → Remote Access) so it’s there after a restart. macOS may ask you to allow it under System Settings → General → Login Items.' }), h('li', { text: 'A Mac that sleeps can’t be reached. Remote Ready keeps it awake while it’s on power.' })),
+        button('Open projects', { kind: 'primary', full: true, onclick: () => ((pairState.step = 'code'), go('#/projects')) }),
+      ),
+    ];
+  }
+  const input = h('input', {
+    class: 'field code',
+    type: 'text',
+    inputmode: 'text',
+    autocomplete: 'one-time-code',
+    autocapitalize: 'characters',
+    spellcheck: 'false',
+    placeholder: 'XXXX-XXXX-XXXX-XXXX',
+    'aria-label': 'Pairing code',
+    value: pairState.code,
+    oninput: (e) => (pairState.code = e.target.value),
+    onkeydown: (e) => e.key === 'Enter' && submitCode(),
+  });
+  return [
+    ...intro,
+    h('section', { class: 'card' }, h('h2', { text: '1 · On your Mac' }), h('p', { class: 'muted', text: 'Open ReelForge → Settings → Remote Access. Turn on Remote Access, then press Pair a phone. A QR code and a pairing code appear for 10 minutes.' })),
+    h(
+      'section',
+      { class: 'card' },
+      h('h2', { text: '2 · Here' }),
+      button('Scan QR code', { kind: 'mint', iconName: 'qr', full: true, onclick: openScanner }),
+      h('p', { class: 'muted small center', text: 'or type the code' }),
+      input,
+      h('div', { class: 'row gap' }, button('Paste', { small: true, onclick: pasteCode }), h('span', { class: 'grow' }), button(pairState.busy ? 'Pairing…' : 'Continue', { kind: 'primary', small: true, disabled: pairState.busy, onclick: () => submitCode() })),
+      pairState.error ? h('p', { class: 'error-text small', text: pairState.error }) : null,
+      h('p', { class: 'muted small', text: 'The code works once and expires. It isn’t a password: after pairing, this phone gets its own key, which your Mac can withdraw.' }),
+    ),
+    saved.pairings.length ? button('Back to projects', { kind: 'ghost', full: true, onclick: () => go('#/projects') }) : null,
+  ];
+}
+
+async function submitCode(text = pairState.code) {
+  const code = codeFromText(text);
+  if (!code) {
+    pairState.error = 'That isn’t a pairing code. It looks like ABCD-EFGH-JKMN-PQRS.';
+    return render();
+  }
+  pairState.busy = true;
+  pairState.error = null;
+  pairState.code = formatCode(code);
+  render();
+  try {
+    pairState.answer = await core.startPairing(code);
+    pairState.step = 'confirm';
+  } catch (e) {
+    pairState.error = e.message;
+  } finally {
+    pairState.busy = false;
+    render();
+  }
+}
+
+async function confirmPair() {
+  pairState.busy = true;
+  render();
+  try {
+    await core.confirmPairing(pairState.answer);
+    pairState.step = 'done';
+    pairState.answer = null;
+    pairState.code = '';
+    history.replaceState(null, '', '#/pair');
+  } catch (e) {
+    pairState.error = e.message;
+  } finally {
+    pairState.busy = false;
+    render();
+  }
+}
+
+async function pasteCode() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (codeFromText(text)) return submitCode(text);
+    pairState.error = 'The clipboard doesn’t hold a pairing code.';
+  } catch {
+    pairState.error = 'This browser didn’t allow reading the clipboard. Type the code instead.';
+  }
+  render();
+}
+
+// The camera stays on this phone: frames are read here by jsQR (vendor/, loaded only when asked for).
 let jsQRReady = null;
 function loadJsQR() {
   jsQRReady ??= new Promise((resolve, reject) => {
@@ -259,17 +1168,13 @@ function loadJsQR() {
     const s = document.createElement('script');
     s.src = '/vendor/jsQR.min.js';
     s.onload = () => (window.jsQR ? resolve(window.jsQR) : reject(new Error('jsQR missing')));
-    s.onerror = () => {
-      jsQRReady = null;
-      reject(new Error('Couldn’t load the QR reader'));
-    };
+    s.onerror = () => ((jsQRReady = null), reject(new Error('Couldn’t load the QR reader')));
     document.head.append(s);
   });
   return jsQRReady;
 }
 
 const scanner = { stream: null, raf: 0, el: null, warned: false };
-
 function closeScanner() {
   cancelAnimationFrame(scanner.raf);
   scanner.stream?.getTracks().forEach((t) => t.stop());
@@ -278,49 +1183,38 @@ function closeScanner() {
 }
 
 async function openScanner() {
-  if (!navigator.mediaDevices?.getUserMedia) return toast('This browser can’t use the camera here. Use Paste from Mac instead.');
+  if (!navigator.mediaDevices?.getUserMedia) return toast('This browser can’t use the camera here. Type the code instead.');
   closeScanner();
   const video = h('video', { class: 'scan-video', playsinline: true, muted: true, autoplay: true });
-  const status = h('p', { class: 'scan-status', text: 'Starting the camera…' });
-  scanner.el = h(
-    'div',
-    { class: 'scan', role: 'dialog', 'aria-label': 'Scan the pairing QR code' },
-    h('div', { class: 'scan-view' }, video, h('div', { class: 'scan-frame' })),
-    h('p', { class: 'scan-title', text: 'Point at the QR code in Settings → Phone remote on your Mac' }),
-    status,
-    h('button', { class: 'btn', type: 'button', onclick: closeScanner, text: 'Cancel' }),
-  );
+  const statusLine = h('p', { class: 'scan-status', text: 'Starting the camera…' });
+  scanner.el = h('div', { class: 'scan', role: 'dialog', 'aria-label': 'Scan the pairing QR code' }, h('div', { class: 'scan-view' }, video, h('div', { class: 'scan-frame' })), h('p', { class: 'scan-title', text: 'Point at the QR code in Settings → Remote Access on your Mac' }), statusLine, button('Cancel', { onclick: closeScanner }));
   document.body.append(scanner.el);
   try {
-    const [jsQR, stream] = await Promise.all([
-      loadJsQR(),
-      navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }),
-    ]);
-    if (!scanner.el) return stream.getTracks().forEach((t) => t.stop()); // cancelled while asking
+    const [jsQR, stream] = await Promise.all([loadJsQR(), navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false })]);
+    if (!scanner.el) return stream.getTracks().forEach((t) => t.stop());
     scanner.stream = stream;
     video.muted = true;
     video.srcObject = stream;
     await video.play();
-    status.textContent = 'Looking for the code…';
+    statusLine.textContent = 'Looking for the code…';
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const tick = () => {
       if (!scanner.stream) return;
       if (video.readyState >= 2 && video.videoWidth) {
-        // A smaller frame reads faster and the Mac's QR is large on screen.
         const scale = Math.min(1, 720 / Math.max(video.videoWidth, video.videoHeight));
         canvas.width = Math.round(video.videoWidth * scale);
         canvas.height = Math.round(video.videoHeight * scale);
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const code = jsQR(ctx.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height, { inversionAttempts: 'attemptBoth' });
         if (code?.data) {
-          if (secretFromText(code.data)) {
+          if (codeFromText(code.data)) {
             closeScanner();
-            return pairWith(code.data);
+            return submitCode(code.data);
           }
           if (!scanner.warned) {
             scanner.warned = true;
-            status.textContent = 'That QR code isn’t a ReelForge pairing code.';
+            statusLine.textContent = 'That QR code isn’t a ReelForge pairing code.';
           }
         }
       }
@@ -328,809 +1222,172 @@ async function openScanner() {
     };
     tick();
   } catch (err) {
-    const denied = err?.name === 'NotAllowedError' || err?.name === 'SecurityError';
-    closeScanner();
-    toast(denied ? 'Camera access was denied. Allow it for this app in Settings, or use Paste from Mac.' : `Couldn’t start the camera: ${err?.message ?? err}`);
+    statusLine.textContent = err?.name === 'NotAllowedError' ? 'Camera access was denied. Allow it in Settings, or type the code.' : `Couldn’t start the camera (${err?.message ?? err}).`;
   }
 }
 
-function macLine() {
-  const device = state.snapshot?.device;
-  return device
-    ? h('div', { class: 'sub' }, h('span', { class: 'name', text: device.name }), state.rtt !== null ? h('span', { text: ` · ${state.rtt} ms` }) : null)
-    : h('div', { class: 'sub', text: state.online ? 'Waiting for your Mac…' : 'Your Mac isn’t connected' });
-}
-
-function viewHome() {
-  const snap = state.snapshot;
-  const projects = snap?.projects ?? [];
-  const jobs = snap?.jobs ?? [];
-  const recent = snap?.recent ?? [];
-  const byId = new Map(projects.map((p) => [p.id, p]));
-  const pending = projects.filter((p) => p.pendingProposals > 0);
-
-  const jobCard = jobs.length
-    ? h(
-        'section',
-        { class: 'card', 'aria-label': 'Now on your Mac' },
-        h('div', { class: 'label', text: 'Now on your Mac' }),
-        jobs.map((j, i) =>
-          h(
-            'a',
-            { class: `job${i ? ' mt' : ''}`, href: `#/p/${j.projectId}` },
-            h('div', { class: 'between' }, h('b', { text: `${j.kind === 'export' ? 'Exporting' : 'Preview of'} “${byId.get(j.projectId)?.name ?? 'a project'}”` }), h('span', { class: 'mono', text: `${Math.round(j.progress * 100)}%` })),
-            bar(j.progress),
-            h('div', { class: 'muted mt', text: JOB_WORDS[j.state] ?? j.state }),
-          ),
-        ),
-      )
-    : null;
-
-  const needsYou = pending.length
-    ? h(
-        'section',
-        { class: 'card attention' },
-        h('div', { class: 'row' }, h('span', { class: 'pill wait' }, h('span', { class: 'dot' }), 'Needs you')),
-        pending.map((p) => h('a', { class: 'line mt', href: `#/p/${p.id}` }, h('b', { text: 'AI Director' }), ` proposed changes in “${p.name}”.`)),
-      )
-    : null;
-
-  const ready = recent.length
-    ? h(
-        'section',
-        { class: 'card', 'aria-label': 'Recent exports' },
-        h('div', { class: 'label', text: 'Recent exports' }),
-        recent.slice(0, 5).map((j) => {
-          const p = byId.get(j.projectId);
-          const pill = j.state === 'completed' ? h('span', { class: 'pill ok', text: 'Done' }) : j.state === 'failed' ? h('span', { class: 'pill err', text: 'Failed' }) : h('span', { class: 'pill', text: 'Cancelled' });
-          const meta = j.state === 'failed' ? j.error ?? 'Failed' : [ago(j.finishedAt), size(j.sizeBytes)].filter(Boolean).join(' · ');
-          return h(
-            'a',
-            { class: 'proj', href: `#/p/${j.projectId}` },
-            p ? thumb(p) : h('div', { class: 'thumb', 'aria-hidden': 'true' }),
-            h('div', { class: 'info' }, h('div', { class: 'n', text: p?.name ?? 'A project' }), h('div', { class: 'm', text: meta })),
-            h('div', { class: 'grow' }),
-            pill,
-          );
-        }),
-        h('p', { class: 'muted mt', text: 'Saved on your Mac in Exports.' }),
-      )
-    : null;
-
-  const latest = projects.slice(0, 3);
-  const list = h(
-    'section',
-    { class: 'card', 'aria-label': 'Recent projects' },
-    h('div', { class: 'between' }, h('div', { class: 'label', text: 'Recent projects' }), projects.length > latest.length ? h('a', { class: 'link', href: '#/projects', text: `All ${projects.length}` }) : null),
-    !snap ? h('p', { class: 'empty', text: state.online ? 'Loading…' : 'Shown once your Mac connects.' }) : projects.length === 0 ? h('p', { class: 'empty', text: 'No projects yet.' }) : latest.map(projectRow),
-  );
-
-  return [header('Home', macLine()), h('main', { class: 'body' }, jobCard, needsYou, ready, list), tabs('home')];
-}
-
-function viewProjects() {
-  const snap = state.snapshot;
-  const projects = snap?.projects ?? [];
-  return [
-    header('Projects', h('div', { class: 'sub', text: snap ? plural(projects.length, 'project') : '' })),
-    h(
-      'main',
-      { class: 'body' },
-      h(
-        'section',
-        { class: 'card', 'aria-label': 'Projects' },
-        !snap ? h('p', { class: 'empty', text: state.online ? 'Loading…' : 'Shown once your Mac connects.' }) : projects.length === 0 ? h('p', { class: 'empty', text: 'No projects yet. Create one on your Mac.' }) : projects.map(projectRow),
-      ),
-    ),
-    tabs('projects'),
-  ];
-}
-
-function lanes(d) {
-  const total = Math.max(d.durationFrames, 1);
-  const shown = d.tracks.filter((t) => t.clips.length > 0);
-  if (!shown.length) return h('p', { class: 'empty', text: 'The timeline is empty.' });
-  return h(
-    'div',
-    { class: 'lanes', 'aria-label': 'Timeline (read-only)' },
-    shown.map((t) =>
-      h(
-        'div',
-        { class: `lane ${t.kind}${t.hidden || t.muted ? ' off' : ''}`, title: t.name },
-        t.clips.map((c) => {
-          const s = h('span');
-          s.style.left = `${(c.start / total) * 100}%`;
-          s.style.width = `${Math.max((c.duration / total) * 100, 0.8)}%`;
-          return s;
-        }),
-      ),
-    ),
-  );
-}
-
-function viewProject(id) {
-  const summary = (state.snapshot?.projects ?? []).find((p) => p.id === id);
-  const d = state.details.get(id);
-  const live = (state.snapshot?.jobs ?? []).filter((j) => j.projectId === id);
-  const title = d?.name ?? summary?.name ?? 'Project';
-  const sub = h('div', { class: 'sub', text: d ? `rev ${d.revision} · ${d.width}×${d.height} · ${d.fps} fps` : summary ? `${summary.width}×${summary.height} · ${summary.fps} fps` : '' });
-  if (!d) {
-    const missing = state.snapshot && !summary;
-    return [header(title, sub, { back: '#/projects' }), h('main', { class: 'body' }, h('p', { class: 'empty', text: missing ? 'This project isn’t on your Mac any more.' : state.online ? 'Loading…' : 'Shown once your Mac connects.' })), tabs('projects')];
+// ── menus per page ──────────────────────────────────────────────────────────
+function pageMenu(r) {
+  const items = [];
+  const st = core.status();
+  if (r.name === 'session' && r.id) {
+    const p = projectById(r.id);
+    const d = detailOf(r.id);
+    items.push(['director', `Model: ${modelLabel(r.id)}`, () => modelSheet(r.id)]);
+    if (st.live && d) {
+      if (d.canUndo) items.push(['history', 'Undo last change on the Mac', () => history_(r.id, 'undo', p.revision)]);
+      if (d.canRedo) items.push(['refresh', 'Redo', () => history_(r.id, 'redo', p.revision)]);
+      items.push(['film', 'Render a new preview', () => startPreview(r.id)]);
+    }
+    items.push(['projects', 'Switch project', chooseProjectSheet]);
   }
-
-  const poster = state.posters.get(id);
-  const shape = d.width > d.height ? 'landscape' : d.width === d.height ? 'square' : 'portrait';
-  const posterEl = h(
-    'div',
-    { class: `poster ${shape}` },
-    poster?.url ? h('img', { src: poster.url, alt: `Poster frame of ${d.name}` }) : null,
-    h('span', { class: 'pill fmt', text: aspect(d.width, d.height) }),
-    h('span', { class: 'mono tc', text: length(d.durationFrames, d.fps) }),
-  );
-
-  const tracksWithClips = d.tracks.filter((t) => t.clips.length > 0).length;
-  const timeline = h(
-    'section',
-    { class: 'card', 'aria-label': 'Timeline' },
-    lanes(d),
-    h(
-      'div',
-      { class: 'between mt muted' },
-      h('span', { text: [plural(d.clips, 'clip'), plural(tracksWithClips, 'track'), d.captions ? 'captions on' : null].filter(Boolean).join(' · ') }),
-    ),
-    h(
-      'div',
-      { class: 'grid2 mt' },
-      h('button', { class: 'btn sm', type: 'button', disabled: !state.online || !d.canUndo || waiting('history', id), onclick: () => undoRedo(id, 'undo'), text: 'Undo' }),
-      h('button', { class: 'btn sm', type: 'button', disabled: !state.online || !d.canRedo || waiting('history', id), onclick: () => undoRedo(id, 'redo'), text: 'Redo' }),
-    ),
-  );
-
-  const media = [d.assets.video && plural(d.assets.video, 'video'), d.assets.image && plural(d.assets.image, 'image'), d.assets.audio && `${d.assets.audio} audio`].filter(Boolean).join(' · ');
-  const facts = h(
-    'section',
-    { class: 'card' },
-    h('div', { class: 'kv' }, h('span', { text: 'Length' }), h('b', { text: length(d.durationFrames, d.fps) })),
-    h('div', { class: 'kv' }, h('span', { text: 'Media' }), h('b', { text: media || 'None yet' })),
-    d.assets.offline ? h('div', { class: 'kv' }, h('span', { text: 'Offline' }), h('b', { class: 'warn', text: `${plural(d.assets.offline, 'file')} to relink on your Mac` })) : null,
-    h('div', { class: 'kv' }, h('span', { text: 'Edited' }), h('b', { text: ago(d.updatedAt) })),
-  );
-
-  const director = viewDirector(d);
-
-  const jobs = d.jobs.length
-    ? h(
-        'section',
-        { class: 'card', 'aria-label': 'Renders' },
-        h('div', { class: 'label', text: 'Renders' }),
-        d.jobs.map((j, i) => {
-          const now = live.find((x) => x.id === j.id);
-          const active = now || ['queued', 'analyzing', 'rendering', 'muxing'].includes(j.state);
-          const st = now?.state ?? j.state;
-          const pill = active ? h('span', { class: 'pill run' }, h('span', { class: 'dot' }), `${Math.round((now?.progress ?? j.progress) * 100)}%`) : st === 'completed' ? h('span', { class: 'pill ok', text: 'Done' }) : st === 'failed' ? h('span', { class: 'pill err', text: 'Failed' }) : h('span', { class: 'pill', text: JOB_WORDS[st] ?? st });
-          const meta = active ? JOB_WORDS[st] ?? st : st === 'failed' ? j.error ?? 'Failed' : [ago(j.finishedAt ?? j.createdAt), size(j.sizeBytes)].filter(Boolean).join(' · ');
-          return h(
-            'div',
-            { class: `jobrow${i ? ' sep' : ''}` },
-            h('div', { class: 'between' }, h('b', { text: j.kind === 'export' ? 'Export' : 'Preview' }), pill),
-            active ? bar(now?.progress ?? j.progress) : null,
-            h('div', { class: 'muted mt', text: meta }),
-          );
-        }),
-      )
-    : null;
-
-  return [header(title, sub, { back: '#/projects' }), h('main', { class: 'body' }, posterEl, director, timeline, jobs, facts), tabs('projects')];
+  if (r.name === 'review') items.push(['history', 'Version history', () => versionHistorySheet(projectById(r.id), detailOf(r.id))]);
+  items.push(['refresh', 'Refresh from the Mac', () => (st.live ? core.command('sync', {}, { wait: false }) : core.connect())]);
+  items.push(['monitor', 'Device & pairing', openDeviceSheet]);
+  sheet('Actions', h('div', { class: 'list' }, items.map(([ic, label, fn]) => h('button', { class: 'option', type: 'button', onclick: () => (closeSheet(), fn()) }, icon(ic), h('span', { class: 'grow', text: label })))));
 }
 
-// ── AI Director ────────────────────────────────────────────────────────────
-const PROVIDER_ORDER = ['anthropic', 'claude-code', 'codex', 'ollama'];
-
-function aiOf(projectId) {
-  let a = state.ai.get(projectId);
-  if (!a) state.ai.set(projectId, (a = { options: null, draft: '', error: null, asked: false }));
-  return a;
+async function history_(projectId, action, baseRevision) {
+  const r = await core.command(action, { projectId, baseRevision });
+  if (!r) return toast('Your Mac isn’t connected.');
+  if (r.t === 'error') return toast(r.code === 'REVISION_CONFLICT' ? 'The timeline just changed on your Mac. Try again.' : r.message);
+  toast(action === 'undo' ? 'Undone on your Mac.' : 'Redone on your Mac.');
+  core.openProject(projectId, true);
 }
 
-/** The model to ask: the one picked on this phone, else what the project used last, else the first that works. */
-function choiceFor(a) {
-  const providers = a.options?.providers ?? [];
-  const usable = (c) => c && providers.some((p) => p.id === c.provider && p.ready && p.models.includes(c.model));
-  let saved = null;
-  try {
-    saved = JSON.parse(localStorage.getItem(MODEL_KEY) ?? 'null');
-  } catch {}
-  if (usable(saved)) return saved;
-  if (usable(a.options?.last)) return a.options.last;
-  const first = PROVIDER_ORDER.map((id) => providers.find((p) => p.id === id && p.ready)).find(Boolean);
-  return first ? { provider: first.id, model: first.defaultModel ?? first.models[0] } : null;
+function modelLabel(projectId) {
+  const p = pairing();
+  const choice = saved.prefs.model[`${p?.macId}:${projectId}`] ?? saved.prefs.model[p?.macId];
+  if (choice) return choice.model;
+  const o = live.aiOptions.get(projectId);
+  return o?.last?.model ?? 'Mac’s default';
 }
 
-function waiting(kind, target) {
-  for (const b of state.busy.values()) if (b.kind === kind && b.target === target) return true;
-  return false;
-}
-
-function since(iso) {
-  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
-
-const CHANGE_WORDS = { added: 'Add', removed: 'Remove', changed: 'Change' };
-
-function proposalCard(x, i) {
-  const deciding = waiting('apply', x.id) || waiting('reject', x.id);
-  const changes = x.list.map((c) =>
-    h(
-      'li',
-      {},
-      h('b', { text: `${CHANGE_WORDS[c.kind] ?? c.kind} ${c.target} ` }),
-      h('span', { text: c.label }),
-      c.before || c.after ? h('div', { class: 'muted mono', text: [c.before, c.after].filter(Boolean).join(' → ') }) : null,
-    ),
-  );
-  return h(
-    'div',
-    { class: `proposal${i ? ' sep' : ''}` },
-    x.requestedBy === 'mcp' ? h('div', { class: 'muted', text: 'Asked by an assistant connected to ReelForge' }) : null,
-    h('div', { class: 'bubble', text: x.instruction }),
-    h('p', { class: 'mt', text: x.summary }),
-    x.warnings.map((w) => h('p', { class: 'muted warn mt', text: w })),
-    changes.length ? h('ul', { class: 'changes mt' }, changes, x.changes > x.list.length ? h('li', { class: 'muted', text: `and ${x.changes - x.list.length} more` }) : null) : null,
-    h('div', { class: 'muted mt', text: `${plural(x.changes, 'change')} · ${x.model} · ${ago(x.createdAt)}` }),
-    x.stale
-      ? h(
-          'div',
-          {},
-          h('p', { class: 'muted warn mt', text: 'The timeline changed after this was made, so it can’t be applied. Ask again.' }),
-          h('button', { class: 'btn sm mt', type: 'button', disabled: !state.online || deciding, onclick: () => decide(x.id, 'reject'), text: 'Dismiss' }),
-        )
-      : h(
-          'div',
-          { class: 'grid2 mt' },
-          h('button', { class: 'btn sm', type: 'button', disabled: !state.online || deciding, onclick: () => decide(x.id, 'reject'), text: 'Reject' }),
-          h('button', { class: 'btn sm mint', type: 'button', disabled: !state.online || deciding, onclick: () => decide(x.id, 'apply'), text: waiting('apply', x.id) ? 'Applying…' : 'Apply' }),
-        ),
-  );
-}
-
-function viewDirector(d) {
-  const a = aiOf(d.id);
-  const pending = d.proposals.filter((x) => x.status === 'pending');
-  const providers = a.options?.providers ?? [];
-  const choice = choiceFor(a);
-  const chosen = providers.find((p) => p.id === choice?.provider);
-
-  let compose;
-  if (d.asking) {
-    compose = h(
-      'div',
-      { class: 'asking' },
-      h('div', { class: 'bubble', text: d.asking.instruction }),
-      h('div', { class: 'between mt' }, h('span', { class: 'pill run' }, h('span', { class: 'dot' }), `Planning · ${since(d.asking.startedAt)}`), h('span', { class: 'muted', text: d.asking.model })),
-      h('button', { class: 'btn sm mt', type: 'button', disabled: !state.online || waiting('cancel', d.id), onclick: () => cancelAsk(d.id), text: 'Cancel' }),
-    );
-  } else {
-    const groups = providers.map((p) =>
-      h(
-        'optgroup',
-        { label: p.ready ? p.label : `${p.label} (not set up on your Mac)` },
-        p.models.map((m) => h('option', { value: `${p.id}|${m}`, disabled: !p.ready, selected: choice && choice.provider === p.id && choice.model === m, text: m })),
-      ),
-    );
-    const box = h('textarea', {
-      class: 'ask-input',
-      rows: 3,
-      maxlength: 4000,
-      placeholder: 'What should change? e.g. “Cut the silences” or “Zoom in slowly on the last clip”',
-      'aria-label': 'Instruction for the AI Director',
-      'data-keep': true,
-      disabled: !state.online,
-      oninput: (e) => (a.draft = e.target.value),
-      onblur: settle,
-    });
-    box.value = a.draft;
-    const select = h(
-      'select',
-      {
-        class: 'ask-model',
-        'aria-label': 'Model',
-        'data-keep': true,
-        disabled: !state.online || !providers.length,
-        onblur: settle,
-        onchange: (e) => {
-          const [provider, model] = e.target.value.split('|');
-          localStorage.setItem(MODEL_KEY, JSON.stringify({ provider, model }));
-          a.error = null;
-          render();
-        },
-      },
-      providers.length ? groups : h('option', { text: a.options ? 'No models on your Mac' : 'Loading models…' }),
-    );
-    const blocked = chosen && chosen.external && !chosen.consented;
-    compose = h(
-      'div',
-      {},
-      box,
-      h('div', { class: 'row mt' }, select, h('button', { class: 'btn sm mint', type: 'button', disabled: !state.online || !choice || waiting('ask', d.id), onclick: () => ask(d.id), text: 'Send' })),
-      blocked ? h('p', { class: 'muted mt', text: `The first time, allow ${chosen.label} to read this project in AI Director on your Mac — or pick a Local model.` }) : null,
-      a.error ? h('p', { class: 'muted warn mt', text: a.error }) : null,
-    );
-  }
-
-  return h(
-    'section',
-    { class: `card${pending.length ? ' attention' : ''}`, 'aria-label': 'AI Director' },
-    h('div', { class: 'label', text: 'AI Director' }),
-    pending.map(proposalCard),
-    h('div', { class: pending.length ? 'compose sep' : 'compose' }, compose),
-  );
-}
-
-/** Sends a command whose answer this page waits for; `busy` marks what it is about (buttons go grey). */
-async function act(type, fields, busy) {
-  const id = crypto.randomUUID();
-  state.mine.add(id);
-  if (busy) state.busy.set(id, busy);
-  render();
-  const ok = await command(type, { id, ...fields }).catch(() => false);
-  if (!ok) {
-    state.busy.delete(id);
-    toast('Couldn’t reach the relay. Check your connection.');
+function modelSheet(projectId) {
+  const o = live.aiOptions.get(projectId);
+  const p = pairing();
+  const key = `${p.macId}:${projectId}`;
+  const current = saved.prefs.model[key] ?? saved.prefs.model[p.macId] ?? null;
+  const set = (choice) => {
+    if (choice) saved.prefs.model[key] = saved.prefs.model[p.macId] = choice;
+    else delete saved.prefs.model[key];
+    core.persist();
+    closeSheet();
     render();
+  };
+  const rows = [h('button', { class: `option${!current ? ' on' : ''}`, type: 'button', onclick: () => set(null) }, h('span', { class: 'grow' }, h('b', { text: 'Mac’s default' }), h('span', { class: 'muted small block', text: 'The model this project used last on the Mac.' })), !current ? icon('check', { size: 18 }) : null)];
+  // Usable here and now first: local models, then providers already allowed for this project.
+  const rank = (x) => (!x.ready ? 3 : !x.external ? 0 : x.consented ? 1 : 2);
+  for (const prov of [...(o?.providers ?? [])].sort((a, b) => rank(a) - rank(b))) {
+    for (const model of prov.models) {
+      const on = current?.provider === prov.id && current?.model === model;
+      const note = !prov.ready ? 'Not set up on the Mac' : prov.external && !prov.consented ? 'Needs your OK on the Mac for this project' : prov.external ? 'Sends project context to the provider' : 'Runs on your Mac';
+      rows.push(h('button', { class: `option${on ? ' on' : ''}`, type: 'button', disabled: !prov.ready || null, onclick: () => set({ provider: prov.id, model }) }, h('span', { class: 'grow' }, h('b', { text: model }), h('span', { class: 'muted small block', text: `${prov.label} · ${note}` })), on ? icon('check', { size: 18 }) : null));
+    }
   }
-  return id;
+  if (!o) rows.push(h('p', { class: 'muted small', text: isLive() ? 'Loading the Mac’s models…' : 'The list of models comes from your Mac. Until then, the Mac’s default is used.' }));
+  sheet('Model', h('div', { class: 'list' }, rows));
 }
 
-function ask(projectId) {
-  const a = aiOf(projectId);
-  const choice = choiceFor(a);
-  const instruction = a.draft.trim();
-  if (!instruction) return toast('Write what to change first.');
-  if (!choice) return toast('Pick a model first.');
-  a.error = null;
-  document.activeElement?.blur?.();
-  act('ai.ask', { projectId, instruction, provider: choice.provider, model: choice.model }, { kind: 'ask', target: projectId });
+// ── toast ───────────────────────────────────────────────────────────────────
+let toastTimer;
+function toast(text, kind = 'info') {
+  toastEl.textContent = text;
+  toastEl.className = `toast ${kind}`;
+  toastEl.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (toastEl.hidden = true), 3800);
 }
+core.onNotice(toast);
 
-function cancelAsk(projectId) {
-  act('ai.cancel', { projectId }, { kind: 'cancel', target: projectId });
-}
-
-function decide(proposalId, action) {
-  act(`proposal.${action}`, { proposalId }, { kind: action, target: proposalId });
-}
-
-function undoRedo(projectId, action) {
-  const d = state.details.get(projectId);
-  if (d) act(action, { projectId, baseRevision: d.revision }, { kind: 'history', target: projectId });
-}
-
-// Rebuilding the page while someone types would close the keyboard: wait until they leave the field.
-let renderLater = false;
-function settle() {
-  // A tap on Send blurs the box first; give the tap time to land before the buttons are rebuilt.
-  setTimeout(() => {
-    if (renderLater) render();
-  }, 300);
-}
-
-function pushSupport() {
-  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
-  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
-    return ios && !standalone ? 'install' : 'unsupported';
-  }
-  if (Notification.permission === 'denied') return 'denied';
-  return 'ok';
-}
-
-function prefs() {
-  try {
-    return { exports: true, proposals: true, failures: true, ...JSON.parse(localStorage.getItem(PREFS_KEY) ?? '{}') };
-  } catch {
-    return { exports: true, proposals: true, failures: true };
-  }
-}
-
-function viewSettings() {
-  const device = state.snapshot?.device;
-  const support = pushSupport();
-  const p = prefs();
-  const toggle = (name, label) =>
-    h(
-      'label',
-      { class: 'check' },
-      h('input', {
-        type: 'checkbox',
-        checked: p[name],
-        disabled: state.push.busy,
-        onchange: (e) => {
-          localStorage.setItem(PREFS_KEY, JSON.stringify({ ...prefs(), [name]: e.target.checked }));
-          if (state.push.subscribed) pushOn();
-        },
-      }),
-      h('span', { text: label }),
-    );
-
-  let notify;
-  if (support === 'install') notify = h('p', { class: 'muted', text: 'On iPhone, notifications need the app on your Home Screen: tap Share → Add to Home Screen, then open ReelForge from there.' });
-  else if (support === 'unsupported') notify = h('p', { class: 'muted', text: 'This browser can’t show notifications.' });
-  else if (support === 'denied') notify = h('p', { class: 'muted', text: 'Notifications are blocked for this site. Allow them in your browser’s settings, then come back.' });
-  else
-    notify = h(
-      'div',
-      {},
-      h('p', { class: 'muted', text: 'Sent by your Mac, encrypted for this phone. Your Mac has to be on and running ReelForge.' }),
-      h('div', { class: 'checks mt' }, toggle('exports', 'An export is ready'), toggle('failures', 'An export failed'), toggle('proposals', 'The AI Director has a proposal')),
-      state.push.subscribed
-        ? h('div', { class: 'grid2 mt' }, h('button', { class: 'btn sm', type: 'button', disabled: state.push.busy, onclick: () => pushTest(), text: 'Send a test' }), h('button', { class: 'btn sm', type: 'button', disabled: state.push.busy, onclick: () => pushOff(), text: 'Turn off' }))
-        : h('button', { class: 'btn mint mt', type: 'button', disabled: state.push.busy || !state.push.ready, onclick: () => pushOn(), text: 'Turn on notifications' }),
-    );
-
-  return [
-    header('Settings', h('div', { class: 'sub', text: 'This phone' })),
-    h(
-      'main',
-      { class: 'body' },
-      h(
-        'section',
-        { class: 'card' },
-        h('div', { class: 'label', text: 'Your Mac' }),
-        h('div', { class: 'kv' }, h('span', { text: 'Name' }), h('b', { text: device?.name ?? '—' })),
-        h('div', { class: 'kv' }, h('span', { text: 'ReelForge' }), h('b', { text: device?.version ?? '—' })),
-        h('div', { class: 'kv' }, h('span', { text: 'Round trip' }), h('b', { text: state.rtt !== null ? `${state.rtt} ms` : '—' })),
-      ),
-      h('section', { class: 'card' }, h('div', { class: 'label', text: 'Notifications' }), notify),
-      h(
-        'section',
-        { class: 'card' },
-        h('div', { class: 'label', text: 'Pairing' }),
-        h('p', { class: 'muted', text: 'Unpairing forgets the key on this phone. To lock out every phone, make a new pairing on your Mac.' }),
-        h('button', { class: 'btn mt', type: 'button', onclick: () => confirm('Forget this pairing on this phone?') && unpair(), text: 'Unpair this phone' }),
-      ),
-    ),
-    tabs('settings'),
-  ];
-}
-
+// ── rendering ───────────────────────────────────────────────────────────────
+let lastRoute = '';
 function render() {
-  const focused = document.activeElement;
-  if (focused instanceof HTMLElement && focused.hasAttribute('data-keep') && app.contains(focused)) {
-    renderLater = true;
+  const r = route();
+  if (!saved.pairings.length || r.name === 'pair') {
+    document.body.dataset.screen = 'pair';
+    app.replaceChildren(header({ back: saved.pairings.length ? '#/projects' : null }), h('main', { class: 'page' }, pairScreen(r)));
     return;
   }
-  renderLater = false;
-  if (state.problem === 'unpaired' || !state.token) return app.replaceChildren(viewUnpaired(state.problem));
-  const r = route();
-  const view = r.name === 'project' ? viewProject(r.id) : r.name === 'projects' ? viewProjects() : r.name === 'settings' ? viewSettings() : viewHome();
-  app.replaceChildren(...view);
-}
-
-// ── relay ──────────────────────────────────────────────────────────────────
-async function command(type, fields = {}) {
-  const c = await seal(state.key, { id: crypto.randomUUID(), at: Date.now(), type, ...fields });
-  const res = await fetch('/api/command', { method: 'POST', headers: { authorization: `Bearer ${state.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ c }) });
-  return res.ok;
-}
-
-async function blob(id) {
-  const res = await fetch(`/api/blob?id=${encodeURIComponent(id)}`, { headers: { authorization: `Bearer ${state.token}` }, cache: 'no-store' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return unseal(state.key, (await res.json()).c);
-}
-
-let pingAt = 0;
-async function ping() {
-  if (!state.online) return;
-  pingAt = performance.now();
-  await command('ping').catch(() => {});
-}
-
-// Posters are asked for one at a time, and again only when the project changed since.
-const posterQueue = [];
-let posterBusy = null; // { projectId, done }
-function wantPoster(p) {
-  const have = state.posters.get(p.id);
-  if ((have && have.revision === p.revision) || posterQueue.includes(p.id) || posterBusy?.projectId === p.id) return;
-  posterQueue.push(p.id);
-  nextPoster();
-}
-async function nextPoster() {
-  if (posterBusy || !state.online) return;
-  const projectId = posterQueue.shift();
-  if (!projectId) return;
-  const revision = (state.snapshot?.projects ?? []).find((p) => p.id === projectId)?.revision;
-  await new Promise((resolve) => {
-    const timer = setTimeout(resolve, 20_000);
-    posterBusy = { projectId, revision, done: () => (clearTimeout(timer), resolve()) };
-    command('poster', { projectId }).then((ok) => ok || posterBusy?.done());
-  });
-  posterBusy = null;
-  nextPoster();
-}
-async function gotPoster(ev) {
-  const busy = posterBusy?.projectId === ev.projectId ? posterBusy : null;
-  try {
-    const old = state.posters.get(ev.projectId);
-    const revision = busy?.revision ?? old?.revision ?? null;
-    if (!ev.blob) state.posters.set(ev.projectId, { key: null, url: null, revision });
-    else if (old?.key === ev.key && old.url) state.posters.set(ev.projectId, { ...old, revision });
-    else {
-      const file = await blob(ev.blob);
-      const url = URL.createObjectURL(new Blob([fromBase64(file.data)], { type: file.type }));
-      if (old?.url) URL.revokeObjectURL(old.url);
-      state.posters.set(ev.projectId, { key: ev.key, url, revision });
-    }
-  } catch {
-    // the file expired or the relay restarted: asked again next time
-  } finally {
-    busy?.done();
+  document.body.dataset.screen = r.name;
+  const back = r.name === 'review' ? `#/session/${r.id}` : null;
+  let content;
+  if (r.name === 'session') content = sessionScreen(r);
+  else if (r.name === 'review') content = reviewScreen(r);
+  else if (r.name === 'exports') content = exportsScreen();
+  else content = projectsScreen();
+  const routeKey = location.hash;
+  const page = h('main', { class: 'page', id: 'main' }, content);
+  const sessionId = r.name === 'session' ? (r.id ?? lastProjectId()) : null;
+  app.replaceChildren(
+    ...[
+      header({ back, menu: () => pageMenu({ ...r, id: r.id ?? sessionId }) }),
+      connectionStrip(),
+      page,
+      sessionId && projectById(sessionId) ? composer(sessionId) : null,
+      dock(r.name === 'review' ? 'session' : r.name),
+    ].filter(Boolean),
+  );
+  if (routeKey !== lastRoute) {
+    lastRoute = routeKey;
+    window.scrollTo(0, 0);
   }
+  sheetUpdate && sheetIsOpen() ? sheetUpdate() : null;
 }
 
-// The open project's detail is asked for on arrival and whenever the Mac says it changed.
-let openAsked = { id: null, revision: null, at: 0 };
-function refreshOpenProject(force = false) {
-  const r = route();
-  if (r.name !== 'project' || !state.online) return;
-  const summary = (state.snapshot?.projects ?? []).find((p) => p.id === r.id);
-  if (summary) wantPoster(summary);
-  // Asked again when the timeline changes, a render starts, or one ends.
-  const running = (state.snapshot?.jobs ?? []).filter((j) => j.projectId === r.id).map((j) => j.id);
-  const ended = (state.snapshot?.recent ?? []).filter((j) => j.projectId === r.id).length;
-  const stamp = `${summary?.revision ?? null}:${summary?.pendingProposals ?? 0}:${running.join(',')}:${ended}`;
-  const a = aiOf(r.id);
-  if (!a.asked) {
-    a.asked = true;
-    command('ai.options', { projectId: r.id }).catch(() => (a.asked = false));
-  }
-  if (!force && openAsked.id === r.id && openAsked.revision === stamp && Date.now() - openAsked.at < 60_000) return;
-  openAsked = { id: r.id, revision: stamp, at: Date.now() };
-  command('project.open', { projectId: r.id }).catch(() => {});
-}
-
-function afterSnapshot() {
-  const projects = state.snapshot?.projects ?? [];
-  for (const p of projects.slice(0, 30)) wantPoster(p);
-  refreshOpenProject();
-}
-
-async function onEvent(name, data) {
-  if (name === 'agent') {
-    const was = state.online;
-    state.online = Boolean(data.online);
-    if (state.online && !was) {
-      setTimeout(ping, 300);
-      nextPoster();
-    }
-  } else if (name === 'reset') {
-    state.snapshot = null;
-  } else if (name === 'entry') {
-    state.since = data.seq;
-    let ev;
-    try {
-      ev = await unseal(state.key, data.c);
-    } catch {
-      return; // not sealed with our key
-    }
-    if (ev.t === 'snapshot') {
-      state.snapshot = ev;
-      afterSnapshot();
-    } else if (ev.t === 'jobs' && state.snapshot) {
-      state.snapshot = { ...state.snapshot, jobs: ev.jobs };
-      refreshOpenProject();
-    } else if (ev.t === 'project') state.details.set(ev.project.id, ev.project);
-    else if (ev.t === 'poster') await gotPoster(ev);
-    else if (ev.t === 'push') {
-      if (ev.tested) toast('Test sent. It should arrive in a moment.');
-    } else if (ev.t === 'pong' && pingAt) {
-      state.rtt = Math.round(performance.now() - pingAt);
-      pingAt = 0;
-    } else if (ev.t === 'ai.options') {
-      aiOf(ev.projectId).options = { providers: ev.providers, last: ev.last };
-    } else if (ev.t === 'ai' || ev.t === 'proposal' || ev.t === 'history') {
-      answered(ev);
-    } else if (ev.t === 'error') {
-      const mine = state.mine.has(ev.id);
-      const busy = state.busy.get(ev.id);
-      state.busy.delete(ev.id);
-      if (mine) {
-        if (ev.code === 'REVISION_CONFLICT') toast(ev.type === 'proposal.apply' ? 'The timeline changed since this proposal was made, so it wasn’t applied. Ask again.' : 'The timeline just changed on your Mac. Try again.');
-        else if (busy?.kind === 'ask') aiOf(busy.target).error = ev.message;
-        else toast(ev.message);
-        refreshOpenProject(true);
-      }
-    }
+core.onChange(() => {
+  // Don't redraw under a finger typing in a field that isn't kept between redraws.
+  const a = document.activeElement;
+  if (a && (a.matches('input.search, input.field, textarea.field') || a.closest('.sheet'))) {
+    if (sheetIsOpen()) sheetUpdate?.();
+    return;
   }
   render();
-}
-
-/** Answers to the AI Director, apply/reject and undo/redo. */
-function answered(ev) {
-  const mine = state.mine.has(ev.id);
-  if (ev.t !== 'ai' || ev.state !== 'planning') state.busy.delete(ev.id);
-  if (ev.t === 'ai') {
-    const a = aiOf(ev.projectId);
-    if (ev.state === 'done' && mine) {
-      a.draft = '';
-      a.error = null;
-      toast('The AI Director has a proposal. Review it below.');
-    } else if (ev.state === 'failed' && mine) {
-      if (ev.code === 'CONSENT_REQUIRED') {
-        const p = a.options?.providers.find((x) => x.id === choiceFor(a)?.provider);
-        a.asked = false; // its consent may have changed since: fetch the list again
-        a.error = `${p?.label ?? 'This provider'} needs your OK on the Mac first: open AI Director there and allow it for this project, or pick a Local model.`;
-      } else a.error = ev.message === 'Cancelled.' ? null : ev.message;
-      if (/isn't available|isn't set up/.test(ev.message)) {
-        a.asked = false; // the Mac's list changed: ask for it again
-      }
-    }
-  } else if (ev.t === 'proposal' && mine) {
-    toast(ev.action === 'applied' ? 'Applied to the timeline. Undo is under the timeline.' : 'Proposal dismissed.');
-  } else if (ev.t === 'history' && mine) {
-    toast(ev.action === 'undo' ? 'Undone.' : 'Redone.');
-  }
-  refreshOpenProject(true);
-}
-
-// While the AI Director plans, its timer ticks on the open project.
-setInterval(() => {
-  const r = route();
-  if (r.name === 'project' && state.details.get(r.id)?.asking) render();
-}, 1000);
-
-async function stream() {
-  let wait = 1000;
-  for (;;) {
-    try {
-      const res = await fetch(`/api/stream?since=${state.since}`, { headers: { authorization: `Bearer ${state.token}` }, cache: 'no-store' });
-      if (res.status === 401) {
-        state.problem = 'unpaired';
-        return render();
-      }
-      if (res.status === 429) {
-        state.problem = 'locked';
-        render();
-        await new Promise((r) => setTimeout(r, 60_000));
-        continue;
-      }
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-      state.connected = true;
-      state.problem = null;
-      wait = 1000;
-      render();
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let end;
-        while ((end = buffer.indexOf('\n\n')) >= 0) {
-          const block = buffer.slice(0, end);
-          buffer = buffer.slice(end + 2);
-          const name = /^event: (.+)$/m.exec(block)?.[1];
-          const data = /^data: (.*)$/m.exec(block)?.[1];
-          if (name && data) await onEvent(name, JSON.parse(data));
-        }
-      }
-    } catch {
-      // dropped: retry below
-    }
-    state.connected = false;
-    render();
-    await new Promise((r) => setTimeout(r, wait));
-    wait = Math.min(wait * 2, 15_000);
-  }
-}
-
-// ── notifications ──────────────────────────────────────────────────────────
-async function registration() {
-  if (!('serviceWorker' in navigator)) return null;
-  await navigator.serviceWorker.register('/sw.js');
-  return navigator.serviceWorker.ready;
-}
-
-function urlBase64(text) {
-  return fromBase64(text.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(text.length / 4) * 4, '='));
-}
-
-async function pushOn() {
-  const key = state.snapshot?.pushKey;
-  if (!key || !state.online) return toast('Your Mac isn’t connected. Try again once it’s online.');
-  state.push.busy = true;
-  render();
-  try {
-    if ((await Notification.requestPermission()) !== 'granted') throw new Error('Notifications weren’t allowed.');
-    const reg = await registration();
-    const want = urlBase64(key);
-    let sub = await reg.pushManager.getSubscription();
-    // Subscribed for another Mac's key (re-paired with a different Mac): start over.
-    const have = sub?.options?.applicationServerKey ? new Uint8Array(sub.options.applicationServerKey) : null;
-    if (sub && have && (have.length !== want.length || have.some((b, i) => b !== want[i]))) {
-      await sub.unsubscribe();
-      sub = null;
-    }
-    sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: want });
-    const json = sub.toJSON();
-    if (!(await command('push.subscribe', { endpoint: json.endpoint, keys: json.keys, prefs: prefs() }))) throw new Error('Your Mac isn’t connected.');
-    state.push.subscribed = true;
-  } catch (e) {
-    toast(e instanceof Error ? e.message : String(e));
-  } finally {
-    state.push.busy = false;
-    render();
-  }
-}
-
-async function pushOff({ quiet = false } = {}) {
-  const reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null;
-  const sub = await reg?.pushManager.getSubscription();
-  if (!sub) return;
-  state.push.busy = true;
-  if (!quiet) render();
-  try {
-    await command('push.unsubscribe', { endpoint: sub.endpoint }).catch(() => false);
-    await sub.unsubscribe();
-    state.push.subscribed = false;
-  } finally {
-    state.push.busy = false;
-    if (!quiet) render();
-  }
-}
-
-async function pushTest() {
-  const reg = await navigator.serviceWorker.getRegistration();
-  const sub = await reg?.pushManager.getSubscription();
-  if (!sub) return;
-  if (!(await command('push.test', { endpoint: sub.endpoint }))) toast('Your Mac isn’t connected.');
-}
-
-async function pushInit() {
-  try {
-    if (pushSupport() !== 'ok') return;
-    const reg = await registration();
-    state.push.subscribed = Boolean(await reg?.pushManager.getSubscription());
-  } catch {
-    // no service worker (private browsing, say): the Settings card explains
-  } finally {
-    state.push.ready = true;
-    render();
-  }
-}
-
-// A tapped notification, when the app is already open.
-navigator.serviceWorker?.addEventListener('message', (e) => {
-  if (typeof e.data?.open === 'string' && e.data.open.startsWith('/')) location.hash = new URL(e.data.open, location.origin).hash || '#/';
 });
 
 window.addEventListener('hashchange', () => {
+  closeSheet();
   render();
-  refreshOpenProject(true);
-  window.scrollTo(0, 0);
 });
 
-// Coming back to the app (iOS suspends it): refresh the round trip and what's on screen.
+// The keyboard: hide the dock while typing and keep the composer above the keyboard (iOS doesn't shrink
+// the layout viewport, so fixed elements would sit behind it).
+const vv = window.visualViewport;
+function keyboardOffset() {
+  const kb = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+  document.documentElement.style.setProperty('--kb', `${Math.round(kb)}px`);
+  document.body.classList.toggle('kb-open', kb > 80);
+}
+vv?.addEventListener('resize', keyboardOffset);
+vv?.addEventListener('scroll', keyboardOffset);
+document.addEventListener('focusin', (e) => e.target.matches?.('textarea, input:not([type=checkbox]):not([type=range])') && document.body.classList.add('typing'));
+document.addEventListener('focusout', () => setTimeout(() => !document.activeElement?.matches?.('textarea, input:not([type=checkbox]):not([type=range])') && document.body.classList.remove('typing'), 50));
+
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') return closeScanner(); // never leave the camera on in the background
-  ping();
-  refreshOpenProject(true);
+  if (document.visibilityState !== 'visible') return closeScanner();
+  void core.ping();
+  const r = route();
+  if (r.name === 'session' && r.id) core.openProject(r.id, true);
 });
-setInterval(() => state.token && state.problem !== 'unpaired' && render(), 30_000); // keeps "edited 2 min ago" honest (never while a link is being pasted)
+
+navigator.serviceWorker?.addEventListener('message', (e) => {
+  if (typeof e.data?.open === 'string' && e.data.open.startsWith('/')) location.hash = new URL(e.data.open, location.origin).hash || '#/projects';
+});
+
+setInterval(() => !document.hidden && !document.activeElement?.matches?.('input, textarea') && render(), 30_000); // keeps "2 min ago" honest
+
+function capital(s) {
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
+function clipText(s, n) {
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
 
 (async () => {
-  const secret = takeSecretFromLink();
-  if (secret) {
-    const keys = await deriveKeys(secret);
-    state.token = keys.token;
-    state.key = keys.key;
-  }
   render();
-  if (state.token) {
-    stream();
-    pushInit();
+  if (saved.pairings.length) {
+    await core.restoreMedia();
+    await core.connect();
+    void pushInit();
   }
 })();
