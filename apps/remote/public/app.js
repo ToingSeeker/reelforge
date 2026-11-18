@@ -1306,6 +1306,7 @@ function render() {
   const r = route();
   if (!saved.pairings.length || r.name === 'pair') {
     document.body.dataset.screen = 'pair';
+    document.body.classList.remove('split');
     app.replaceChildren(header({ back: saved.pairings.length ? '#/projects' : null }), h('main', { class: 'page' }, pairScreen(r)));
     return;
   }
@@ -1319,6 +1320,8 @@ function render() {
   const routeKey = location.hash;
   const page = h('main', { class: 'page', id: 'main' }, content);
   const sessionId = r.name === 'session' ? (r.id ?? lastProjectId()) : null;
+  // `split`: a session with a project. On wide screens the preview and the conversation sit side by side.
+  document.body.classList.toggle('split', Boolean(sessionId && projectById(sessionId)));
   app.replaceChildren(
     ...[
       header({ back, menu: () => pageMenu({ ...r, id: r.id ?? sessionId }) }),
