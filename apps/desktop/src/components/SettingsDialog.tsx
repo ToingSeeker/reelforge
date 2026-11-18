@@ -1,13 +1,27 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Client } from "../api.ts";
 import type { Notify } from "../editor.ts";
 import { keychain } from "../native.ts";
 import { Icon } from "../icons.tsx";
 import { ConnectorSettings } from "./ConnectorSettings.tsx";
-import { PhoneRemoteSettings } from "./PhoneRemoteSettings.tsx";
+import { RemoteAccessSettings } from "./RemoteAccessSettings.tsx";
 
 /** AI provider keys: saved to the macOS Keychain by the desktop shell, never shown again. */
-export function SettingsDialog({ client, projectId, notify, onClose }: { client: Client | null; projectId: string | null; notify: Notify; onClose: () => void }) {
+export function SettingsDialog({
+  client,
+  projectId,
+  notify,
+  section = null,
+  onClose,
+}: {
+  client: Client | null;
+  projectId: string | null;
+  notify: Notify;
+  /** Opened for one section (the menu bar item's "Remote Access Settings…"): scrolled to it. */
+  section?: "remote" | null;
+  onClose: () => void;
+}) {
+  const remoteRef = useRef<HTMLDivElement>(null);
   const [has, setHas] = useState<boolean | null>(null);
   const [source, setSource] = useState<string>("none");
   const [key, setKey] = useState("");
@@ -75,7 +89,9 @@ export function SettingsDialog({ client, projectId, notify, onClose }: { client:
           )}
         </section>
         <ConnectorSettings client={client} notify={notify} />
-        <PhoneRemoteSettings client={client} notify={notify} />
+        <div ref={remoteRef}>
+          <RemoteAccessSettings client={client} notify={notify} onLoaded={() => section === "remote" && remoteRef.current?.scrollIntoView({ block: "start" })} />
+        </div>
         {projectId && (
           <section className="rf-settings-group">
             <h3>This project</h3>

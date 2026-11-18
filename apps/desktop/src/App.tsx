@@ -5,7 +5,7 @@ import { SettingsDialog } from "./components/SettingsDialog.tsx";
 import { AutomationLab } from "./components/AutomationLab.tsx";
 import { createClient, resolveApiInfo, type Client } from "./api.ts";
 import { useEditor } from "./editor.ts";
-import { onFileDrop, pickExportPath, pickMediaFiles } from "./native.ts";
+import { backgroundEngine, onFileDrop, pickExportPath, pickMediaFiles } from "./native.ts";
 import { useExports, usePreview } from "./render.ts";
 import { RenderQueue } from "./components/RenderQueue.tsx";
 import { CaptionsPanel } from "./components/CaptionsPanel.tsx";
@@ -85,6 +85,8 @@ export function App() {
   const [selectedCaption, setSelectedCaption] = useState<string | null>(null);
   const [previewProposal, setPreviewProposal] = useState<AIProposal | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** Settings opened from the menu bar item's "Remote Access Settings…": scrolled to that section. */
+  const [settingsSection, setSettingsSection] = useState<"remote" | null>(null);
   const [snapToBeats, setSnapToBeats] = useState(() => readPref("rf.snapBeats") !== "0");
   const [importing, setImporting] = useState(false);
   const [fileHover, setFileHover] = useState(false);
@@ -92,6 +94,22 @@ export function App() {
   const dropHandler = useRef<AssetDropHandler | null>(null);
 
   const notify = useCallback((tone: "info" | "error", text: string) => setToast({ tone, text, id: Date.now() }), []);
+
+  // The desktop shell's menu bar item opens Remote Access; a swapped engine (Stop Engine & Disconnect)
+  // means a new URL and token, so the page starts over with them.
+  useEffect(() => {
+    let off = () => {};
+    void backgroundEngine
+      .listen(
+        () => {
+          setSettingsSection("remote");
+          setSettingsOpen(true);
+        },
+        () => window.location.reload(),
+      )
+      .then((f) => (off = f));
+    return () => off();
+  }, []);
 
   useEffect(() => {
     resolveApiInfo()
@@ -735,7 +753,18 @@ export function App() {
           {assetDrag.asset.filename}
         </div>
       )}
-      {settingsOpen && <SettingsDialog client={client} projectId={current?.id ?? null} notify={notify} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsDialog
+          client={client}
+          projectId={current?.id ?? null}
+          notify={notify}
+          section={settingsSection}
+          onClose={() => {
+            setSettingsOpen(false);
+            setSettingsSection(null);
+          }}
+        />
+      )}
       {dialogOpen && <NewProjectDialog onCancel={() => setDialogOpen(false)} onCreate={createProject} />}
       {toast && (
         <div key={toast.id} className={`rf-toast rf-toast-${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>
