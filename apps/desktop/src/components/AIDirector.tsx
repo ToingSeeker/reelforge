@@ -80,6 +80,20 @@ export function AIDirector(p: Props) {
     void p.client.proposals(projectId).then((list) => setThread(list.reverse()), () => {});
   }, [p.client, projectId]);
 
+  // Proposals also come and go from elsewhere (the phone remote, MCP clients): look again every few
+  // seconds, and only re-render when something actually changed.
+  useEffect(() => {
+    if (!p.client || !projectId) return;
+    const client = p.client;
+    const id = window.setInterval(() => {
+      void client.proposals(projectId).then(
+        (list) => setThread((t) => (JSON.stringify(t) === JSON.stringify([...list].reverse()) ? t : [...list].reverse())),
+        () => {},
+      );
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [p.client, projectId]);
+
   useEffect(() => {
     if (!pending) return;
     const id = window.setInterval(() => setTick((n) => n + 1), 1000);
@@ -103,7 +117,7 @@ export function AIDirector(p: Props) {
       const proposal = captions
         ? await captionProposal(projectId, instruction, captions.style, abort.signal, (stage, step) => setPending((x) => (x ? { ...x, stage, step } : x)))
         : await p.client.propose(projectId, { instruction, provider: choice!.provider, model: choice!.model, selection: p.selection }, abort.signal);
-      setThread((t) => [...t, proposal]);
+      setThread((t) => (t.some((x) => x.id === proposal.id) ? t : [...t, proposal])); // the poll may have brought it already
       setText("");
     } catch (e) {
       if (abort.signal.aborted) p.notify("info", "Request cancelled.");

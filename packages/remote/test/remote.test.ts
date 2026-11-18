@@ -315,3 +315,148 @@ test("stage 2: project detail, poster, live job progress and notifications strai
   await m.rotate();
   assert.equal(m.status().notifications, 0);
 });
+
+test("stage 3: ask the AI Director from the phone, apply or reject, undo and redo", async (t) => {
+  // A model that answers when the test says so, and stops when the request is cancelled.
+  const asked: { provider: string; model: string; instruction: string }[] = [];
+  let release: (() => void) | undefined;
+  const { home, db, make, relay } = setup(t, {
+    ai: {
+      providers: async () => [
+        { id: "anthropic", label: "Claude API", external: true, models: ["claude-x"], defaultModel: "claude-x", ready: true, recipient: "anthropic" },
+        { id: "ollama", label: "Local (Ollama)", external: false, models: ["qwen-local"], defaultModel: "qwen-local", ready: true, recipient: "ollama" },
+        { id: "codex", label: "Codex", external: true, models: ["gpt-x"], defaultModel: "gpt-x", ready: false, recipient: "openai" },
+      ],
+      propose: async (projectId, input, signal) => {
+        asked.push(input);
+        await new Promise<void>((resolve, reject) => {
+          release = resolve;
+          signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        });
+        const clipId = new TimelineStore(db).get(projectId).clips[0]!.id;
+        return new ProposalStore(db).create(projectId, { instruction: input.instruction, selection: [], provider: input.provider, model: input.model, summary: "Zoom in on the pour", operations: [{ type: "clip.update", clipId, props: { scale: 1.2 } }], explanations: ["closer"], warnings: ["Only the first clip."] });
+      },
+    },
+  });
+
+  const project = new ProjectStore(db).create({ name: "Café Opening", settings: { width: 1080, height: 1920 } }, "desktop");
+  writeFileSync(join(home, "pour.mp4"), "fake");
+  const st = statSync(join(home, "pour.mp4"));
+  const asset = new AssetStore(db).add(project.id, { path: join(home, "pour.mp4"), sizeBytes: st.size, mtimeMs: st.mtimeMs }, {
+    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: false, hasAlpha: false,
+    videoCodec: "h264", audioCodec: null, sampleRate: null, channels: null, rotation: 0,
+  }, "desktop").asset;
+  const timeline = new TimelineStore(db);
+  const tl = timeline.get(project.id);
+  const v1 = tl.tracks.find((x) => x.kind === "video")!.id;
+  timeline.apply(project.id, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0, duration: 90 }] }, "desktop");
+
+  const m = make();
+  const url = await relay(m.status().relayAuth);
+  await m.start({ url });
+  await until("online", () => m.status().state === "online");
+  const secret = JSON.parse(readFileSync(join(home, "remote", "settings.json"), "utf8")).secret as string;
+  const p = phone(url, secret);
+  t.after(() => p.close());
+  await until("a snapshot", () => p.events.find((e) => e.t === "snapshot"));
+  const last = <T>(type: string, fn: (e: Record<string, unknown>) => boolean = () => true) => p.events.findLast((e) => e.t === type && fn(e)) as T | undefined;
+  const count = (type: string) => p.events.filter((e) => e.t === type).length;
+  const detail = async () => {
+    const n = count("project");
+    await p.send("project.open", { projectId: project.id });
+    await until("the project", () => count("project") > n);
+    return last<{ project: { revision: number; canUndo: boolean; canRedo: boolean; asking: unknown; proposals: { id: string; status: string; stale: boolean; list: { label: string }[]; warnings: string[] }[] } }>("project")!.project;
+  };
+
+  // The model picker: what this Mac offers, and which providers this project allows already.
+  await p.send("ai.options", { projectId: project.id });
+  const options = await until("the options", () => last<{ providers: { id: string; ready: boolean; consented: boolean }[]; last: unknown }>("ai.options"));
+  assert.deepEqual(options.providers.map((x) => [x.id, x.ready, x.consented]), [["anthropic", true, false], ["ollama", true, true], ["codex", false, false]]);
+  assert.equal(options.last, null);
+
+  // Only what this Mac offers can be asked for.
+  await p.send("ai.ask", { projectId: project.id, instruction: "punch in", provider: "ollama", model: "--dangerously-skip-permissions" });
+  await until("refused model", () => last("ai", (e) => e.state === "failed" && /isn't available/.test(String(e.message))));
+  await p.send("ai.ask", { projectId: project.id, instruction: "punch in", provider: "codex", model: "gpt-x" });
+  await until("not set up", () => last("ai", (e) => e.state === "failed" && /isn't set up/.test(String(e.message))));
+  await p.send("ai.ask", { projectId: project.id, instruction: "   ", provider: "ollama", model: "qwen-local" });
+  await until("empty prompt", () => p.events.some((e) => e.t === "error" && e.type === "ai.ask" && /Write what to change/.test(String(e.message))));
+  assert.equal(asked.length, 0);
+
+  // A request runs in the background: the phone sees it in progress, and other commands still get through.
+  await p.send("ai.ask", { projectId: project.id, instruction: "punch in on the pour", provider: "ollama", model: "qwen-local" });
+  await until("planning", () => last("ai", (e) => e.state === "planning"));
+  await until("the model is asked", () => asked.length === 1);
+  assert.deepEqual(asked[0], { instruction: "punch in on the pour", provider: "ollama", model: "qwen-local" });
+  assert.deepEqual((await detail()).asking && Object.keys((await detail()).asking as object).sort(), ["instruction", "model", "provider", "startedAt"]);
+  const pongs = count("pong");
+  await p.send("ping");
+  await until("a pong while planning", () => count("pong") > pongs);
+  await p.send("ai.ask", { projectId: project.id, instruction: "again", provider: "ollama", model: "qwen-local" });
+  await until("one at a time", () => p.events.some((e) => e.t === "error" && /still working/.test(String(e.message))));
+
+  release!();
+  const done = await until("done", () => last<{ proposalId: string }>("ai", (e) => e.state === "done"));
+  let d = await detail();
+  assert.equal(d.asking, null);
+  const shown = d.proposals.find((x) => x.id === done.proposalId)!;
+  assert.equal(shown.status, "pending");
+  assert.equal(shown.stale, false);
+  assert.deepEqual(shown.warnings, ["Only the first clip."]);
+  assert.equal(shown.list.length, 1);
+  await p.send("ai.options", { projectId: project.id });
+  await until("remembers the model", () => last<{ last: unknown }>("ai.options", (e) => e.last !== null)?.last);
+  assert.deepEqual(last<{ last: unknown }>("ai.options")!.last, { provider: "ollama", model: "qwen-local" });
+
+  // Apply from the phone: the same approval as the desktop button, recorded as coming from the phone.
+  const before = d.revision;
+  await p.send("proposal.apply", { proposalId: done.proposalId });
+  const applied = await until("applied", () => last<{ projectId: string; revision: number }>("proposal", (e) => e.action === "applied"));
+  assert.equal(applied.projectId, project.id);
+  assert.equal(applied.revision, before + 1);
+  const stored = new ProposalStore(db).get(done.proposalId);
+  assert.equal(stored.status, "applied");
+  assert.equal(stored.approval?.channel, "phone-remote:apply");
+  await p.send("proposal.apply", { proposalId: done.proposalId });
+  await until("not twice", () => p.events.some((e) => e.t === "error" && /already applied/.test(String(e.message))));
+  await p.send("proposal.apply", { proposalId: "../x" });
+  await until("bad id", () => p.events.some((e) => e.t === "error" && /proposal id isn't valid/.test(String(e.message))));
+
+  // Undo and redo, against the revision the phone saw.
+  await p.send("undo", { projectId: project.id, baseRevision: before });
+  await until("stale undo", () => p.events.some((e) => e.t === "error" && e.type === "undo" && e.code === "REVISION_CONFLICT"));
+  await p.send("undo", { projectId: project.id, baseRevision: applied.revision });
+  const undone = await until("undone", () => last<{ revision: number }>("history", (e) => e.action === "undo"));
+  assert.notEqual(timeline.get(project.id).clips[0]!.props.scale, 1.2);
+  await p.send("redo", { projectId: project.id, baseRevision: undone.revision });
+  await until("redone", () => last("history", (e) => e.action === "redo"));
+  assert.equal(timeline.get(project.id).clips[0]!.props.scale, 1.2);
+
+  // Cancel stops the model.
+  await p.send("ai.ask", { projectId: project.id, instruction: "slower", provider: "ollama", model: "qwen-local" });
+  await until("asked again", () => asked.length === 2);
+  await p.send("ai.cancel", { projectId: project.id });
+  await until("cancelled", () => last("ai", (e) => e.state === "failed" && e.message === "Cancelled."));
+  assert.equal((await detail()).asking, null);
+
+  // Reject, and a proposal the timeline has moved past is marked stale and can't be applied.
+  await p.send("ai.ask", { projectId: project.id, instruction: "a third idea", provider: "ollama", model: "qwen-local" });
+  await until("asked a third time", () => asked.length === 3);
+  release!();
+  const third = await until("third", () => last<{ proposalId: string }>("ai", (e) => e.state === "done" && e.proposalId !== done.proposalId));
+  await p.send("proposal.reject", { proposalId: third.proposalId });
+  await until("rejected", () => last("proposal", (e) => e.action === "rejected"));
+  assert.equal(new ProposalStore(db).get(third.proposalId).status, "rejected");
+
+  await p.send("ai.ask", { projectId: project.id, instruction: "a fourth idea", provider: "ollama", model: "qwen-local" });
+  await until("asked a fourth time", () => asked.length === 4);
+  release!();
+  const fourth = await until("fourth", () => last<{ proposalId: string }>("ai", (e) => e.state === "done" && e.proposalId !== third.proposalId && e.proposalId !== done.proposalId));
+  const now = timeline.get(project.id);
+  timeline.apply(project.id, { baseRevision: now.project.revision, operations: [{ type: "clip.update", clipId: now.clips[0]!.id, props: { opacity: 0.5 } }] }, "desktop");
+  d = await detail();
+  assert.equal(d.proposals.find((x) => x.id === fourth.proposalId)?.stale, true);
+  await p.send("proposal.apply", { proposalId: fourth.proposalId });
+  await until("stale apply", () => p.events.some((e) => e.t === "error" && e.type === "proposal.apply" && e.code === "REVISION_CONFLICT"));
+  assert.ok(!p.raw.join("\n").includes("pour"), "prompts and summaries cross the relay encrypted");
+});

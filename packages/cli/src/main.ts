@@ -29,7 +29,7 @@ import {
   type ErrorCode,
   type TimelineOp,
 } from "@reelforge/core";
-import { ANTHROPIC_DEFAULT_MODEL, credentialSource, listOllamaModels, OllamaProvider, propose, providerFor, setCredential } from "@reelforge/ai";
+import { ANTHROPIC_DEFAULT_MODEL, consentRecipient, credentialSource, listAIProviders, listOllamaModels, OllamaProvider, propose, providerFor, providerReady, setCredential } from "@reelforge/ai";
 import { AnalysisRunner, createRenderJob, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 import { ConnectorAuth, ConnectorManager, createMcpServer } from "@reelforge/mcp";
@@ -727,6 +727,10 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     dir: join(resolveHome(env), "remote"),
     version: VERSION,
     thumbnail: (asset) => ensureThumbnail(resolveCacheDir(env), asset),
+    ai: {
+      providers: async () => (await listAIProviders()).map((p) => ({ ...p, ready: providerReady(p), recipient: consentRecipient(p.id) })),
+      propose: (projectId, input, signal) => propose(db, projectId, providerFor(input.provider), { instruction: input.instruction, model: input.model }, { signal }),
+    },
     log: (line) => io.err(`[remote] ${line}\n`),
   });
   const srv = await startApiServer({

@@ -107,7 +107,11 @@ Relay menahan maks 40 MB per arah sekaligus, dan Railway membayar egress. Jadi:
    Settings → QR (didekode, isinya = link pairing) → HP 390 px melihat proyek + Online, update langsung saat proyek
    dibuat di Mac, tetap ter-pair setelah reload, "Mac offline" saat Stop. CLI `reelforge remote` belum dibuat.
 2. **Pantau** — Home, Projects, detail proyek (poster, ringkasan timeline), job progress, push notification.
-3. **AI Director dari HP** — kirim prompt, lihat proposal (daftar operasi + ringkasan), Apply/Reject, Undo.
+3. ✅ **AI Director dari HP** (2026-11-18) — kirim prompt (pilih model dari daftar Mac; izin provider eksternal tetap
+   dari desktop), progres + Cancel, proposal (ringkasan, peringatan, daftar perubahan, tanda basi), Apply/Reject,
+   Undo/Redo. Apply tercatat `by: api`, `channel: phone-remote:apply`. AI Director desktop kini memuat ulang daftar
+   proposal tiap 4 detik. Terbukti: tes `remote.test.ts` stage 3; e2e Chromium 390 px dengan Ollama qwen2.5:14b
+   sungguhan (57 dtk → proposal → Apply → Undo → Redo → Cancel). App lock belum dibuat.
 4. **Render & unduh** — preset, progress, unduh preview/export via chunk, cancel/retry.
 5. **Kirim media dari HP** — upload chunk ke inbox → import → muncul di library; captions generate.
 6. **Deploy** — `cd apps/remote && railway init && railway up`, `railway variable set REELFORGE_REMOTE_AUTH=…`,

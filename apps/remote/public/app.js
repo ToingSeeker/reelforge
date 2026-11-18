@@ -7,6 +7,7 @@ import { secretFromText } from './pairing.js';
 
 const SECRET_KEY = 'reelforge.remote.secret';
 const PREFS_KEY = 'reelforge.remote.notify';
+const MODEL_KEY = 'reelforge.remote.model';
 const app = document.getElementById('app');
 const toastEl = document.getElementById('toast');
 
@@ -22,6 +23,9 @@ const state = {
   details: new Map(), // projectId → detail from the Mac
   posters: new Map(), // projectId → { key, url, revision }
   push: { ready: false, subscribed: false, busy: false },
+  ai: new Map(), // projectId → { options, draft, error, asked }
+  mine: new Set(), // ids of commands this page sent: only their answers raise toasts (the relay replays its log on reload)
+  busy: new Map(), // command id → what is waiting for an answer, e.g. { kind: 'apply', target: proposalId }
 };
 
 // ── pairing ────────────────────────────────────────────────────────────────
@@ -474,7 +478,12 @@ function viewProject(id) {
       'div',
       { class: 'between mt muted' },
       h('span', { text: [plural(d.clips, 'clip'), plural(tracksWithClips, 'track'), d.captions ? 'captions on' : null].filter(Boolean).join(' · ') }),
-      h('span', { text: 'read-only' }),
+    ),
+    h(
+      'div',
+      { class: 'grid2 mt' },
+      h('button', { class: 'btn sm', type: 'button', disabled: !state.online || !d.canUndo || waiting('history', id), onclick: () => undoRedo(id, 'undo'), text: 'Undo' }),
+      h('button', { class: 'btn sm', type: 'button', disabled: !state.online || !d.canRedo || waiting('history', id), onclick: () => undoRedo(id, 'redo'), text: 'Redo' }),
     ),
   );
 
@@ -488,24 +497,7 @@ function viewProject(id) {
     h('div', { class: 'kv' }, h('span', { text: 'Edited' }), h('b', { text: ago(d.updatedAt) })),
   );
 
-  const pending = d.proposals.filter((x) => x.status === 'pending');
-  const proposals = pending.length
-    ? h(
-        'section',
-        { class: 'card attention', 'aria-label': 'AI Director' },
-        h('div', { class: 'label', text: 'AI Director' }),
-        pending.map((x, i) =>
-          h(
-            'div',
-            { class: i ? 'mt' : '' },
-            h('div', { class: 'bubble', text: x.instruction }),
-            h('p', { class: 'mt', text: x.summary }),
-            h('div', { class: 'muted mt', text: `${plural(x.changes, 'change')} · ${x.model} · ${ago(x.createdAt)}` }),
-          ),
-        ),
-        h('p', { class: 'muted mt', text: 'Review and apply it on your Mac. (Apply from the phone comes next.)' }),
-      )
-    : null;
+  const director = viewDirector(d);
 
   const jobs = d.jobs.length
     ? h(
@@ -529,7 +521,199 @@ function viewProject(id) {
       )
     : null;
 
-  return [header(title, sub, { back: '#/projects' }), h('main', { class: 'body' }, posterEl, timeline, proposals, jobs, facts), tabs('projects')];
+  return [header(title, sub, { back: '#/projects' }), h('main', { class: 'body' }, posterEl, director, timeline, jobs, facts), tabs('projects')];
+}
+
+// ── AI Director ────────────────────────────────────────────────────────────
+const PROVIDER_ORDER = ['anthropic', 'claude-code', 'codex', 'ollama'];
+
+function aiOf(projectId) {
+  let a = state.ai.get(projectId);
+  if (!a) state.ai.set(projectId, (a = { options: null, draft: '', error: null, asked: false }));
+  return a;
+}
+
+/** The model to ask: the one picked on this phone, else what the project used last, else the first that works. */
+function choiceFor(a) {
+  const providers = a.options?.providers ?? [];
+  const usable = (c) => c && providers.some((p) => p.id === c.provider && p.ready && p.models.includes(c.model));
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem(MODEL_KEY) ?? 'null');
+  } catch {}
+  if (usable(saved)) return saved;
+  if (usable(a.options?.last)) return a.options.last;
+  const first = PROVIDER_ORDER.map((id) => providers.find((p) => p.id === id && p.ready)).find(Boolean);
+  return first ? { provider: first.id, model: first.defaultModel ?? first.models[0] } : null;
+}
+
+function waiting(kind, target) {
+  for (const b of state.busy.values()) if (b.kind === kind && b.target === target) return true;
+  return false;
+}
+
+function since(iso) {
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+const CHANGE_WORDS = { added: 'Add', removed: 'Remove', changed: 'Change' };
+
+function proposalCard(x, i) {
+  const deciding = waiting('apply', x.id) || waiting('reject', x.id);
+  const changes = x.list.map((c) =>
+    h(
+      'li',
+      {},
+      h('b', { text: `${CHANGE_WORDS[c.kind] ?? c.kind} ${c.target} ` }),
+      h('span', { text: c.label }),
+      c.before || c.after ? h('div', { class: 'muted mono', text: [c.before, c.after].filter(Boolean).join(' → ') }) : null,
+    ),
+  );
+  return h(
+    'div',
+    { class: `proposal${i ? ' sep' : ''}` },
+    x.requestedBy === 'mcp' ? h('div', { class: 'muted', text: 'Asked by an assistant connected to ReelForge' }) : null,
+    h('div', { class: 'bubble', text: x.instruction }),
+    h('p', { class: 'mt', text: x.summary }),
+    x.warnings.map((w) => h('p', { class: 'muted warn mt', text: w })),
+    changes.length ? h('ul', { class: 'changes mt' }, changes, x.changes > x.list.length ? h('li', { class: 'muted', text: `and ${x.changes - x.list.length} more` }) : null) : null,
+    h('div', { class: 'muted mt', text: `${plural(x.changes, 'change')} · ${x.model} · ${ago(x.createdAt)}` }),
+    x.stale
+      ? h(
+          'div',
+          {},
+          h('p', { class: 'muted warn mt', text: 'The timeline changed after this was made, so it can’t be applied. Ask again.' }),
+          h('button', { class: 'btn sm mt', type: 'button', disabled: !state.online || deciding, onclick: () => decide(x.id, 'reject'), text: 'Dismiss' }),
+        )
+      : h(
+          'div',
+          { class: 'grid2 mt' },
+          h('button', { class: 'btn sm', type: 'button', disabled: !state.online || deciding, onclick: () => decide(x.id, 'reject'), text: 'Reject' }),
+          h('button', { class: 'btn sm mint', type: 'button', disabled: !state.online || deciding, onclick: () => decide(x.id, 'apply'), text: waiting('apply', x.id) ? 'Applying…' : 'Apply' }),
+        ),
+  );
+}
+
+function viewDirector(d) {
+  const a = aiOf(d.id);
+  const pending = d.proposals.filter((x) => x.status === 'pending');
+  const providers = a.options?.providers ?? [];
+  const choice = choiceFor(a);
+  const chosen = providers.find((p) => p.id === choice?.provider);
+
+  let compose;
+  if (d.asking) {
+    compose = h(
+      'div',
+      { class: 'asking' },
+      h('div', { class: 'bubble', text: d.asking.instruction }),
+      h('div', { class: 'between mt' }, h('span', { class: 'pill run' }, h('span', { class: 'dot' }), `Planning · ${since(d.asking.startedAt)}`), h('span', { class: 'muted', text: d.asking.model })),
+      h('button', { class: 'btn sm mt', type: 'button', disabled: !state.online || waiting('cancel', d.id), onclick: () => cancelAsk(d.id), text: 'Cancel' }),
+    );
+  } else {
+    const groups = providers.map((p) =>
+      h(
+        'optgroup',
+        { label: p.ready ? p.label : `${p.label} (not set up on your Mac)` },
+        p.models.map((m) => h('option', { value: `${p.id}|${m}`, disabled: !p.ready, selected: choice && choice.provider === p.id && choice.model === m, text: m })),
+      ),
+    );
+    const box = h('textarea', {
+      class: 'ask-input',
+      rows: 3,
+      maxlength: 4000,
+      placeholder: 'What should change? e.g. “Cut the silences” or “Zoom in slowly on the last clip”',
+      'aria-label': 'Instruction for the AI Director',
+      'data-keep': true,
+      disabled: !state.online,
+      oninput: (e) => (a.draft = e.target.value),
+      onblur: settle,
+    });
+    box.value = a.draft;
+    const select = h(
+      'select',
+      {
+        class: 'ask-model',
+        'aria-label': 'Model',
+        'data-keep': true,
+        disabled: !state.online || !providers.length,
+        onblur: settle,
+        onchange: (e) => {
+          const [provider, model] = e.target.value.split('|');
+          localStorage.setItem(MODEL_KEY, JSON.stringify({ provider, model }));
+          a.error = null;
+          render();
+        },
+      },
+      providers.length ? groups : h('option', { text: a.options ? 'No models on your Mac' : 'Loading models…' }),
+    );
+    const blocked = chosen && chosen.external && !chosen.consented;
+    compose = h(
+      'div',
+      {},
+      box,
+      h('div', { class: 'row mt' }, select, h('button', { class: 'btn sm mint', type: 'button', disabled: !state.online || !choice || waiting('ask', d.id), onclick: () => ask(d.id), text: 'Send' })),
+      blocked ? h('p', { class: 'muted mt', text: `The first time, allow ${chosen.label} to read this project in AI Director on your Mac — or pick a Local model.` }) : null,
+      a.error ? h('p', { class: 'muted warn mt', text: a.error }) : null,
+    );
+  }
+
+  return h(
+    'section',
+    { class: `card${pending.length ? ' attention' : ''}`, 'aria-label': 'AI Director' },
+    h('div', { class: 'label', text: 'AI Director' }),
+    pending.map(proposalCard),
+    h('div', { class: pending.length ? 'compose sep' : 'compose' }, compose),
+  );
+}
+
+/** Sends a command whose answer this page waits for; `busy` marks what it is about (buttons go grey). */
+async function act(type, fields, busy) {
+  const id = crypto.randomUUID();
+  state.mine.add(id);
+  if (busy) state.busy.set(id, busy);
+  render();
+  const ok = await command(type, { id, ...fields }).catch(() => false);
+  if (!ok) {
+    state.busy.delete(id);
+    toast('Couldn’t reach the relay. Check your connection.');
+    render();
+  }
+  return id;
+}
+
+function ask(projectId) {
+  const a = aiOf(projectId);
+  const choice = choiceFor(a);
+  const instruction = a.draft.trim();
+  if (!instruction) return toast('Write what to change first.');
+  if (!choice) return toast('Pick a model first.');
+  a.error = null;
+  document.activeElement?.blur?.();
+  act('ai.ask', { projectId, instruction, provider: choice.provider, model: choice.model }, { kind: 'ask', target: projectId });
+}
+
+function cancelAsk(projectId) {
+  act('ai.cancel', { projectId }, { kind: 'cancel', target: projectId });
+}
+
+function decide(proposalId, action) {
+  act(`proposal.${action}`, { proposalId }, { kind: action, target: proposalId });
+}
+
+function undoRedo(projectId, action) {
+  const d = state.details.get(projectId);
+  if (d) act(action, { projectId, baseRevision: d.revision }, { kind: 'history', target: projectId });
+}
+
+// Rebuilding the page while someone types would close the keyboard: wait until they leave the field.
+let renderLater = false;
+function settle() {
+  // A tap on Send blurs the box first; give the tap time to land before the buttons are rebuilt.
+  setTimeout(() => {
+    if (renderLater) render();
+  }, 300);
 }
 
 function pushSupport() {
@@ -612,6 +796,12 @@ function viewSettings() {
 }
 
 function render() {
+  const focused = document.activeElement;
+  if (focused instanceof HTMLElement && focused.hasAttribute('data-keep') && app.contains(focused)) {
+    renderLater = true;
+    return;
+  }
+  renderLater = false;
   if (state.problem === 'unpaired' || !state.token) return app.replaceChildren(viewUnpaired(state.problem));
   const r = route();
   const view = r.name === 'project' ? viewProject(r.id) : r.name === 'projects' ? viewProjects() : r.name === 'settings' ? viewSettings() : viewHome();
@@ -690,7 +880,12 @@ function refreshOpenProject(force = false) {
   // Asked again when the timeline changes, a render starts, or one ends.
   const running = (state.snapshot?.jobs ?? []).filter((j) => j.projectId === r.id).map((j) => j.id);
   const ended = (state.snapshot?.recent ?? []).filter((j) => j.projectId === r.id).length;
-  const stamp = `${summary?.revision ?? null}:${running.join(',')}:${ended}`;
+  const stamp = `${summary?.revision ?? null}:${summary?.pendingProposals ?? 0}:${running.join(',')}:${ended}`;
+  const a = aiOf(r.id);
+  if (!a.asked) {
+    a.asked = true;
+    command('ai.options', { projectId: r.id }).catch(() => (a.asked = false));
+  }
   if (!force && openAsked.id === r.id && openAsked.revision === stamp && Date.now() - openAsked.at < 60_000) return;
   openAsked = { id: r.id, revision: stamp, at: Date.now() };
   command('project.open', { projectId: r.id }).catch(() => {});
@@ -733,10 +928,58 @@ async function onEvent(name, data) {
     } else if (ev.t === 'pong' && pingAt) {
       state.rtt = Math.round(performance.now() - pingAt);
       pingAt = 0;
-    } else if (ev.t === 'error') toast(ev.message);
+    } else if (ev.t === 'ai.options') {
+      aiOf(ev.projectId).options = { providers: ev.providers, last: ev.last };
+    } else if (ev.t === 'ai' || ev.t === 'proposal' || ev.t === 'history') {
+      answered(ev);
+    } else if (ev.t === 'error') {
+      const mine = state.mine.has(ev.id);
+      const busy = state.busy.get(ev.id);
+      state.busy.delete(ev.id);
+      if (mine) {
+        if (ev.code === 'REVISION_CONFLICT') toast(ev.type === 'proposal.apply' ? 'The timeline changed since this proposal was made, so it wasn’t applied. Ask again.' : 'The timeline just changed on your Mac. Try again.');
+        else if (busy?.kind === 'ask') aiOf(busy.target).error = ev.message;
+        else toast(ev.message);
+        refreshOpenProject(true);
+      }
+    }
   }
   render();
 }
+
+/** Answers to the AI Director, apply/reject and undo/redo. */
+function answered(ev) {
+  const mine = state.mine.has(ev.id);
+  if (ev.t !== 'ai' || ev.state !== 'planning') state.busy.delete(ev.id);
+  if (ev.t === 'ai') {
+    const a = aiOf(ev.projectId);
+    if (ev.state === 'done' && mine) {
+      a.draft = '';
+      a.error = null;
+      toast('The AI Director has a proposal. Review it below.');
+    } else if (ev.state === 'failed' && mine) {
+      if (ev.code === 'CONSENT_REQUIRED') {
+        const p = a.options?.providers.find((x) => x.id === choiceFor(a)?.provider);
+        a.asked = false; // its consent may have changed since: fetch the list again
+        a.error = `${p?.label ?? 'This provider'} needs your OK on the Mac first: open AI Director there and allow it for this project, or pick a Local model.`;
+      } else a.error = ev.message === 'Cancelled.' ? null : ev.message;
+      if (/isn't available|isn't set up/.test(ev.message)) {
+        a.asked = false; // the Mac's list changed: ask for it again
+      }
+    }
+  } else if (ev.t === 'proposal' && mine) {
+    toast(ev.action === 'applied' ? 'Applied to the timeline. Undo is under the timeline.' : 'Proposal dismissed.');
+  } else if (ev.t === 'history' && mine) {
+    toast(ev.action === 'undo' ? 'Undone.' : 'Redone.');
+  }
+  refreshOpenProject(true);
+}
+
+// While the AI Director plans, its timer ticks on the open project.
+setInterval(() => {
+  const r = route();
+  if (r.name === 'project' && state.details.get(r.id)?.asking) render();
+}, 1000);
 
 async function stream() {
   let wait = 1000;

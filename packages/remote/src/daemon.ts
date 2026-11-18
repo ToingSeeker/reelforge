@@ -12,8 +12,7 @@ import { deriveKeys, seal, unseal, type RemoteKeys } from "./keys.ts";
 export const COMMAND_MAX_AGE_MS = 5 * 60 * 1000;
 const OUTBOX_MAX = 500;
 const BATCH = 50;
-/** Project ids are UUIDs; anything else from the phone is refused before it reaches a store. */
-const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface RemoteProject {
   id: string;
@@ -73,8 +72,42 @@ export interface RemoteProjectDetail {
   clips: number;
   captions: number;
   assets: { video: number; audio: number; image: number; offline: number };
-  proposals: { id: string; status: string; instruction: string; summary: string; changes: number; provider: string; model: string; createdAt: string }[];
+  /** Newest first, pending ones first; the pending ones carry what the phone needs to decide. */
+  proposals: RemoteProposal[];
+  /** A request from the phone the AI Director is still working on, or null. */
+  asking: RemoteAsk | null;
   jobs: { id: string; kind: string; state: string; progress: number; error: string | null; createdAt: string; finishedAt: string | null; sizeBytes: number | null }[];
+}
+
+export interface RemoteProposal {
+  id: string;
+  status: string;
+  /** Pending, but the timeline moved on since it was made: it can't be applied any more. */
+  stale: boolean;
+  requestedBy: "user" | "mcp";
+  instruction: string;
+  summary: string;
+  changes: number;
+  /** The first changes, as the desktop's diff lists them. */
+  list: { kind: string; target: string; label: string; before: string | null; after: string | null }[];
+  warnings: string[];
+  provider: string;
+  model: string;
+  createdAt: string;
+}
+
+export interface RemoteAsk {
+  instruction: string;
+  provider: string;
+  model: string;
+  startedAt: string;
+}
+
+/** The phone's model picker. */
+export interface RemoteAiOptions {
+  providers: { id: string; label: string; models: string[]; defaultModel: string | null; ready: boolean; external: boolean; consented: boolean }[];
+  /** What this project used last (else any project), so the phone starts where the desktop left off. */
+  last: { provider: string; model: string } | null;
 }
 
 export interface RemotePoster {
@@ -101,6 +134,19 @@ export interface PushSubscribeInput {
 export interface RemoteHandlers {
   project?(projectId: string): RemoteProjectDetail;
   poster?(projectId: string): Promise<RemotePoster | null>;
+  /**
+   * The AI Director. `ask` checks its input and claims the project before it returns, so a refusal
+   * (busy, empty prompt) arrives at once; the promise then settles when the model answers.
+   */
+  ai?: {
+    options(projectId: string): Promise<RemoteAiOptions>;
+    ask(projectId: string, input: { instruction: unknown; provider: unknown; model: unknown }): Promise<{ id: string }>;
+    cancel(projectId: string): boolean;
+    apply(proposalId: string): { projectId: string; revision: number };
+    reject(proposalId: string): { projectId: string };
+    undo(projectId: string, baseRevision: unknown): { revision: number };
+    redo(projectId: string, baseRevision: unknown): { revision: number };
+  };
   push?: {
     publicKey(): string;
     subscribe(input: PushSubscribeInput): PushPrefs;
@@ -294,6 +340,45 @@ export class RemoteDaemon {
           const blob = await this.#putBlob({ type: poster.type, data: poster.data.toString("base64") });
           return this.send({ t: "poster", id, projectId, key: poster.key, blob });
         }
+        case "ai.options": {
+          if (!h.ai) break;
+          const projectId = projectIdOf(cmd);
+          return this.send({ t: "ai.options", id, projectId, ...(await h.ai.options(projectId)) });
+        }
+        case "ai.ask": {
+          if (!h.ai) break;
+          const projectId = projectIdOf(cmd);
+          // Not awaited: a model can take minutes, and other commands (cancel, ping) must still get through.
+          const run = h.ai.ask(projectId, { instruction: cmd.instruction, provider: cmd.provider, model: cmd.model });
+          this.send({ t: "ai", id, projectId, state: "planning" });
+          run.then(
+            (p) => this.send({ t: "ai", id, projectId, state: "done", proposalId: p.id }),
+            (e) => this.send({ t: "ai", id, projectId, state: "failed", code: codeOf(e), message: errText(e) }),
+          );
+          return;
+        }
+        case "ai.cancel": {
+          if (!h.ai) break;
+          const projectId = projectIdOf(cmd);
+          return this.send({ t: "ai", id, projectId, state: h.ai.cancel(projectId) ? "cancelling" : "idle" });
+        }
+        case "proposal.apply": {
+          if (!h.ai) break;
+          const r = h.ai.apply(uuidOf(cmd.proposalId, "proposal"));
+          return this.send({ t: "proposal", id, action: "applied", ...r });
+        }
+        case "proposal.reject": {
+          if (!h.ai) break;
+          const r = h.ai.reject(uuidOf(cmd.proposalId, "proposal"));
+          return this.send({ t: "proposal", id, action: "rejected", ...r });
+        }
+        case "undo":
+        case "redo": {
+          if (!h.ai) break;
+          const projectId = projectIdOf(cmd);
+          const r = h.ai[cmd.type](projectId, cmd.baseRevision);
+          return this.send({ t: "history", id, action: cmd.type, projectId, ...r });
+        }
         case "push.subscribe": {
           if (!h.push) break;
           const prefs = h.push.subscribe({ endpoint: cmd.endpoint, keys: cmd.keys, prefs: cmd.prefs });
@@ -312,7 +397,7 @@ export class RemoteDaemon {
       }
       return this.send({ t: "error", id, message: `Unknown command: ${String(cmd.type).slice(0, 40)}` });
     } catch (e) {
-      this.send({ t: "error", id, message: errText(e) });
+      this.send({ t: "error", id, type: String(cmd.type).slice(0, 40), code: codeOf(e), message: errText(e) });
     }
   }
 
@@ -395,8 +480,19 @@ export class RemoteDaemon {
 class FatalError extends Error {}
 
 function projectIdOf(cmd: Record<string, unknown>): string {
-  if (typeof cmd.projectId !== "string" || !PROJECT_ID.test(cmd.projectId)) throw new Error("That project id isn't valid.");
-  return cmd.projectId;
+  return uuidOf(cmd.projectId, "project");
+}
+
+/** Ids from the phone are UUIDs; anything else is refused before it reaches a store. */
+function uuidOf(value: unknown, what: string): string {
+  if (typeof value !== "string" || !UUID.test(value)) throw new Error(`That ${what} id isn't valid.`);
+  return value;
+}
+
+/** ReelForgeError's code (CONSENT_REQUIRED, REVISION_CONFLICT, …), so the phone can say what to do. */
+function codeOf(e: unknown): string | null {
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^[A-Z_]{2,40}$/.test(code) ? code : null;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
