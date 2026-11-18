@@ -1,8 +1,9 @@
 // ReelForge Remote, the phone app: direct the agent editing on your Mac from anywhere.
 // Talks only to the relay that served it (core.js); everything it sends and receives is sealed with keys
-// the relay never has. Screens: Projects, Session, Exports (dock), Review, and pairing.
+// the relay never has. Screens: Projects, Session, Exports (dock), Review, Edit (manual editing), and pairing.
 import * as core from './core.js';
 import { codeFromText, formatCode } from './pairing.js';
+import { editorActive, editScreen, initEditor, leaveEditor } from './edit.js';
 import { ago, aspect, button, clock, closeSheet, duration, h, icon, iconButton, logo, pill, plural, progress, sheet, sheetIsOpen, size } from './ui.js';
 
 const { saved, live } = core;
@@ -10,7 +11,8 @@ const app = document.getElementById('app');
 const toastEl = document.getElementById('toast');
 
 // ── routes ──────────────────────────────────────────────────────────────────
-// #/projects · #/session[/<id>] · #/review/<project>/<version> · #/exports · #/pair[=CODE]
+// #/projects · #/session[/<id>] · #/review/<project>/<version> · #/review/<project>/rev/<revision>
+// #/edit/<project>/<revision> · #/exports · #/pair[=CODE]
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 function route() {
   const hash = location.hash;
@@ -19,6 +21,8 @@ function route() {
   if ((m = new RegExp(`^#/session/(${UUID})$`, 'i').exec(hash))) return { name: 'session', id: m[1] };
   if (hash === '#/session') return { name: 'session', id: null };
   if ((m = new RegExp(`^#/review/(${UUID})/(${UUID})$`, 'i').exec(hash))) return { name: 'review', id: m[1], version: m[2] };
+  if ((m = new RegExp(`^#/review/(${UUID})/rev/(\\d{1,9})$`, 'i').exec(hash))) return { name: 'review-rev', id: m[1], revision: Number(m[2]) };
+  if ((m = new RegExp(`^#/edit/(${UUID})/(\\d{1,9})$`, 'i').exec(hash))) return { name: 'edit', id: m[1], revision: Number(m[2]) };
   if (hash === '#/exports') return { name: 'exports' };
   return { name: 'projects' };
 }
@@ -37,6 +41,15 @@ const detailOf = (id) => cache()?.details?.[id] ?? null;
 const jobsOf = (id) => (snap()?.jobs ?? []).filter((j) => j.projectId === id);
 const askOf = (id) => (snap()?.asks ?? []).find((a) => a.projectId === id) ?? null;
 const isLive = () => core.status().live;
+const editingOf = (id) => (snap()?.editing ?? []).find((x) => x.projectId === id && Date.parse(x.expiresAt) > Date.now()) ?? null;
+
+/** Opens the manual editor on a project's timeline at `revision`; Back returns to `from`. */
+let editReturn = null;
+function openEditor(projectId, revision, from = location.hash) {
+  rememberProject(projectId);
+  editReturn = from;
+  go(`#/edit/${projectId}/${revision}`);
+}
 
 function lastProjectId() {
   const c = cache();
@@ -57,6 +70,8 @@ function projectState(p) {
   const ask = askOf(p.id);
   const job = jobsOf(p.id)[0];
   const queued = core.instructionsFor(p.id).filter((x) => ['local', 'queued'].includes(x.state)).length;
+  const editing = editingOf(p.id);
+  if (editing) return { text: editing.deviceId === pairing()?.deviceId ? 'Editing by hand' : `${editing.deviceName} is editing`, tone: 'mint', icon: 'pencil', busy: true };
   if (ask) return { text: 'Agent editing', tone: 'mint', icon: 'director', busy: true };
   if (job) return { text: job.kind === 'export' ? `Exporting ${Math.round(job.progress * 100)}%` : 'Rendering preview', tone: 'orange', icon: 'film', busy: true };
   if (p.pendingProposals) return { text: 'Review ready', tone: 'mint', icon: 'checkCircle' };
@@ -331,6 +346,9 @@ function previewCard(p, d) {
   else label = st.live ? 'No preview of this timeline yet' : 'No preview saved on this phone';
 
   const actions = [];
+  const editing = editingOf(p.id);
+  const elsewhere = editing && editing.deviceId !== pairing()?.deviceId;
+  actions.push(button(elsewhere ? `${editing.deviceName} is editing` : 'Edit', { small: true, kind: 'mint', iconName: 'pencil', disabled: elsewhere || (!st.live && !editing), aria: elsewhere ? `${editing.deviceName} is editing this project by hand` : 'Edit the timeline by hand', onclick: () => openEditor(p.id, p.revision) }));
   if (st.live && !rendering && (!remote || !remote.current) && (!pv?.url || pv.revision !== p.revision)) {
     actions.push(button('Render preview', { small: true, iconName: 'film', onclick: () => startPreview(p.id) }));
   }
@@ -486,7 +504,9 @@ function instructionCard(p, it) {
   if (it.state === 'done' && it.proposalId) actions.push(button('Review', { small: true, kind: 'mint', onclick: () => go(`#/review/${p.id}/${it.proposalId}`) }));
   const why =
     it.state === 'needs_review'
-      ? `The timeline changed on your Mac since you wrote this (revision ${it.baseRevision} → ${it.currentRevision}). Run it on the timeline as it is now, or cancel it.`
+      ? it.reason === 'editing'
+        ? 'It arrived while the project was being edited by hand, so it didn’t run. Run it on the timeline as it is now, or cancel it.'
+        : `The timeline changed on your Mac since you wrote this (revision ${it.baseRevision} → ${it.currentRevision}). Run it on the timeline as it is now, or cancel it.`
       : it.state === 'failed'
         ? it.error ?? 'The agent couldn’t do that.'
         : hint;
@@ -704,10 +724,109 @@ function reviewScreen(r) {
       disabled: Boolean(cannot) || exportBusy,
       onclick: () => approveAndExport(p, v, pending ? v.id : v.status === 'applied' ? v.id : null, exportRevision),
     }),
+    adjustButton(p, v, pending, appliedCurrent),
     pending && isLive() ? button('Dismiss this version', { kind: 'ghost', full: true, onclick: () => dismissVersion(v) }) : null,
     h('div', { class: 'row between mt' }, button('Version history', { small: true, iconName: 'history', onclick: () => versionHistorySheet(p, d) })),
     projectExports(p.id),
   ];
+}
+
+/** "Adjust edit": fix the agent's result by hand. A pending version is applied first (with the user's OK). */
+function adjustButton(p, v, pending, appliedCurrent) {
+  const why = !isLive() ? 'Editing needs your Mac online.' : v.stale ? 'This version is out of date.' : v.status === 'rejected' ? 'This version was dismissed.' : !pending && !appliedCurrent ? 'The timeline changed after this version; edit the latest instead.' : null;
+  const go2 = () => {
+    if (appliedCurrent) return openEditor(p.id, p.revision);
+    sheet(
+      `Adjust version ${v.version}?`,
+      h(
+        'div',
+        { class: 'stack' },
+        h('p', { text: `Version ${v.version} is applied to the timeline first, then you fix it by hand. Undo on the Mac takes it back.` }),
+        button('Apply & edit', {
+          kind: 'mint',
+          full: true,
+          iconName: 'pencil',
+          onclick: async () => {
+            closeSheet();
+            const r = await core.command('proposal.apply', { proposalId: v.id });
+            if (!r) return toast('Your Mac isn’t connected.');
+            if (r.t === 'error') return toast(r.message);
+            core.openProject(p.id, true);
+            openEditor(p.id, r.revision);
+          },
+        }),
+        button('Cancel', { kind: 'ghost', full: true, onclick: closeSheet }),
+      ),
+    );
+  };
+  return h('div', { class: 'stack-tight' }, button('Adjust edit', { full: true, iconName: 'pencil', disabled: Boolean(why), onclick: go2 }), why && (pending || appliedCurrent || v.stale) ? h('p', { class: 'muted small center', text: why }) : null);
+}
+
+// ── Review of a manual edit (a revision, not an agent version) ─────────────
+function reviewRevisionScreen(r) {
+  const p = projectById(r.id);
+  if (!p) return [h('h1', { class: 'title', text: 'Review & export' }), h('section', { class: 'card empty' }, h('p', { text: 'That project isn’t synced on this phone.' }), button('Projects', { onclick: () => go('#/projects') }))];
+  rememberProject(p.id);
+  core.openProject(p.id);
+  const d = detailOf(p.id);
+  const n = r.revision;
+  const s = d?.manual?.find((x) => x.toRevision === n) ?? null;
+  const current = p.revision === n;
+  if (!live.exportOptions.has(p.id) && isLive()) void core.command('export.options', { projectId: p.id }, { wait: false });
+  const opts = live.exportOptions.get(p.id);
+  const res = opts?.resolutions?.find((x) => x.id === exportChoice.resolution) ?? opts?.resolutions?.[0];
+  const pv = live.previews.get(p.id);
+  const cannot = !current ? `The timeline changed after this edit (now revision ${p.revision}). Export the latest instead.` : !isLive() ? 'Exporting runs on your Mac, so it needs to be online.' : null;
+  // Consecutive repeats read as one line: "Trim clip × 3".
+  const steps = [];
+  for (const label of s?.steps ?? []) {
+    const last = steps.at(-1);
+    if (last?.label === label) last.n += 1;
+    else steps.push({ label, n: 1 });
+  }
+  return [
+    h('h1', { class: 'title', text: 'Review & export' }),
+    h(
+      'section',
+      { class: 'card review' },
+      h(
+        'div',
+        { class: 'review-top' },
+        h('button', { class: 'review-art', type: 'button', 'aria-label': 'Open the preview in Session', onclick: () => openSession(p.id) }, poster(p.id, 'tall'), h('span', { class: 'play-badge' }, icon('play', { size: 18 }))),
+        h(
+          'div',
+          { class: 'review-text' },
+          h('h2', { text: `${p.name} · Manual edit` }),
+          pill(current ? `Revision ${n} · current` : `Revision ${n}`, current ? 'ok' : 'warn', current ? 'check' : 'alert'),
+          h('p', { class: 'muted small mt', text: s ? `Edited by hand${s.deviceName ? ` on ${s.deviceName}` : ''} · ${ago(s.endedAt)}` : d ? 'Edited by hand' : 'Loading…' }),
+          s?.steps.length === 0 ? h('p', { text: s.undone ? 'Everything in this edit was undone.' : 'No changes in this edit.' }) : d && !s ? h('p', { text: 'No changes were made in this edit.' }) : null,
+        ),
+      ),
+      steps.length ? h('ul', { class: 'changes' }, steps.map((x) => h('li', {}, icon('check', { size: 16 }), h('span', { class: 'grow', text: x.n > 1 ? `${x.label} × ${x.n}` : x.label })))) : null,
+      s?.undone ? h('p', { class: 'muted small', text: `${plural(s.undone, 'step')} undone along the way.` }) : null,
+      h('p', { class: 'muted small', text: pv?.url && pv.revision === n ? 'The preview in Session shows this revision.' : 'A preview of this revision renders on your Mac; it shows in Session when ready.' }),
+      h('div', { class: 'row gap' }, button('Adjust edit', { small: true, iconName: 'pencil', disabled: !current || !isLive(), onclick: () => openEditor(p.id, p.revision) }), button('Continue with agent', { small: true, kind: 'mint', iconName: 'director', onclick: () => continueWithAgent(p) })),
+    ),
+    h('h2', { class: 'section-title', text: 'Export settings' }),
+    h(
+      'section',
+      { class: 'card settings' },
+      settingRow('file', 'Format', opts ? `${opts.format}` : 'MP4', null),
+      settingRow('crop', 'Resolution', res ? `${res.width} × ${res.height}` : `${p.width} × ${p.height}`, opts ? () => pickSheet('Resolution', opts.resolutions.map((x) => ({ id: x.id, label: `${x.width} × ${x.height}`, note: x.id === 'full' ? 'Project size' : 'Half size, smaller file' })), exportChoice.resolution, (id) => (exportChoice.resolution = id)) : null),
+      settingRow('layers', 'Frame rate', `${opts?.fps ?? p.fps} fps`, null),
+      settingRow('film', 'Quality', exportChoice.quality === 'small' ? 'Smaller file' : 'Standard', opts ? () => pickSheet('Quality', opts.qualities.map((x) => ({ id: x.id, label: x.label })), exportChoice.quality, (id) => (exportChoice.quality = id)) : null),
+      h('p', { class: 'muted small', text: `Saved on ${pairing()?.macName ?? 'your Mac'} in ${opts?.folder ?? 'Movies › ReelForge'}. Frame rate follows the project.` }),
+    ),
+    cannot ? h('p', { class: 'notice-line', text: cannot }) : null,
+    button('Export this revision', { kind: 'primary', iconName: 'exports', full: true, disabled: Boolean(cannot) || exportBusy, onclick: () => approveAndExport(p, null, null, n) }),
+    projectExports(p.id),
+  ];
+}
+
+/** Back to the conversation with the agent; its next instruction starts from the latest revision. */
+function continueWithAgent(p) {
+  openSession(p.id);
+  requestAnimationFrame(() => composers.get(p.id)?.area.focus());
 }
 
 function settingRow(iconName, label, value, onclick) {
@@ -1241,6 +1360,7 @@ function pageMenu(r) {
     }
     items.push(['projects', 'Switch project', chooseProjectSheet]);
   }
+  if (r.name === 'session' && r.id && (st.live || editingOf(r.id))) items.splice(1, 0, ['pencil', 'Edit by hand', () => openEditor(r.id, projectById(r.id).revision)]);
   if (r.name === 'review') items.push(['history', 'Version history', () => versionHistorySheet(projectById(r.id), detailOf(r.id))]);
   items.push(['refresh', 'Refresh from the Mac', () => (st.live ? core.command('sync', {}, { wait: false }) : core.connect())]);
   items.push(['monitor', 'Device & pairing', openDeviceSheet]);
@@ -1309,11 +1429,24 @@ function render() {
     app.replaceChildren(header({ back: saved.pairings.length ? '#/projects' : null }), h('main', { class: 'page' }, pairScreen(r)));
     return;
   }
+  if (r.name === 'edit') {
+    document.body.dataset.screen = 'edit';
+    if (!projectById(r.id) && !editorActive()) {
+      app.replaceChildren(header({ back: '#/projects' }), h('main', { class: 'page' }, h('section', { class: 'card empty' }, h('p', { text: 'That project isn’t synced on this phone.' }), button('Projects', { onclick: () => go('#/projects') }))));
+      return;
+    }
+    const root = editScreen({ ...r, from: editReturn ?? `#/session/${r.id}` });
+    if (app.firstChild !== root || app.childNodes.length !== 1) app.replaceChildren(root);
+    lastRoute = location.hash;
+    return;
+  }
+  if (editorActive()) leaveEditor();
   document.body.dataset.screen = r.name;
-  const back = r.name === 'review' ? `#/session/${r.id}` : null;
+  const back = r.name === 'review' || r.name === 'review-rev' ? `#/session/${r.id}` : null;
   let content;
   if (r.name === 'session') content = sessionScreen(r);
   else if (r.name === 'review') content = reviewScreen(r);
+  else if (r.name === 'review-rev') content = reviewRevisionScreen(r);
   else if (r.name === 'exports') content = exportsScreen();
   else content = projectsScreen();
   const routeKey = location.hash;
@@ -1325,7 +1458,7 @@ function render() {
       connectionStrip(),
       page,
       sessionId && projectById(sessionId) ? composer(sessionId) : null,
-      dock(r.name === 'review' ? 'session' : r.name),
+      dock(r.name === 'review' || r.name === 'review-rev' ? 'session' : r.name),
     ].filter(Boolean),
   );
   if (routeKey !== lastRoute) {
@@ -1336,6 +1469,8 @@ function render() {
 }
 
 core.onChange(() => {
+  // The editor keeps its own DOM and never rebuilds a field being typed in.
+  if (route().name === 'edit') return render();
   // Don't redraw under a finger typing in a field that isn't kept between redraws.
   const a = document.activeElement;
   if (a && (a.matches('input.search, input.field, textarea.field') || a.closest('.sheet'))) {
@@ -1356,6 +1491,7 @@ const vv = window.visualViewport;
 function keyboardOffset() {
   const kb = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
   document.documentElement.style.setProperty('--kb', `${Math.round(kb)}px`);
+  if (vv) document.documentElement.style.setProperty('--vvh', `${Math.round(vv.height)}px`);
   document.body.classList.toggle('kb-open', kb > 80);
 }
 vv?.addEventListener('resize', keyboardOffset);
@@ -1374,7 +1510,18 @@ navigator.serviceWorker?.addEventListener('message', (e) => {
   if (typeof e.data?.open === 'string' && e.data.open.startsWith('/')) location.hash = new URL(e.data.open, location.origin).hash || '#/projects';
 });
 
-setInterval(() => !document.hidden && !document.activeElement?.matches?.('input, textarea') && render(), 30_000); // keeps "2 min ago" honest
+setInterval(() => !document.hidden && !document.activeElement?.matches?.('input, textarea') && route().name !== 'edit' && render(), 30_000); // keeps "2 min ago" honest
+
+initEditor({
+  toast,
+  go,
+  render,
+  projectById,
+  detailOf,
+  // One sound at a time: the Session player stops when the editor opens.
+  pausePlayers: () => players.forEach((pl) => pl.video.pause()),
+});
+keyboardOffset();
 
 function capital(s) {
   return s ? s[0].toUpperCase() + s.slice(1) : s;

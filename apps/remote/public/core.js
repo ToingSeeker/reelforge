@@ -26,27 +26,40 @@ function load() {
       drafts: raw.drafts && typeof raw.drafts === 'object' ? raw.drafts : {},
       outbox: Array.isArray(raw.outbox) ? raw.outbox : [],
       prefs: { notify: { exports: true, proposals: true, failures: true }, model: {}, askedNotify: false, ...(raw.prefs ?? {}) },
+      edits: raw.edits && typeof raw.edits === 'object' ? raw.edits : {},
     };
   } catch {
-    return { pairings: [], active: null, macs: {}, drafts: {}, outbox: [], prefs: { notify: { exports: true, proposals: true, failures: true }, model: {}, askedNotify: false } };
+    return { pairings: [], active: null, macs: {}, drafts: {}, outbox: [], prefs: { notify: { exports: true, proposals: true, failures: true }, model: {}, askedNotify: false }, edits: {} };
   }
 }
 
 export const saved = load();
 let saveTimer = 0;
-export function persist() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+function write() {
+  saveTimer = 0;
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(saved));
+  } catch {
+    // full: drop cached details first, they come back from the Mac
+    for (const m of Object.values(saved.macs)) m.details = {};
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(saved));
-    } catch {
-      // full: drop cached details first, they come back from the Mac
-      for (const m of Object.values(saved.macs)) m.details = {};
-      try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(saved));
-      } catch {}
-    }
-  }, 150);
+    } catch {}
+  }
+}
+export function persist() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(write, 150);
+}
+/** Writes now if a save is waiting: the page may be about to go (reload, app switch, closed tab). */
+export function persistNow() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer);
+  write();
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', persistNow);
+  document.addEventListener('visibilitychange', () => document.visibilityState === 'hidden' && persistNow());
 }
 
 /** Cached data for one Mac (snapshot, details, last project), created on first use. */
@@ -519,6 +532,14 @@ async function gotPoster(ev, revision) {
   }
 }
 
+/** A sealed blob the Mac put on the relay for this phone (stills, filmstrips), opened. */
+export async function fetchBlob(id) {
+  const res = await fetch(`/api/blob?id=${encodeURIComponent(id)}`, { headers: auth(), cache: 'no-store' });
+  if (!res.ok) throw new Error(`The relay answered ${res.status}.`);
+  const file = await unseal(keys.key, (await res.json()).c, `blob:${id}`);
+  return new Blob([Uint8Array.from(atob(file.data), (c) => c.charCodeAt(0))], { type: file.type });
+}
+
 /** Posters and previews saved earlier, so the app shows them before (or without) the Mac. */
 export async function restoreMedia() {
   const p = activePairing();
@@ -800,6 +821,7 @@ function onQueueEvent(ev) {
   if (ev.proposalId) item.proposalId = ev.proposalId;
   if (ev.message) item.error = ev.message;
   if (ev.currentRevision) item.currentRevision = ev.currentRevision;
+  item.reason = ev.reason ?? null;
   if (before !== item.state) {
     if (item.state === 'accepted') notice('Your Mac took the instruction.');
     else if (item.state === 'done') notice('Review ready.');

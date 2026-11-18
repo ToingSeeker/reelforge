@@ -1,5 +1,6 @@
 export { probeFile, resolveSource, interpretProbe, sourceInputArgs, SUPPORTED_EXTENSIONS } from "./probe.ts";
 export { ensureThumbnail, thumbnailFile, type Thumbnail } from "./thumbnails.ts";
+export { sourceStill, ensureFilmstrip, STILL_MAX, FILMSTRIP_HEIGHT, type Filmstrip } from "./frames.ts";
 export { importMedia, relinkMedia, expandFolders, MAX_IMPORT_BATCH, type ImportResult, type ImportFailure } from "./import.ts";
 export { compileRender, effectFilters, exportSettings, previewSettings, frameSeconds, AUDIO_RATE } from "./compile.ts";
 export { ensureProxy } from "./proxy.ts";

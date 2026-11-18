@@ -199,15 +199,16 @@ export class TimelineStore {
     return this.get(pid);
   }
 
-  undo(projectId: string, input: HistoryInput, actor: Actor): Timeline {
-    return this.#travel(projectId, input, actor, "undo");
+  /** `meta` is recorded with the step (e.g. which phone edit session undid it). */
+  undo(projectId: string, input: HistoryInput, actor: Actor, meta: Record<string, unknown> = {}): Timeline {
+    return this.#travel(projectId, input, actor, "undo", meta);
   }
 
-  redo(projectId: string, input: HistoryInput, actor: Actor): Timeline {
-    return this.#travel(projectId, input, actor, "redo");
+  redo(projectId: string, input: HistoryInput, actor: Actor, meta: Record<string, unknown> = {}): Timeline {
+    return this.#travel(projectId, input, actor, "redo", meta);
   }
 
-  #travel(projectId: string, input: HistoryInput, actor: Actor, dir: "undo" | "redo"): Timeline {
+  #travel(projectId: string, input: HistoryInput, actor: Actor, dir: "undo" | "redo", meta: Record<string, unknown>): Timeline {
     const pid = parse(ProjectIdSchema, projectId);
     const { baseRevision } = parse(HistoryInputSchema, input);
     transaction(this.#db, () => {
@@ -226,7 +227,7 @@ export class TimelineStore {
         projectId: pid,
         baseRevision,
         kind: `history.${dir}`,
-        payload: { operationId: target.id, revision: target.revision },
+        payload: { ...meta, operationId: target.id, revision: target.revision },
         actor,
         now: this.#now(),
       });

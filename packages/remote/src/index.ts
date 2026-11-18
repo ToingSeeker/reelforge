@@ -32,7 +32,9 @@ export {
   type RemoteAiOptions,
   type RemoteAsk,
   type RemoteDeviceInfo,
+  type RemoteEditing,
   type RemoteEngineInfo,
+  type RemoteFrames,
   type RemoteExport,
   type RemoteJob,
   type RemoteManagerOptions,
@@ -47,4 +49,5 @@ export {
   type RemoteStatus,
   type RemoteVersion,
 } from "./manager.ts";
+export { EditSessions, EditError, EDIT_CHANNEL, LEASE_MS, type EditLease, type ManualEditSummary } from "./edit.ts";
 export { checkEndpoint, encryptPayload, newVapidKeys, sendPush, vapidAuthorization, MAX_PUSH_PAYLOAD, type PushResult, type PushSubscription, type VapidKeys } from "./push.ts";

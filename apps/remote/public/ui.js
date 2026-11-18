@@ -63,6 +63,23 @@ const PATHS = {
   wifiOff: 'M3 3l18 18M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 4.2-2.4M19 12.9a10 10 0 0 0-2.5-1.7M2 9.3a15 15 0 0 1 4.6-2.8M22 9.3A15 15 0 0 0 11 5.1M12 20h.01',
   stop: 'M7 7h10v10H7z',
   queue: 'M4 6h12M4 12h12M4 18h7M17 15v6M14 18h6',
+  // the phone editor
+  undo: 'M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11',
+  redo: 'M15 14l5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H13',
+  chevronLeft: 'M15 6l-6 6 6 6',
+  scissors: 'M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM20 4L8.1 15.9M14.5 14.5L20 20M8.1 8.1L12 12',
+  clip: 'M3.5 6h17v12h-17zM7.5 6v12M16.5 6v12',
+  frame: 'M6.5 2.5v14h14M2.5 6.5h14v14',
+  cc: 'M3.5 5.5h17v13h-17zM10.5 10.2a2.4 2.4 0 1 0 0 3.6M17 10.2a2.4 2.4 0 1 0 0 3.6',
+  audio: 'M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2',
+  sliders: 'M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4',
+  reset: 'M4 12a8 8 0 1 0 2.3-5.7L4 8.5M4 4v4.5h4.5',
+  grip: 'M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01',
+  list: 'M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01',
+  minus: 'M5 12h14',
+  arrowUp: 'M12 19V5M6 11l6-6 6 6',
+  arrowDown: 'M12 5v14M6 13l6 6 6-6',
+  ripple: 'M3 7h7v10H3zM14 7h7v10h-7zM10 12h4',
 };
 
 export function icon(name, { size = 20, label } = {}) {

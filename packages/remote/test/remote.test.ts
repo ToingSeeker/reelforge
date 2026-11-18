@@ -7,6 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AssetStore, JobStore, openDatabase, ProjectStore, ProposalStore, TimelineStore, type RenderJob } from "@reelforge/core";
 import {
+  EditSessions,
+  LEASE_MS,
   deriveDeviceKeys,
   normalisePairingCode,
   normaliseUrl,
@@ -426,4 +428,112 @@ test("exports: approve a version at a named revision, render, download in sealed
   assert.equal((await until("cancelled", () => p.reply(cancel.id, "job"))).state, "cancelled");
   void m;
   assert.ok(existsSync(job.outputPath!));
+});
+
+test("manual edit: a lease per project, idempotent edits on the shared reducer, conflicts never overwrite, undo stays in the session", async (t) => {
+  const { db, home, p, m, creds, url } = await paired(t, { ai: { providers: async () => [], propose: () => Promise.reject(new Error("unused")) } });
+  const project = new ProjectStore(db).create({ name: "Spider trade", settings: { width: 1080, height: 1920 } }, "desktop");
+  const { clip } = addClip(db, home, project.id);
+  const ask = async (type: string, extra: Record<string, unknown>) => {
+    const s = await p.send(type, { projectId: project.id, ...extra });
+    return until(type, () => p.events.find((e) => e.id === s.id && (e.t === "edit" || e.t === "error"))) as Promise<Ev & { model: { revision: number; clips: { id: string; start: number; duration: number; sourceIn: number; props: { scale: number } }[]; history: { canUndo: boolean; canRedo: boolean } }; revision: number; duplicate: boolean; code?: string; details?: Record<string, unknown>; lease: { mine: boolean } | null }>;
+  };
+  const sessionId = crypto.randomUUID();
+
+  // Read-only look first, then the lease.
+  const opened = await ask("edit.open", {});
+  assert.equal(opened.t, "edit");
+  assert.equal(opened.lease, null);
+  assert.equal(opened.model.clips.length, 1);
+  const begun = await ask("edit.begin", { sessionId });
+  assert.equal(begun.lease?.mine, true);
+  const base = begun.model.revision;
+
+  // A trim through the same operation the desktop uses; one command id, one revision.
+  const commandId = crypto.randomUUID();
+  const trim = await ask("edit.apply", { sessionId, commandId, baseRevision: base, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 60 }] });
+  assert.equal(trim.t, "edit", String(trim.message));
+  assert.equal(trim.revision, base + 1);
+  assert.equal(new TimelineStore(db).get(project.id).clips[0]!.duration, 60);
+  // The answer got lost and the phone sends it again: same result, not applied twice.
+  const again = await ask("edit.apply", { sessionId, commandId, baseRevision: base, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 60 }] });
+  assert.equal(again.duplicate, true);
+  assert.equal(new ProjectStore(db).get(project.id).revision, base + 1);
+
+  // The reducer's rules hold on the phone too: past the source's end is refused, nothing changes.
+  const bad = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: base + 1, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 9999 }] });
+  assert.equal(bad.code, "VALIDATION_ERROR");
+  assert.equal(new ProjectStore(db).get(project.id).revision, base + 1);
+
+  // While a phone edits, the agent and outside undo wait.
+  assert.throws(() => m.ask(project.id, { instruction: "zoom", provider: "x", model: "y" }), /editing this project by hand/);
+  assert.throws(() => m.history("undo", project.id, base + 1), /editing this project by hand/);
+
+  // Desktop edits in between: the phone's next edit names the old revision and is refused, not merged.
+  new TimelineStore(db).apply(project.id, { baseRevision: base + 1, operations: [{ type: "clip.update", clipId: clip.id, props: { scale: 1.5 } }] }, "desktop");
+  const conflict = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: base + 1, label: "Framing", operations: [{ type: "clip.update", clipId: clip.id, props: { scale: 2 } }] });
+  assert.equal(conflict.code, "REVISION_CONFLICT");
+  assert.equal(conflict.details?.currentRevision, base + 2);
+  assert.equal(new TimelineStore(db).get(project.id).clips[0]!.props.scale, 1.5, "the desktop's change stands");
+
+  // Undo is scoped to the session: the newest step is the desktop's, so the phone can't undo it.
+  const now = await ask("edit.open", {});
+  assert.equal(now.model.history.canUndo, false);
+  const split = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: base + 2, label: "Split", operations: [{ type: "clip.split", clipId: clip.id, frame: 30 }] });
+  assert.equal(split.model.clips.length, 2);
+  assert.equal(split.model.history.canUndo, true);
+  const undo = await ask("edit.undo", { sessionId, commandId: crypto.randomUUID(), baseRevision: split.revision });
+  assert.equal(undo.model.clips.length, 1);
+  assert.equal(undo.model.history.canRedo, true);
+  assert.equal(undo.model.history.canUndo, false, "the desktop's step under it isn't the phone's to undo");
+
+  // A second phone can't take the lease while the first holds it.
+  const { pairing } = await m.startPairing();
+  const creds2 = await pair(url, pairing!.code, "Second phone");
+  const p2 = phone(url, creds2);
+  t.after(() => p2.close());
+  const hello2 = await p2.send("device.hello", { name: "Second phone" });
+  await until("paired 2", () => p2.reply(hello2.id, "device"));
+  const s2 = await p2.send("edit.begin", { projectId: project.id, sessionId: crypto.randomUUID() });
+  const locked = await until("locked", () => p2.events.find((e) => e.id === s2.id && e.t === "error"));
+  assert.equal(locked.code, "EDIT_LOCKED");
+  assert.equal((locked.details as { deviceName: string }).deviceName, "Test iPhone");
+
+  // Done: the lease is released and the session is summarised for Review.
+  const end = await ask("edit.end", { sessionId });
+  assert.equal(end.lease, null);
+  const summary = (end as unknown as { summary: { fromRevision: number; toRevision: number; steps: string[]; undone: number } }).summary;
+  assert.deepEqual(summary.steps, ["Trim clip"]);
+  assert.equal(summary.undone, 1);
+  assert.equal(summary.toRevision, new ProjectStore(db).get(project.id).revision);
+  const after = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: summary.toRevision, label: "Split", operations: [{ type: "clip.split", clipId: clip.id, frame: 30 }] });
+  assert.equal(after.code, "LEASE_LOST");
+  void creds;
+});
+
+test("manual edit: a lease lapses on its own when the phone goes quiet", () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-lease-")));
+  const db = openDatabase(join(home, "reelforge.db"));
+  try {
+    let now = 1_000_000;
+    const edits = new EditSessions(db, { now: () => now });
+    const project = new ProjectStore(db).create({ name: "P", settings: { width: 1080, height: 1920 } }, "desktop");
+    const sid = crypto.randomUUID();
+    edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d1", deviceName: "Phone 1", agentBusy: false });
+    assert.throws(() => edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d2", deviceName: "Phone 2", agentBusy: false }), /Phone 1 is editing/);
+    assert.throws(() => edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d2", deviceName: "Phone 2", agentBusy: true }), /editing/);
+    now += LEASE_MS - 1000;
+    edits.heartbeat("d1", project.id, sid);
+    now += LEASE_MS - 1000;
+    assert.ok(edits.lease(project.id), "the heartbeat kept it");
+    now += 2000;
+    assert.equal(edits.lease(project.id), null, "no heartbeat: it lapsed");
+    assert.throws(() => edits.heartbeat("d1", project.id, sid), /ended/);
+    const other = edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d2", deviceName: "Phone 2", agentBusy: false });
+    assert.equal(other.lease.deviceName, "Phone 2");
+    assert.throws(() => edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d3", deviceName: "Phone 3", agentBusy: true }), (e: Error & { code?: string }) => e.code === "EDIT_LOCKED");
+  } finally {
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+  }
 });

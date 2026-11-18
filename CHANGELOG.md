@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Manual editing from the phone.** ReelForge Remote has an Edit screen (Session → Edit, Review → Adjust edit)
+  for fixing the agent's result by hand: trim, split, delete (with or without ripple) and reorder clips; framing
+  (fit/fill, scale, position, by drag and pinch on the preview); caption text, timing, style, size and position;
+  clip and track volume, fades and mute; looks (vignette, black & white, sepia, blur, sharpen, grain). Edits are
+  the desktop's own timeline operations, so the desktop shows them and exports use them. One phone edits a project
+  at a time (a lease that lapses 45 s after the phone goes quiet); every edit carries a command id and the revision
+  it was made against, so a retry is applied once and an edit made on the Mac in between is a conflict the user
+  resolves, never an overwrite. While paused the preview is composited on the phone from source stills with the
+  export's placement maths and caption layout; playing shows the Mac's rendered preview, labelled with its
+  revision. Done opens Review of the new revision, ready to export. The agent waits while a project is edited by hand.
+  Not available yet: exposure/contrast/saturation (the export engine has none), per-caption styles (styles are per
+  caption track), keyframed framing on the phone, editing offline.
+
 - **Motion graphics with Remotion.** The Templates panel has three original templates (title card, lower
   third, badge), a live preview of the actual composition, and fields generated from each template's schema. "Add at
   playhead" renders the graphic once on this Mac into a transparent ProRes 4444 clip (identical inputs reuse

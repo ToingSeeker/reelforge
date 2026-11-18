@@ -26,6 +26,7 @@ import {
   type RenderJob,
 } from "@reelforge/core";
 import { RemoteDaemon, PIECE_BYTES, errText, type DaemonStatus, type QueuedInstruction, type RemoteCommand } from "./daemon.ts";
+import { EditError, EditSessions, type EditLease, type ManualEditSummary } from "./edit.ts";
 import { deriveDeviceKeys, deriveKeys, formatPairingCode, macIdOf, newPairingCode, newSecret, pairAnswer, verifyPairHello, type PairingCode } from "./keys.ts";
 import { checkEndpoint, newVapidKeys, sendPush, type PushSubscription, type VapidKeys } from "./push.ts";
 
@@ -146,6 +147,27 @@ export interface RemoteProjectDetail extends RemoteProject {
   asking: RemoteAsk | null;
   preview: RemotePreview | null;
   jobs: { id: string; kind: string; state: string; progress: number; revision: number; error: string | null; createdAt: string; finishedAt: string | null; sizeBytes: number | null }[];
+  /** Manual edit sessions from phones, newest first (Review of a manual revision reads these). */
+  manual: ManualEditSummary[];
+  /** Who is editing this project by hand right now. */
+  editing: RemoteEditing | null;
+}
+
+export interface RemoteEditing {
+  projectId: string;
+  deviceId: string;
+  deviceName: string;
+  sessionId: string;
+  startedAt: string;
+  expiresAt: string;
+}
+
+/** Source pictures for the phone's editor (from @reelforge/media). */
+export interface RemoteFrames {
+  /** The source at `timeUs`, ≤ 720 px. */
+  still(asset: Asset, timeUs: number): Promise<string>;
+  /** Evenly spaced pictures of the whole source in one strip. */
+  filmstrip(asset: Asset): Promise<{ path: string; count: number; stepUs: number }>;
 }
 
 export interface RemoteAiOptions {
@@ -242,6 +264,7 @@ export interface RemoteManagerOptions {
   ai?: RemoteAi;
   render?: RemoteRender;
   media?: RemoteMedia;
+  frames?: RemoteFrames;
   /** How this engine runs, and whether the editor window is open (both for the phone's status line). */
   engine?: () => RemoteEngineInfo;
   editor?: () => EditorState;
@@ -342,6 +365,8 @@ export class RemoteManager {
   #powerTimer: ReturnType<typeof setInterval> | undefined;
   #uploads = new Map<string, AbortController>();
   readonly #startedAt = new Date().toISOString();
+  /** Manual editing from phones: one lease per project. */
+  readonly #edits: EditSessions;
 
   constructor(opts: RemoteManagerOptions) {
     this.#opts = { ...opts };
@@ -349,6 +374,7 @@ export class RemoteManager {
     this.#devicesFile = join(opts.dir, "devices.json");
     this.#handledFile = join(opts.dir, "handled.json");
     this.#pushFile = join(opts.dir, "push.json");
+    this.#edits = new EditSessions(opts.db);
   }
 
   // ── files ────────────────────────────────────────────────────────────────
@@ -645,6 +671,7 @@ export class RemoteManager {
     const gone = f.devices.find((d) => d.id === deviceId);
     if (!gone || (onlyUnconfirmed && gone.confirmed)) return;
     const rest = f.devices.filter((d) => d.id !== deviceId);
+    this.#edits.releaseDevice(deviceId);
     // New broadcast key, so the removed phone can't read what is said from now on; the others get it sealed
     // with their own keys before anything is sealed with it.
     const next = { broadcastKey: randomBytes(32).toString("base64"), devices: rest };
@@ -799,6 +826,7 @@ export class RemoteManager {
       exports: exports.slice(0, 30),
       asks,
       jobs,
+      editing: this.#edits.leases().map(editingOf),
     };
   }
 
@@ -846,6 +874,7 @@ export class RemoteManager {
       createdAt: x.createdAt,
     }));
     const ask = this.#asks.get(projectId);
+    const lease = this.#edits.lease(projectId);
     const jobs = jobStore.list(projectId, { limit: 10 });
     const preview = jobs.find((j) => j.kind === "preview" && j.state !== "failed" && j.state !== "cancelled") ?? null;
     const fps = Math.round((p.settings.fps.num / p.settings.fps.den) * 100) / 100;
@@ -891,6 +920,8 @@ export class RemoteManager {
         finishedAt: j.finishedAt,
         sizeBytes: sizes.get(j.id) ?? null,
       })),
+      manual: this.#edits.summaries(projectId),
+      editing: lease ? editingOf(lease) : null,
     };
   }
 
@@ -926,6 +957,9 @@ export class RemoteManager {
     if (!instruction || instruction.length > 4000) throw new ReelForgeError("VALIDATION_ERROR", "Write what to change (up to 4000 characters).");
     if (typeof input.provider !== "string" || typeof input.model !== "string") throw new ReelForgeError("VALIDATION_ERROR", "Pick a model first.");
     if (this.#asks.has(projectId)) throw new ReelForgeError("VALIDATION_ERROR", "The AI Director is still working on this project. Wait for it, or cancel it.");
+    // The agent never edits under a hand: a phone editing this project by hand finishes (Done) first.
+    const editing = this.#edits.lease(projectId);
+    if (editing) throw new ReelForgeError("VALIDATION_ERROR", `${editing.deviceName} is editing this project by hand. Tap Done there, then ask again.`);
     new ProjectStore(this.#opts.db).get(projectId); // NOT_FOUND before anything starts
     const provider = input.provider;
     const model = input.model;
@@ -954,8 +988,15 @@ export class RemoteManager {
   }
 
   applyProposal(proposalId: string): { projectId: string; revision: number } {
+    this.#notEditing(new ProposalStore(this.#opts.db).get(proposalId).projectId);
     const r = new ProposalStore(this.#opts.db).apply(proposalId, { by: PHONE_ACTOR, channel: PHONE_CHANNEL });
     return { projectId: r.proposal.projectId, revision: r.timeline.project.revision };
+  }
+
+  /** Timeline changes from outside a manual edit session wait until it ends (Done), so nothing lands under a hand. */
+  #notEditing(projectId: string): void {
+    const l = this.#edits.lease(projectId);
+    if (l) throw new ReelForgeError("VALIDATION_ERROR", `${l.deviceName} is editing this project by hand. Tap Done there first.`);
   }
 
   rejectProposal(proposalId: string): { projectId: string } {
@@ -964,6 +1005,7 @@ export class RemoteManager {
 
   history(action: "undo" | "redo", projectId: string, baseRevision: unknown): { revision: number } {
     if (typeof baseRevision !== "number") throw new ReelForgeError("VALIDATION_ERROR", "baseRevision is required");
+    this.#notEditing(projectId);
     const store = new TimelineStore(this.#opts.db);
     const tl = action === "undo" ? store.undo(projectId, { baseRevision }, PHONE_ACTOR) : store.redo(projectId, { baseRevision }, PHONE_ACTOR);
     return { revision: tl.project.revision };
@@ -1076,6 +1118,17 @@ export class RemoteManager {
           const projectId = uuidOf(cmd.projectId, "project");
           return reply({ t: "history", action: cmd.type, projectId, ...this.history(cmd.type, projectId, cmd.baseRevision) });
         }
+        case "edit.open":
+        case "edit.begin":
+        case "edit.heartbeat":
+        case "edit.apply":
+        case "edit.undo":
+        case "edit.redo":
+        case "edit.end":
+          return reply(await this.#edit(deviceId, cmd));
+        case "edit.still":
+        case "edit.strip":
+          return reply(await this.#frame(deviceId, cmd));
         case "export.options":
           return reply({ t: "export.options", ...this.exportOptions(uuidOf(cmd.projectId, "project")) });
         case "export.start": {
@@ -1117,8 +1170,94 @@ export class RemoteManager {
       }
       return reply({ t: "error", message: `Unknown command: ${String(cmd.type).slice(0, 40)}` });
     } catch (e) {
-      reply({ t: "error", type: String(cmd.type).slice(0, 40), code: codeOf(e), message: errText(e) });
+      const details = String(cmd.type).startsWith("edit.") ? detailsOf(e) : null;
+      reply({ t: "error", type: String(cmd.type).slice(0, 40), code: codeOf(e), message: errText(e), ...(details ? { details } : {}) });
     }
+  }
+
+  // ── manual editing ───────────────────────────────────────────────────────
+
+  /** The edit-session commands. Every answer carries the timeline as it is after the command. */
+  async #edit(deviceId: string, cmd: RemoteCommand): Promise<Record<string, unknown>> {
+    const projectId = uuidOf(cmd.projectId, "project");
+    const edits = this.#edits;
+    const sessionId = typeof cmd.sessionId === "string" ? cmd.sessionId : null;
+    const answer = (extra: Record<string, unknown>, sid: string | null = sessionId) => {
+      const lease = edits.lease(projectId);
+      const ask = this.#asks.get(projectId);
+      return {
+        t: "edit",
+        projectId,
+        ...extra,
+        lease: lease ? { ...editingOf(lease), mine: lease.deviceId === deviceId && lease.sessionId === sid } : null,
+        agent: ask ? { instruction: ask.instruction, startedAt: ask.startedAt } : null,
+        model: edits.model(projectId, sid),
+      };
+    };
+    switch (cmd.type) {
+      case "edit.open":
+        // Read-only look before editing: the timeline, who holds the lease, whether the agent is busy.
+        return answer({ action: "open" }, null);
+      case "edit.begin": {
+        // "Stop agent & edit": the agent only proposes (it never writes the timeline), so stopping it
+        // mid-plan leaves nothing half-done; the request is cancelled and editing starts.
+        if (cmd.stopAgent === true && this.#asks.has(projectId)) {
+          this.cancelAsk(projectId);
+          const end = Date.now() + 5000;
+          while (this.#asks.has(projectId) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+        }
+        const { lease, resumed } = edits.begin({ projectId, sessionId: cmd.sessionId, deviceId, deviceName: this.#deviceName(deviceId), agentBusy: this.#asks.has(projectId) });
+        this.#daemon?.sendSnapshot();
+        return answer({ action: "begin", resumed }, lease.sessionId);
+      }
+      case "edit.heartbeat": {
+        const lease = edits.heartbeat(deviceId, projectId, cmd.sessionId);
+        return { t: "edit", projectId, action: "heartbeat", expiresAt: new Date(lease.expiresAt).toISOString(), revision: new ProjectStore(this.#opts.db).get(projectId).revision };
+      }
+      case "edit.apply": {
+        const r = edits.apply(deviceId, { projectId, sessionId: cmd.sessionId, commandId: cmd.commandId, baseRevision: cmd.baseRevision, operations: cmd.operations, label: cmd.label });
+        this.#daemon?.sendSnapshot();
+        return answer({ action: "apply", commandId: cmd.commandId, ...r });
+      }
+      case "edit.undo":
+      case "edit.redo": {
+        const r = edits.travel(deviceId, cmd.type === "edit.undo" ? "undo" : "redo", { projectId, sessionId: cmd.sessionId, commandId: cmd.commandId, baseRevision: cmd.baseRevision });
+        this.#daemon?.sendSnapshot();
+        return answer({ action: cmd.type.slice(5), commandId: cmd.commandId, ...r });
+      }
+      case "edit.end": {
+        const r = edits.end(deviceId, projectId, cmd.sessionId);
+        this.#daemon?.sendSnapshot();
+        return answer({ action: "end", ...r });
+      }
+    }
+    throw new ReelForgeError("VALIDATION_ERROR", "unknown edit command");
+  }
+
+  /** A source still or filmstrip for the editor, as a sealed blob for the phone that asked. */
+  async #frame(deviceId: string, cmd: RemoteCommand): Promise<Record<string, unknown>> {
+    const frames = this.#opts.frames;
+    if (!frames) throw new ReelForgeError("UNAVAILABLE", "This Mac's ReelForge can't send pictures to the editor.");
+    const projectId = uuidOf(cmd.projectId, "project");
+    const assetId = uuidOf(cmd.assetId, "asset");
+    const tl = new TimelineStore(this.#opts.db).get(projectId);
+    const asset = tl.assets.find((a) => a.id === assetId);
+    if (!asset) throw new ReelForgeError("NOT_FOUND", "That media isn't in this project.");
+    if (cmd.type === "edit.strip") {
+      const strip = await frames.filmstrip(asset);
+      const blob = await this.#daemon!.putBlob(deviceId, { type: "image/jpeg", data: readFileSync(strip.path).toString("base64") });
+      return { t: "strip", projectId, assetId, blob, count: strip.count, stepUs: strip.stepUs };
+    }
+    const frame = Number(cmd.sourceFrame);
+    if (!Number.isInteger(frame) || frame < 0) throw new ReelForgeError("VALIDATION_ERROR", "bad frame");
+    const fps = tl.project.settings.fps;
+    const path = await frames.still(asset, (frame * fps.den * 1_000_000) / fps.num);
+    const blob = await this.#daemon!.putBlob(deviceId, { type: "image/jpeg", data: readFileSync(path).toString("base64") });
+    return { t: "still", projectId, assetId, sourceFrame: frame, blob };
+  }
+
+  #deviceName(deviceId: string): string {
+    return this.#readDevices().devices.find((d) => d.id === deviceId)?.name ?? "A phone";
   }
 
   /** A finished export or preview, to the phone that asked, in pieces. */
@@ -1185,6 +1324,10 @@ export class RemoteManager {
       project = new ProjectStore(this.#opts.db).get(item.projectId);
     } catch {
       return tell({ state: "failed", message: "That project is no longer on your Mac." });
+    }
+    // Someone is editing by hand: the instruction waits for the user's say-so instead of running underneath.
+    if (this.#edits.lease(item.projectId)) {
+      return tell({ state: "needs_review", reason: "editing", baseRevision: b.baseRevision, currentRevision: project.revision, instruction: b.instruction });
     }
     // Written against an older timeline: the user decides whether it still makes sense, not this Mac.
     if (typeof b.baseRevision === "number" && b.baseRevision !== project.revision) {
@@ -1464,6 +1607,19 @@ function versionLookup(proposals: AIProposal[]): (revision: number) => number | 
 function uuidOf(value: unknown, what: string): string {
   if (typeof value !== "string" || !UUID.test(value)) throw new ReelForgeError("VALIDATION_ERROR", `That ${what} id isn't valid.`);
   return value;
+}
+
+function editingOf(l: EditLease): RemoteEditing {
+  return { projectId: l.projectId, deviceId: l.deviceId, deviceName: l.deviceName, sessionId: l.sessionId, startedAt: l.startedAt, expiresAt: new Date(l.expiresAt).toISOString() };
+}
+
+/** What an edit failure says beyond its message: revisions, who holds the lease, which operation failed. */
+function detailsOf(e: unknown): Record<string, unknown> | null {
+  const d = e instanceof EditError || e instanceof ReelForgeError ? e.details : null;
+  if (!d) return null;
+  const keep: Record<string, unknown> = {};
+  for (const k of ["currentRevision", "baseRevision", "deviceName", "expiresAt", "opIndex", "clipId", "captionId", "overlaps"]) if (k in d) keep[k] = d[k];
+  return keep;
 }
 
 /** ReelForgeError's code (CONSENT_REQUIRED, REVISION_CONFLICT, …), so the phone can say what to do. */
