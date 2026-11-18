@@ -337,6 +337,7 @@ function previewCard(p, d) {
   if (st.live && remote?.state === 'completed' && remote.current && pv?.jobId !== remote.jobId && pv?.state !== 'loading') {
     actions.push(button(`Load latest preview${remote.sizeBytes ? ` (${size(remote.sizeBytes)})` : ''}`, { small: true, iconName: 'exports', onclick: () => core.loadPreview(p.id, remote) }));
   }
+  const canExport = st.live && !jobsOf(p.id).some((j) => j.kind === 'export');
   const body = [];
   if (!previewCollapsed) {
     if (pv?.url) body.push(player(p.id, pv));
@@ -351,7 +352,12 @@ function previewCard(p, d) {
       'div',
       { class: 'card-head' },
       h('span', { class: `small ${tone === 'ok' ? 'ok-text' : 'muted'}`, text: label }),
-      iconButton(previewCollapsed ? 'chevronDown' : 'chevronUp', previewCollapsed ? 'Show preview' : 'Hide preview', () => ((previewCollapsed = !previewCollapsed), render())),
+      h(
+        'div',
+        { class: 'row gap' },
+        canExport ? button('Export', { small: true, iconName: 'exports', aria: 'Export the current timeline', onclick: () => exportTimelineSheet(p.id) }) : null,
+        iconButton(previewCollapsed ? 'chevronDown' : 'chevronUp', previewCollapsed ? 'Show preview' : 'Hide preview', () => ((previewCollapsed = !previewCollapsed), render())),
+      ),
     ),
     body,
     actions.length ? h('div', { class: 'row gap wrap mt' }, actions) : null,
@@ -763,7 +769,13 @@ async function approveAndExport(p, v, proposalId, revision) {
   try {
     const r = await core.command('export.start', { projectId: p.id, proposalId, revision, resolution: exportChoice.resolution, quality: exportChoice.quality });
     if (!r) return toast('Your Mac isn’t connected.');
-    if (r.t === 'error') return toast(r.code === 'REVISION_CONFLICT' ? r.message : `Couldn’t start the export: ${r.message}`);
+    if (r.t === 'error') {
+      if (r.code === 'REVISION_CONFLICT' && !proposalId) {
+        core.openProject(p.id, true);
+        return toast('The timeline just changed on your Mac. Check it and export again.');
+      }
+      return toast(r.code === 'REVISION_CONFLICT' ? r.message : `Couldn’t start the export: ${r.message}`);
+    }
     toast(r.applied ? 'Approved. The export is queued on your Mac.' : 'Export queued on your Mac.');
     core.openProject(p.id, true);
     maybeAskForNotifications('export');
@@ -772,6 +784,39 @@ async function approveAndExport(p, v, proposalId, revision) {
     exportBusy = false;
     render();
   }
+}
+
+/** Export the timeline as it is on the Mac right now — no version needed. Settings are shared with Review. */
+async function exportTimelineSheet(projectId) {
+  let opts = live.exportOptions.get(projectId);
+  if (!opts) {
+    const r = await core.command('export.options', { projectId });
+    if (!r) return toast('Your Mac isn’t connected.');
+    if (r.t === 'error') return toast(r.message);
+    opts = live.exportOptions.get(projectId) ?? r;
+  }
+  const p = projectById(projectId);
+  if (!p) return;
+  const group = (label, options, current, set) =>
+    h(
+      'div',
+      { class: 'list', role: 'radiogroup', 'aria-label': label },
+      h('p', { class: 'muted small', text: label }),
+      options.map((o) =>
+        h('button', { class: `option${o.id === current ? ' on' : ''}`, type: 'button', role: 'radio', 'aria-checked': o.id === current ? 'true' : 'false', onclick: () => (set(o.id), exportTimelineSheet(projectId)) }, h('span', { class: 'grow' }, h('b', { text: o.label }), o.note ? h('span', { class: 'muted small block', text: o.note }) : null), o.id === current ? icon('check', { size: 18 }) : null),
+      ),
+    );
+  sheet(
+    'Export timeline',
+    h(
+      'div',
+      { class: 'list' },
+      h('p', { class: 'muted small', text: `${p.name} exactly as it is on your Mac now (revision ${p.revision}). ${opts.format ?? 'MP4'}, ${opts.fps ?? p.fps} fps, saved in ${opts.folder ?? 'Movies › ReelForge'}.` }),
+      group('Resolution', (opts.resolutions ?? []).map((x) => ({ id: x.id, label: `${x.width} × ${x.height}`, note: x.id === 'full' ? 'Project size' : 'Half size, smaller file' })), exportChoice.resolution, (id) => (exportChoice.resolution = id)),
+      group('Quality', (opts.qualities ?? []).map((x) => ({ id: x.id, label: x.label })), exportChoice.quality, (id) => (exportChoice.quality = id)),
+      button('Export current timeline', { kind: 'primary', iconName: 'exports', full: true, disabled: exportBusy, onclick: () => (closeSheet(), approveAndExport(p, null, null, p.revision)) }),
+    ),
+  );
 }
 
 async function dismissVersion(v) {
@@ -800,7 +845,7 @@ function exportsScreen() {
   ];
   const body = [h('h1', { class: 'title', text: 'Exports' })];
   if (!isLive() && snap()) body.push(h('p', { class: 'synced', text: `Last synced ${ago(cache().syncedAt)} · renders in progress are unconfirmed until your Mac is back` }));
-  if (!all.length) body.push(h('section', { class: 'card empty' }, icon('exports', { size: 28 }), h('p', { text: snap() ? 'No exports yet. Approve a version in Review to export it.' : 'Nothing synced from your Mac yet.' })));
+  if (!all.length) body.push(h('section', { class: 'card empty' }, icon('exports', { size: 28 }), h('p', { text: snap() ? 'No exports yet. Export a project from its Session, or approve a version in Review.' : 'Nothing synced from your Mac yet.' })));
   for (const [title, list] of groups) {
     if (!list.length) continue;
     body.push(h('h2', { class: 'section-title', text: `${title} · ${list.length}` }));
@@ -1238,6 +1283,7 @@ function pageMenu(r) {
       if (d.canUndo) items.push(['history', 'Undo last change on the Mac', () => history_(r.id, 'undo', p.revision)]);
       if (d.canRedo) items.push(['refresh', 'Redo', () => history_(r.id, 'redo', p.revision)]);
       items.push(['film', 'Render a new preview', () => startPreview(r.id)]);
+      items.push(['exports', 'Export the current timeline', () => exportTimelineSheet(r.id)]);
     }
     items.push(['projects', 'Switch project', chooseProjectSheet]);
   }
