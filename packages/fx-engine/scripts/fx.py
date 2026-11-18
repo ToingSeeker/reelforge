@@ -279,7 +279,7 @@ def fx_locked_on(c, e):
 
 @effect('orbit', 'your reels circle your head: in front at the bottom, behind you at the top')
 def fx_orbit(c, e):
-    K = int(e.o.get('count', 6)); cw = int(c.W * float(e.o.get('size', 0.2)))
+    K = int(float(e.o.get('count', 6))); cw = int(c.W * float(e.o.get('size', 0.2)))
     cards = cached(e, 'cards', lambda: [card(vary(im, i) if e.o.get('images') is None else im, cw) for i, im in enumerate(e.cards)])
     intro, out = ease_out(c.lt / 0.4), clamp((e.d - c.lt) / 0.25)
     rx, ry = c.W * 0.38 * intro, max(c.fw * 1.5, c.H * 0.1)
@@ -584,7 +584,7 @@ def fx_shortcut_rain(c, e):
     caps = cached(e, 'caps', lambda: [cap(k) for k in keys])
     parts = cached(e, 'p', lambda: [(random.Random(i).random(), random.Random(i + 99).random() * max(0.1, e.d - 0.8),
                                      0.45 + 0.4 * random.Random(i + 7).random(), random.Random(i + 3).uniform(-25, 25),
-                                     random.Random(i + 5).uniform(-60, 60)) for i in range(int(e.o.get('count', 26)))])
+                                     random.Random(i + 5).uniform(-60, 60)) for i in range(int(float(e.o.get('count', 26))))])
     for i, (x, t0, v, r0, w) in enumerate(parts):
         if c.lt < t0: continue
         y = -ks + (c.lt - t0) * v * c.H
@@ -614,7 +614,7 @@ def fx_reject_stamp(c, e):
 
 @effect('countdown-flip', 'a 3, 2, 1 flip clock above your head')
 def fx_countdown(c, e):
-    n0 = int(e.o.get('from', 3)); seg = e.d / n0
+    n0 = int(float(e.o.get('from', 3))); seg = e.d / n0
     i = min(n0 - 1, int(c.lt / seg)); cur, prev = n0 - i, n0 - i + 1
     f = clamp((c.lt - i * seg) / 0.3) if i > 0 else 1.0
     tw, th = int(c.W * 0.3), int(c.W * 0.38)
@@ -828,8 +828,8 @@ def glass_widgets_v1(c, e):
     cy2 = y_top + bh + mg * 0.45 + bh / 2
     g = glass(c, bw, bh, bh * 0.28, bx, cy2, amt=0.14, dark=gd); d = ImageDraw.Draw(g)
     av = face_chip(c, e, bh * 0.62); g.alpha_composite(av, (int(bw - bh * 0.19 - av.width), int((bh - av.height) / 2)))
-    d.text((bh * 0.2, bh * 0.36), e.o.get('name', 'Vibha'), font=font('uib', bh * 0.22), fill=(255, 255, 255, 255), anchor='lm')
-    d.text((bh * 0.2, bh * 0.66), e.o.get('handle', '@vibha.in.progress'), font=font('uim', bh * 0.14), fill=(255, 255, 255, 215), anchor='lm')
+    d.text((bh * 0.2, bh * 0.36), e.o.get('name', 'ReelForge'), font=font('uib', bh * 0.22), fill=(255, 255, 255, 255), anchor='lm')
+    d.text((bh * 0.2, bh * 0.66), e.o.get('handle', '@reelforge'), font=font('uim', bh * 0.14), fill=(255, 255, 255, 215), anchor='lm')
     place(c, g, bx, cy2, 0.6 + 0.4 * pop(c, 0.24), 0, al * clamp((c.lt - 0.24) / 0.1), behind=True)
     f1, f2 = font('uim', W * 0.045), font('uib', W * 0.045)
     pre, hi = e.o.get('pill', 'Edited by |Claude').split('|') if '|' in e.o.get('pill', 'Edited by |Claude') else (e.o['pill'], '')
@@ -915,8 +915,8 @@ def fx_pastel_word(c, e):
     cw, chh = W * 0.86, W * 0.15; cy = H * 0.865 + (1 - ease_out((c.lt - 0.15) / 0.35)) * H * 0.2
     card_ = rrect(cw, chh, chh * 0.3, (255, 255, 255, 248)); d = ImageDraw.Draw(card_)
     av = face_chip(c, e, chh * 0.64); card_.alpha_composite(av, (int(chh * 0.18), int((chh - av.height) / 2)))
-    d.text((chh * 0.98, chh * 0.38), e.o.get('name', 'Vibha'), font=font('uib', chh * 0.22), fill=(20, 20, 22, 255), anchor='lm')
-    h1 = e.o.get('handle', '@vibha.in.progress  ·  '); f = font('uim', chh * 0.15)
+    d.text((chh * 0.98, chh * 0.38), e.o.get('name', 'ReelForge'), font=font('uib', chh * 0.22), fill=(20, 20, 22, 255), anchor='lm')
+    h1 = e.o.get('handle', '@reelforge  ·  '); f = font('uim', chh * 0.15)
     d.text((chh * 0.98, chh * 0.66), h1, font=f, fill=(140, 140, 150, 255), anchor='lm')
     d.text((chh * 0.98 + f.getlength(h1), chh * 0.66), e.o.get('role', 'creator'), font=f, fill=PURPLE + (255,), anchor='lm')
     at = e.d * 0.6; on = c.lt >= at
@@ -947,7 +947,7 @@ def fx_check_pills(c, e):
         d.text((bw * 0.19, bw * 0.1), title, font=font('uib', bw * 0.06), fill=(20, 20, 22, 255), anchor='lm')
         gr = thumb_grid(e.cards, 3, 3, int(bw * 0.28), int(bw * 0.025), i0=i * 3)
         im.alpha_composite(gr, ((bw - gr.width) // 2, int(bw * 0.2))); return shadowed(im, 16, 8, 70)
-    b1 = cached(e, 'b1', lambda: board(0, e.o.get('handle', '@vibha.in.progress')))
+    b1 = cached(e, 'b1', lambda: board(0, e.o.get('handle', '@reelforge')))
     b2 = cached(e, 'b2', lambda: board(1, e.o.get('board', 'Reels  ·  22 effects')))
     by = max(H * 0.17, c.fy - c.fw * 0.9)
     place(c, b1, W * 0.25, by, 0.6 + 0.4 * pop(c, 0.0), 8, al * clamp(c.lt / 0.1), behind=True)
@@ -1043,12 +1043,12 @@ def fx_profile_wall(c, e):
     place(c, wl, W / 2, H * 0.04 + wl.height / 2, 0.94 + 0.06 * ease_out(c.lt / 0.35), 0, al * clamp(c.lt / 0.15), behind=True)
     cw, chh = W * 0.76, W * 0.25; cy = min(H * 0.86, c.fy + c.fw * 2.6)
     g = glass(c, cw, chh, chh * 0.18, W / 2, cy, amt=0.5, tint=(12, 12, 14)); d = ImageDraw.Draw(g)
-    target = int(e.o.get('count', 197000)); n = int(target * ease_out((c.lt - 0.2) / 0.8))
+    target = int(float(e.o.get('count', 197000))); n = int(target * ease_out((c.lt - 0.2) / 0.8))
     swap = clamp((c.lt - 1.15) / 0.2)
     if swap < 1: d.text((cw / 2, chh * 0.33), f'{n:,}', font=font('uib', chh * 0.3), fill=(255, 255, 255, int(255 * (1 - swap))), anchor='mm')
     if swap > 0: d.text((cw / 2, chh * 0.33), e.o.get('label', 'views'), font=font('uib', chh * 0.3), fill=(255, 255, 255, int(255 * swap)), anchor='mm')
     av = face_chip(c, e, chh * 0.3); g.alpha_composite(av, (int(chh * 0.14), int(chh * 0.58)))
-    d.text((chh * 0.52, chh * 0.68), e.o.get('name', 'vibha.in.progress'), font=font('uib', chh * 0.09), fill=(255, 255, 255, 255), anchor='lm')
+    d.text((chh * 0.52, chh * 0.68), e.o.get('name', 'ReelForge'), font=font('uib', chh * 0.09), fill=(255, 255, 255, 255), anchor='lm')
     d.text((chh * 0.52, chh * 0.8), e.o.get('sub', 'top reel'), font=font('uim', chh * 0.075), fill=(170, 170, 176, 255), anchor='lm')
     on = c.lt >= e.d * 0.7
     d.rounded_rectangle([cw - chh * 0.95, chh * 0.62, cw - chh * 0.14, chh * 0.86], chh * 0.12, fill=((60, 60, 66, 255) if on else (255, 255, 255, 255)))
@@ -1095,7 +1095,7 @@ def fx_broll_split(c, e):
     shift(c, (H * 0.72 - c.fy) * k)
     sh = int(H * 0.5 * k)
     if sh > 2:
-        src = e.cards[int(e.o.get('pick', 0)) % len(e.cards)].convert('RGB')
+        src = e.cards[int(float(e.o.get('pick', 0))) % len(e.cards)].convert('RGB')
         z = 1.0 + 0.06 * clamp(c.lt / e.d); tw, th = int(W * z), int(H * 0.5 * z)
         s = max(tw / src.width, th / src.height); im = src.resize((int(src.width * s) + 1, int(src.height * s) + 1), Image.BILINEAR)
         l, t = (im.width - W) // 2, int((im.height - H * 0.5) * 0.35); im = im.crop((l, t, l + W, t + int(H * 0.5)))
@@ -1205,11 +1205,11 @@ def fx_headline_wall(c, e):
         chh = int(cw * 0.1 + lh * len(lines) + cw * 0.16)
         im = rrect(cw, chh, cw * 0.04, bg + (255,)); d = ImageDraw.Draw(im)
         for j, ln in enumerate(lines): d.text((cw * 0.08, cw * 0.07 + j * lh), ln, font=f, fill=fg + (255,))
-        my = chh - cw * 0.085; s = cw * 0.04
+        my = chh - cw * 0.085; s = cw * 0.04; hdl = e.o.get('handle', '@reelforge')
         d.polygon([(cw * 0.08, my - s / 2), (cw * 0.08, my + s / 2), (cw * 0.08 + s * 0.9, my)], fill=(255, 48, 64, 255))
-        d.text((cw * 0.08 + s * 1.5, my), ('@vibha.in.progress  ·  ' + meta) if meta else '@vibha.in.progress', font=font('uim', cw * 0.045), fill=fg + (170,), anchor='lm')
+        d.text((cw * 0.08 + s * 1.5, my), (hdl + '  ·  ' + meta) if meta else hdl, font=font('uim', cw * 0.045), fill=fg + (170,), anchor='lm')
         return shadowed(im, 14, 8, 110)
-    N = int(e.o.get('count', 13))
+    N = int(float(e.o.get('count', 13)))
     cards = cached(e, 'cards', lambda: [hcard(i) for i in range(N)])
     pos = cached(e, 'pos', lambda: [(random.Random(i * 7 + 1).uniform(0.2, 0.8), random.Random(i * 7 + 2).uniform(0.07, 0.42), random.Random(i * 7 + 3).uniform(-9, 9)) for i in range(N)])
     gap = float(e.o.get('gap', 0.09))
@@ -1326,8 +1326,8 @@ def glass_widgets_v2(c, e):
     cy3 = by + bh / 2 + 22 * u + bh / 2
     g = G(bw, bh, bx, cy3, bh * 0.28); d = ImageDraw.Draw(g)
     av = face_chip(c, e, bh * 0.62); g.alpha_composite(av, (int(bw - bh * 0.19 - av.width), int((bh - av.height) / 2)))
-    d.text((bh * 0.2, bh * 0.36), e.o.get('name', 'Vibha'), font=font('uib', bh * 0.22), fill=white + (255,), anchor='lm')
-    d.text((bh * 0.2, bh * 0.66), e.o.get('handle', '@vibha.in.progress'), font=font('uim', bh * 0.14), fill=white + (215,), anchor='lm')
+    d.text((bh * 0.2, bh * 0.36), e.o.get('name', 'ReelForge'), font=font('uib', bh * 0.22), fill=white + (255,), anchor='lm')
+    d.text((bh * 0.2, bh * 0.66), e.o.get('handle', '@reelforge'), font=font('uim', bh * 0.14), fill=white + (215,), anchor='lm')
     show(g, bx, cy3, 2)
     # 4 · views artifact (a mini page inside the glass)
     aw, ah = 330 * u, 330 * u; dx, dy = 50 * u + aw / 2, ay + S / 2 + 26 * u + ah / 2
@@ -1419,7 +1419,7 @@ def comment_sheet(c, e):
     """Reels 1021 + VOX look: an Instagram Comments sheet above your head (your hair in front). The word types in, posts,
     gets a heart, then your reply drops in with a link chip."""
     W, H = c.W, c.H; u = W / 1080; al = fade(c, e)
-    word = e.o.get('text', 'EFFECTS'); handle = e.o.get('handle', 'vibha.in.progress')
+    word = e.o.get('text', 'EFFECTS'); handle = e.o.get('handle', 'reelforge')
     reply = e.o.get('reply', 'Sent you the pack'); chip = e.o.get('chip', '22 effects')
     sw, sh = 740 * u, 450 * u
     t_post = 0.3 + 0.06 * len(word) + 0.1; t_heart, t_rep = t_post + 0.25, t_post + 0.4
@@ -1545,7 +1545,7 @@ def fx_liquid_glass_graph(c, e):
 
 @effect('carousel-spin', 'your reels spin around you in a 3D carousel, then slow to a stop')
 def fx_carousel_spin(c, e):
-    K = int(e.o.get('count', max(6, min(12, len(e.cards))))); cw = int(c.W * float(e.o.get('size', 0.3)))
+    K = int(float(e.o.get('count', max(6, min(12, len(e.cards)))))); cw = int(c.W * float(e.o.get('size', 0.3)))
     def mk():
         out = []
         for i, im in enumerate(e.cards):
@@ -2154,7 +2154,14 @@ class Ctx: pass
 class Fx:
     def __init__(self, d, fps):
         self.name = d['fx']; self.start = float(d['start']); self.end = float(d['end']); self.d = max(0.05, self.end - self.start)
-        self.o = {k: v for k, v in d.items() if k not in ('fx', 'start', 'end')}; self.state = {}; self.cards = []
+        # Options are text: plans written by an agent may carry numbers ("total": 5), and text helpers
+        # crash on them. Numeric options are always read through int()/float(), which accept strings.
+        self.o = {k: opt_text(v) for k, v in d.items() if k not in ('fx', 'start', 'end')}; self.state = {}; self.cards = []
+
+
+def opt_text(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)): return v
+    return str(int(v)) if float(v).is_integer() else repr(float(v))
 
 
 def load_cards(folder, thumbs):
