@@ -3,6 +3,7 @@
 // fragment (#k=…) and so never reaches the relay. Views are built with textContent, never innerHTML,
 // so nothing from a project name can become markup.
 import { deriveKeys, fromBase64, seal, unseal } from './crypto.js';
+import { secretFromText } from './pairing.js';
 
 const SECRET_KEY = 'reelforge.remote.secret';
 const PREFS_KEY = 'reelforge.remote.notify';
@@ -31,6 +32,21 @@ function takeSecretFromLink() {
     history.replaceState(null, '', location.pathname); // out of the address bar and history
   }
   return localStorage.getItem(SECRET_KEY);
+}
+
+/** Pair from a pasted link or key (see pairing.js for why pasting, not only the QR). */
+function pairWith(text) {
+  const secret = secretFromText(text);
+  if (!secret) return toast('That isn’t a pairing link. On your Mac, use Copy link and paste it here.');
+  // A link for another relay would store a key this relay can't use (and that this app would then
+  // send there as a token): refuse it and say where it points.
+  let link = null;
+  try {
+    if (/^https?:\/\//i.test(String(text).trim())) link = new URL(String(text).trim());
+  } catch {}
+  if (link && link.origin !== location.origin) return toast(`That link is for another relay (${link.host}). Open it there instead.`);
+  localStorage.setItem(SECRET_KEY, secret);
+  location.replace('/'); // start over with the new key
 }
 
 async function unpair() {
@@ -183,6 +199,32 @@ function projectRow(p) {
 
 // ── views ──────────────────────────────────────────────────────────────────
 function viewUnpaired(reason) {
+  const input = h('input', {
+    class: 'pair-input',
+    type: 'text',
+    placeholder: 'Paste the pairing link',
+    autocomplete: 'off',
+    autocapitalize: 'off',
+    autocorrect: 'off',
+    spellcheck: 'false',
+    'aria-label': 'Pairing link',
+  });
+  // Pasting a whole link is the whole job: pair at once, no extra tap.
+  input.addEventListener('paste', (e) => {
+    const text = e.clipboardData?.getData('text');
+    if (secretFromText(text)) {
+      e.preventDefault();
+      pairWith(text);
+    }
+  });
+  const pasteFromClipboard = async () => {
+    try {
+      pairWith(await navigator.clipboard.readText());
+    } catch {
+      input.focus();
+      toast('Couldn’t read the clipboard. Long-press the box and choose Paste.');
+    }
+  };
   return h(
     'main',
     { class: 'pair' },
@@ -191,16 +233,101 @@ function viewUnpaired(reason) {
     h(
       'div',
       { class: 'card' },
-      h('div', { class: 'label', text: reason === 'unpaired' ? 'Pairing no longer valid' : 'Not paired yet' }),
-      h('p', {
-        text:
-          reason === 'unpaired'
-            ? 'This phone was unpaired on your Mac (a new pairing was made). Scan the new QR code to pair again.'
-            : 'On your Mac, open ReelForge → Settings → Phone remote and scan the QR code with this phone’s camera.',
-      }),
+      h('div', { class: 'label', text: reason === 'unpaired' ? 'Pairing no longer valid' : 'Pair with your Mac' }),
+      reason === 'unpaired' ? h('p', { text: 'Your Mac doesn’t accept this pairing: it’s from an older pairing or the link was cut short. Pair again below.' }) : null,
+      h('p', { class: 'mt', text: 'On your Mac, open ReelForge → Settings → Phone remote. Then scan its QR code here, or press Copy link there and paste it here.' }),
+      h('button', { class: 'btn mint mt', type: 'button', onclick: openScanner, text: 'Scan QR code' }),
+      h('button', { class: 'btn mt', type: 'button', onclick: pasteFromClipboard, text: 'Paste from Mac' }),
+      h('p', { class: 'muted mt', text: 'Paste from Mac needs both on the same Apple ID with Handoff on. Otherwise send the link to yourself (AirDrop, Notes) and paste it below.' }),
+      h('div', { class: 'pair-row mt' }, input, h('button', { class: 'btn sm', type: 'button', onclick: () => pairWith(input.value), text: 'Pair' })),
     ),
     reason === 'unpaired' ? h('button', { class: 'btn', type: 'button', onclick: unpair, text: 'Forget this pairing' }) : null,
   );
+}
+
+// ── QR scanner (pairing) ────────────────────────────────────────────────────
+// The camera stays on this phone: frames are read here by jsQR (vendor/, loaded only when asked
+// for) and never leave it. Only a QR holding a pairing link pairs; anything else is ignored.
+let jsQRReady = null;
+function loadJsQR() {
+  jsQRReady ??= new Promise((resolve, reject) => {
+    if (window.jsQR) return resolve(window.jsQR);
+    const s = document.createElement('script');
+    s.src = '/vendor/jsQR.min.js';
+    s.onload = () => (window.jsQR ? resolve(window.jsQR) : reject(new Error('jsQR missing')));
+    s.onerror = () => {
+      jsQRReady = null;
+      reject(new Error('Couldn’t load the QR reader'));
+    };
+    document.head.append(s);
+  });
+  return jsQRReady;
+}
+
+const scanner = { stream: null, raf: 0, el: null, warned: false };
+
+function closeScanner() {
+  cancelAnimationFrame(scanner.raf);
+  scanner.stream?.getTracks().forEach((t) => t.stop());
+  scanner.el?.remove();
+  Object.assign(scanner, { stream: null, raf: 0, el: null, warned: false });
+}
+
+async function openScanner() {
+  if (!navigator.mediaDevices?.getUserMedia) return toast('This browser can’t use the camera here. Use Paste from Mac instead.');
+  closeScanner();
+  const video = h('video', { class: 'scan-video', playsinline: true, muted: true, autoplay: true });
+  const status = h('p', { class: 'scan-status', text: 'Starting the camera…' });
+  scanner.el = h(
+    'div',
+    { class: 'scan', role: 'dialog', 'aria-label': 'Scan the pairing QR code' },
+    h('div', { class: 'scan-view' }, video, h('div', { class: 'scan-frame' })),
+    h('p', { class: 'scan-title', text: 'Point at the QR code in Settings → Phone remote on your Mac' }),
+    status,
+    h('button', { class: 'btn', type: 'button', onclick: closeScanner, text: 'Cancel' }),
+  );
+  document.body.append(scanner.el);
+  try {
+    const [jsQR, stream] = await Promise.all([
+      loadJsQR(),
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }),
+    ]);
+    if (!scanner.el) return stream.getTracks().forEach((t) => t.stop()); // cancelled while asking
+    scanner.stream = stream;
+    video.muted = true;
+    video.srcObject = stream;
+    await video.play();
+    status.textContent = 'Looking for the code…';
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const tick = () => {
+      if (!scanner.stream) return;
+      if (video.readyState >= 2 && video.videoWidth) {
+        // A smaller frame reads faster and the Mac's QR is large on screen.
+        const scale = Math.min(1, 720 / Math.max(video.videoWidth, video.videoHeight));
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const code = jsQR(ctx.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height, { inversionAttempts: 'attemptBoth' });
+        if (code?.data) {
+          if (secretFromText(code.data)) {
+            closeScanner();
+            return pairWith(code.data);
+          }
+          if (!scanner.warned) {
+            scanner.warned = true;
+            status.textContent = 'That QR code isn’t a ReelForge pairing code.';
+          }
+        }
+      }
+      scanner.raf = requestAnimationFrame(tick);
+    };
+    tick();
+  } catch (err) {
+    const denied = err?.name === 'NotAllowedError' || err?.name === 'SecurityError';
+    closeScanner();
+    toast(denied ? 'Camera access was denied. Allow it for this app in Settings, or use Paste from Mac.' : `Couldn’t start the camera: ${err?.message ?? err}`);
+  }
 }
 
 function macLine() {
@@ -745,11 +872,11 @@ window.addEventListener('hashchange', () => {
 
 // Coming back to the app (iOS suspends it): refresh the round trip and what's on screen.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') return;
+  if (document.visibilityState !== 'visible') return closeScanner(); // never leave the camera on in the background
   ping();
   refreshOpenProject(true);
 });
-setInterval(render, 30_000); // keeps "edited 2 min ago" honest
+setInterval(() => state.token && state.problem !== 'unpaired' && render(), 30_000); // keeps "edited 2 min ago" honest (never while a link is being pasted)
 
 (async () => {
   const secret = takeSecretFromLink();

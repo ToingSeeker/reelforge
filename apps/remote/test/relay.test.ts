@@ -140,7 +140,7 @@ test("relay: the phone app is served with a strict CSP, and nothing outside publ
   const relay = createRelay({ authHash: deriveKeys("a-long-secret-for-the-static-files-test").authHash });
   const url = await listen(relay);
   t.after(() => (relay.close(), relay.closeAllConnections()));
-  for (const file of ["/", "/app.js", "/crypto.js", "/style.css", "/app.webmanifest", "/mark.svg", "/icon-192.png"]) {
+  for (const file of ["/", "/app.js", "/crypto.js", "/pairing.js", "/vendor/jsQR.min.js", "/vendor/jsQR.LICENSE.txt", "/style.css", "/app.webmanifest", "/mark.svg", "/icon-192.png"]) {
     const res = await fetch(`${url}${file}`);
     assert.equal(res.status, 200, file);
     assert.match(res.headers.get("content-security-policy") ?? "", /default-src 'self'.*script-src 'self'/, file);
@@ -148,4 +148,51 @@ test("relay: the phone app is served with a strict CSP, and nothing outside publ
   assert.match((await fetch(`${url}/`)).headers.get("content-type") ?? "", /text\/html/);
   for (const bad of ["/../server.mjs", "/%2e%2e/server.mjs", "/package.json", "/test/relay.test.ts"]) assert.equal((await fetch(`${url}${bad}`)).status, 404, bad);
   assert.equal((await fetch(`${url}/`, { method: "POST" })).status, 405);
+});
+
+test("phone app: a pasted pairing link or bare key yields the secret, anything else nothing", async () => {
+  const { secretFromText } = (await import(new URL("../public/pairing.js", import.meta.url).href)) as {
+    secretFromText: (text: unknown) => string | null;
+  };
+  const secret = "Ab3_-xY9Ab3_-xY9Ab3_-xY9Ab3_-xY9Ab3_-xY9Ab3";
+  assert.equal(secretFromText(`https://forge-remote.example/#k=${secret}`), secret);
+  assert.equal(secretFromText(`  https://forge-remote.example/#k=${secret}\n`), secret, "whitespace from the clipboard");
+  assert.equal(secretFromText(`https://forge-remote.example/#x=1&k=${secret}`), secret);
+  assert.equal(secretFromText(secret), secret, "just the key");
+  for (const bad of ["", null, undefined, "hello", "https://forge-remote.example/", `#k=short`, `https://x/#k=${secret} extra`, `${secret}!`])
+    assert.equal(secretFromText(bad), null, String(bad));
+});
+
+test("phone app: the vendored jsQR reads the Mac's pairing QR (qrcode-generator, level M) back to the key", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { runInNewContext } = await import("node:vm");
+  const { createRequire } = await import("node:module");
+  // The phone loads it with a <script> tag, so it attaches to `self`; do the same here.
+  const sandbox: { self: { jsQR?: (d: Uint8ClampedArray, w: number, h: number, o?: object) => { data: string } | null } } = { self: {} };
+  runInNewContext(readFileSync(new URL("../public/vendor/jsQR.min.js", import.meta.url), "utf8"), sandbox);
+  const jsQR = sandbox.self.jsQR!;
+  assert.equal(typeof jsQR, "function");
+
+  const qrcode = createRequire(new URL("../../desktop/package.json", import.meta.url))("qrcode-generator") as (t: number, l: string) => {
+    addData(s: string): void; make(): void; getModuleCount(): number; isDark(r: number, c: number): boolean;
+  };
+  const { secretFromText } = (await import(new URL("../public/pairing.js", import.meta.url).href)) as { secretFromText: (t: unknown) => string | null };
+  const secret = "Zq0_-Yp9Zq0_-Yp9Zq0_-Yp9Zq0_-Yp9Zq0_-Yp9Zq0";
+  const link = `https://forge-remote-production.up.railway.app/#k=${secret}`;
+  const qr = qrcode(0, "M"); // as PhoneRemoteSettings.tsx draws it
+  qr.addData(link);
+  qr.make();
+  // Render it like a camera would see the screen: 6 px per module, a 4-module quiet zone.
+  const n = qr.getModuleCount(), px = 6, size = (n + 8) * px;
+  const rgba = new Uint8ClampedArray(size * size * 4).fill(255);
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+    if (!qr.isDark(r, c)) continue;
+    for (let y = 0; y < px; y++) for (let x = 0; x < px; x++) {
+      const i = (((r + 4) * px + y) * size + (c + 4) * px + x) * 4;
+      rgba[i] = rgba[i + 1] = rgba[i + 2] = 0;
+    }
+  }
+  const code = jsQR(rgba, size, size, { inversionAttempts: "attemptBoth" });
+  assert.equal(code?.data, link);
+  assert.equal(secretFromText(code!.data), secret);
 });
