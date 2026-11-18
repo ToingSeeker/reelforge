@@ -4,6 +4,9 @@ export {
   RemoteDaemon,
   type DaemonStatus,
   type PushPrefs,
+  type RemoteAiOptions,
+  type RemoteAsk,
+  type RemoteProposal,
   type RemoteDaemonOptions,
   type RemoteDevice,
   type RemoteFinishedJob,
@@ -14,5 +17,5 @@ export {
   type RemoteProjectDetail,
   type RemoteState,
 } from "./daemon.ts";
-export { RemoteManager, normaliseUrl, type RemoteManagerOptions, type RemoteSettings, type RemoteStatus } from "./manager.ts";
+export { RemoteManager, normaliseUrl, type RemoteAi, type RemoteManagerOptions, type RemoteSettings, type RemoteStatus } from "./manager.ts";
 export { checkEndpoint, encryptPayload, newVapidKeys, sendPush, vapidAuthorization, MAX_PUSH_PAYLOAD, type PushResult, type PushSubscription, type VapidKeys } from "./push.ts";

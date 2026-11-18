@@ -7,12 +7,14 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { ACTIVE_JOB_STATES, JobStore, ProjectStore, ProposalStore, ReelForgeError, TimelineStore, type Asset, type Database } from "@reelforge/core";
+import { ACTIVE_JOB_STATES, consentCovers, JobStore, ProjectStore, ProposalStore, ReelForgeError, TimelineStore, type AIProposal, type Asset, type Database } from "@reelforge/core";
 import {
   RemoteDaemon,
   type DaemonStatus,
   type PushPrefs,
   type PushSubscribeInput,
+  type RemoteAiOptions,
+  type RemoteAsk,
   type RemoteFinishedJob,
   type RemoteJob,
   type RemotePoster,
@@ -50,6 +52,8 @@ export interface RemoteManagerOptions {
   log?: (line: string) => void;
   /** Makes (or finds cached) a still for an asset; the project's poster. Without it, projects have no poster. */
   thumbnail?: (asset: Asset) => Promise<{ path: string; contentType: "image/jpeg" | "image/png" }>;
+  /** The AI Director, for asking from the phone. Without it the phone can only look. */
+  ai?: RemoteAi;
   /** Overrides for tests. */
   deviceName?: string;
   watchMs?: number;
@@ -59,6 +63,17 @@ export interface RemoteManagerOptions {
   /** Accept http://127.0.0.1 push endpoints (tests only). */
   allowLocalPush?: boolean;
 }
+
+/** What the CLI hands in from @reelforge/ai (this package doesn't depend on it). */
+export interface RemoteAi {
+  providers(): Promise<{ id: string; label: string; external: boolean; models: string[]; defaultModel: string | null; ready: boolean; recipient: string }[]>;
+  propose(projectId: string, input: { instruction: string; provider: string; model: string }, signal: AbortSignal): Promise<AIProposal>;
+}
+
+/** How the phone's decisions are recorded: the engine's actor list has no "phone", the channel says it. */
+const PHONE_ACTOR = "api";
+const PHONE_CHANNEL = "phone-remote:apply";
+const MAX_LISTED_CHANGES = 20;
 
 interface Stored {
   url: string | null;
@@ -94,6 +109,8 @@ export class RemoteManager {
   #notifier: ReturnType<typeof setInterval> | undefined;
   /** What the notifier saw last time; null until its first look (nothing is announced from before). */
   #seen: { finished: Set<string>; proposals: Set<string> } | null = null;
+  /** Requests from the phone the AI Director is working on, one per project. */
+  #asks = new Map<string, RemoteAsk & { abort: AbortController }>();
 
   constructor(opts: RemoteManagerOptions) {
     this.#opts = opts;
@@ -258,7 +275,24 @@ export class RemoteManager {
       .list(projectId, 20)
       .sort((a, b) => Number(b.status === "pending") - Number(a.status === "pending"))
       .slice(0, 5)
-      .map((x) => ({ id: x.id, status: x.status, instruction: x.instruction, summary: x.summary, changes: x.changes.length, provider: x.provider, model: x.model, createdAt: x.createdAt }));
+      .map((x) => {
+        const pending = x.status === "pending";
+        return {
+          id: x.id,
+          status: x.status,
+          stale: pending && x.baseRevision !== p.revision,
+          requestedBy: x.requestedBy,
+          instruction: x.instruction,
+          summary: x.summary,
+          changes: x.changes.length,
+          list: pending ? x.changes.slice(0, MAX_LISTED_CHANGES).map((c) => ({ kind: c.kind, target: c.target, label: c.label, before: c.before, after: c.after })) : [],
+          warnings: pending ? [...new Set(x.warnings)] : [],
+          provider: x.provider,
+          model: x.model,
+          createdAt: x.createdAt,
+        };
+      });
+    const ask = this.#asks.get(projectId);
     const jobs = jobStore.list(projectId, { limit: 5 }).map((j) => ({
       id: j.id,
       kind: j.kind,
@@ -285,8 +319,86 @@ export class RemoteManager {
       captions: tl.captions.length,
       assets,
       proposals,
+      asking: ask ? { instruction: ask.instruction, provider: ask.provider, model: ask.model, startedAt: ask.startedAt } : null,
       jobs,
     };
+  }
+
+  // ── AI Director from the phone ───────────────────────────────────────────
+
+  #ai(): RemoteAi {
+    if (!this.#opts.ai) throw new ReelForgeError("UNAVAILABLE", "This Mac's ReelForge can't run the AI Director for the phone.");
+    return this.#opts.ai;
+  }
+
+  async aiOptions(projectId: string): Promise<RemoteAiOptions> {
+    const consent = new ProposalStore(this.#opts.db).consent(projectId);
+    const providers = (await this.#ai().providers()).map((p) => ({
+      id: p.id,
+      label: p.label,
+      models: p.models,
+      defaultModel: p.defaultModel,
+      ready: p.ready,
+      external: p.external,
+      consented: !p.external || consentCovers(consent, p.recipient),
+    }));
+    // Captions are planned by ReelForge itself ("reelforge"), not by a model the phone can pick.
+    const byModel = (list: AIProposal[]) => list.find((x) => providers.some((p) => p.id === x.provider && p.models.includes(x.model)));
+    const store = new ProposalStore(this.#opts.db);
+    let last = byModel(store.list(projectId, 20));
+    if (!last) for (const p of new ProjectStore(this.#opts.db).list().slice(0, 10)) if ((last = byModel(store.list(p.id, 5)))) break;
+    return { providers, last: last ? { provider: last.provider, model: last.model } : null };
+  }
+
+  /** Claims the project at once (so a second request is refused), then plans in the background. */
+  ask(projectId: string, input: { instruction: unknown; provider: unknown; model: unknown }): Promise<AIProposal> {
+    const ai = this.#ai();
+    const instruction = typeof input.instruction === "string" ? input.instruction.trim() : "";
+    if (!instruction || instruction.length > 4000) throw new ReelForgeError("VALIDATION_ERROR", "Write what to change (up to 4000 characters).");
+    if (typeof input.provider !== "string" || typeof input.model !== "string") throw new ReelForgeError("VALIDATION_ERROR", "Pick a model first.");
+    if (this.#asks.has(projectId)) throw new ReelForgeError("VALIDATION_ERROR", "The AI Director is still working on this project. Wait for it, or cancel it.");
+    new ProjectStore(this.#opts.db).get(projectId); // NOT_FOUND before anything starts
+    const provider = input.provider;
+    const model = input.model;
+    const abort = new AbortController();
+    this.#asks.set(projectId, { instruction, provider, model, startedAt: new Date().toISOString(), abort });
+    return (async () => {
+      try {
+        // The phone may only pick what this Mac offers; its strings never reach a model CLI unchecked.
+        const offered = (await ai.providers()).find((p) => p.id === provider);
+        if (!offered || !offered.models.includes(model)) throw new ReelForgeError("VALIDATION_ERROR", "That model isn't available on your Mac any more. Pick another one.");
+        if (!offered.ready) throw new ReelForgeError("UNAVAILABLE", `${offered.label} isn't set up on your Mac.`);
+        return await ai.propose(projectId, { instruction, provider, model }, abort.signal);
+      } catch (e) {
+        if (abort.signal.aborted) throw new ReelForgeError("VALIDATION_ERROR", "Cancelled.");
+        throw e;
+      } finally {
+        if (this.#asks.get(projectId)?.abort === abort) this.#asks.delete(projectId);
+      }
+    })();
+  }
+
+  cancelAsk(projectId: string): boolean {
+    const ask = this.#asks.get(projectId);
+    ask?.abort.abort();
+    return !!ask;
+  }
+
+  /** The phone pressed Apply: the same approval as the desktop's button, recorded with the phone's channel. */
+  applyProposal(proposalId: string): { projectId: string; revision: number } {
+    const r = new ProposalStore(this.#opts.db).apply(proposalId, { by: PHONE_ACTOR, channel: PHONE_CHANNEL });
+    return { projectId: r.proposal.projectId, revision: r.timeline.project.revision };
+  }
+
+  rejectProposal(proposalId: string): { projectId: string } {
+    return { projectId: new ProposalStore(this.#opts.db).reject(proposalId, PHONE_ACTOR).projectId };
+  }
+
+  history(action: "undo" | "redo", projectId: string, baseRevision: unknown): { revision: number } {
+    if (typeof baseRevision !== "number") throw new ReelForgeError("VALIDATION_ERROR", "baseRevision is required");
+    const store = new TimelineStore(this.#opts.db);
+    const tl = action === "undo" ? store.undo(projectId, { baseRevision }, PHONE_ACTOR) : store.redo(projectId, { baseRevision }, PHONE_ACTOR);
+    return { revision: tl.project.revision };
   }
 
   /**
@@ -362,6 +474,8 @@ export class RemoteManager {
     const others = p.subscriptions.filter((s) => s.endpoint !== endpoint);
     if (others.length >= MAX_PHONES) throw new Error(`Notifications are on for ${MAX_PHONES} phones already. Turn them off on one first.`);
     this.#writePush({ ...p, subscriptions: [...others, { endpoint, keys: { p256dh, auth }, prefs, createdAt: new Date().toISOString() }] });
+    // Draw the line now, not at the next scan: an export finishing in between is news to this phone.
+    if (!this.#seen) this.#seen = this.#look().seen;
     return prefs;
   }
 
@@ -397,22 +511,28 @@ export class RemoteManager {
     await this.#notify("exports", { title: "ReelForge", body: "Notifications from your Mac are working.", tag: "test", url: "/" }, endpoint as string);
   }
 
-  /** Looks for exports that just finished and proposals that just arrived; tells the subscribed phones. */
-  async #scan(): Promise<void> {
-    if (this.#readPush().subscriptions.length === 0) {
-      this.#seen = null; // nobody to tell; start fresh when someone subscribes
-      return;
-    }
+  /** What there is to announce right now: finished exports and pending proposals. */
+  #look() {
     const state = this.state();
-    const names = new Map(state.projects.map((p) => [p.id, p.name]));
     const proposalStore = new ProposalStore(this.#opts.db);
     const pending: { id: string; projectId: string; summary: string }[] = [];
     for (const p of state.projects) {
       if (p.pendingProposals === 0) continue;
       for (const x of proposalStore.list(p.id, 20)) if (x.status === "pending") pending.push({ id: x.id, projectId: p.id, summary: x.summary });
     }
+    return { state, pending, seen: { finished: new Set(state.recent.map((j) => j.id)), proposals: new Set(pending.map((x) => x.id)) } };
+  }
+
+  /** Looks for exports that just finished and proposals that just arrived; tells the subscribed phones. */
+  async #scan(): Promise<void> {
+    if (this.#readPush().subscriptions.length === 0) {
+      this.#seen = null; // nobody to tell; start fresh when someone subscribes
+      return;
+    }
+    const { state, pending, seen: now } = this.#look();
+    const names = new Map(state.projects.map((p) => [p.id, p.name]));
     const seen = this.#seen;
-    this.#seen = { finished: new Set(state.recent.map((j) => j.id)), proposals: new Set(pending.map((x) => x.id)) };
+    this.#seen = now;
     if (!seen) return;
     for (const j of state.recent) {
       if (seen.finished.has(j.id) || j.state === "cancelled") continue;
@@ -459,6 +579,19 @@ export class RemoteManager {
       handlers: {
         project: (id) => this.project(id),
         poster: (id) => this.poster(id),
+        ...(this.#opts.ai
+          ? {
+              ai: {
+                options: (id) => this.aiOptions(id),
+                ask: (id, input) => this.ask(id, input),
+                cancel: (id) => this.cancelAsk(id),
+                apply: (id) => this.applyProposal(id),
+                reject: (id) => this.rejectProposal(id),
+                undo: (id, base) => this.history("undo", id, base),
+                redo: (id, base) => this.history("redo", id, base),
+              },
+            }
+          : {}),
         push: {
           publicKey: () => this.#vapid().publicKey,
           subscribe: (input) => this.#subscribe(input),
@@ -482,6 +615,7 @@ export class RemoteManager {
   }
 
   async #teardown(): Promise<void> {
+    for (const ask of this.#asks.values()) ask.abort.abort();
     clearInterval(this.#notifier);
     this.#notifier = undefined;
     const d = this.#daemon;

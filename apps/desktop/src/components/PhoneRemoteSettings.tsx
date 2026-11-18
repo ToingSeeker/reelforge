@@ -139,11 +139,15 @@ export function PhoneRemoteSettings({ client, notify }: { client: Client | null;
 
       {st.pairingLink && (
         <div className="rf-connector-field">
-          <span>3. Pair your phone: scan with its camera</span>
+          <span>3. Pair your phone</span>
           <div className="rf-remote-pair">
             <PairingQr text={st.pairingLink} />
             <div className="rf-remote-pair-side">
-              <p className="rf-hint">The code holds this Mac's key. Anyone who scans it can follow your projects, so don't share or screenshot it.</p>
+              <p className="rf-hint">
+                First time: scan with the camera to open the remote in Safari, then Share → Add to Home Screen. The Home Screen app keeps its own storage, so pair it from
+                inside: tap Scan QR code in the app and scan this code again (or press Copy link here and tap Paste from Mac).
+              </p>
+              <p className="rf-hint">The code and the link hold this Mac's key. Anyone who has them can follow your projects, so don't share or screenshot them.</p>
               <p className="rf-hint">
                 {st.notifications > 0
                   ? `Notifications on for ${st.notifications} ${st.notifications === 1 ? "phone" : "phones"}. They stop with a new pairing.`

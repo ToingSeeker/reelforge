@@ -30,7 +30,7 @@ import {
   type Database,
   type ErrorCode,
 } from "@reelforge/core";
-import { ANTHROPIC_DEFAULT_MODEL, CLAUDE_CODE_MODELS, claudeBinary, codexBinary, consentRecipient, credentialSource, defaultModelFor, listCodexModels, listOllamaModels, OllamaProvider, propose, providerFor } from "@reelforge/ai";
+import { consentRecipient, defaultModelFor, listAIProviders, propose, providerFor } from "@reelforge/ai";
 import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
 import {
   AnalysisRunner,
@@ -454,17 +454,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     {
       method: "GET",
       pattern: re("/v1/ai/providers"),
-      handle: async ({ res }) => {
-        const ollama = await listOllamaModels();
-        return send(res, 200, {
-          providers: [
-            { id: "anthropic", label: "Claude API", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL, models: [ANTHROPIC_DEFAULT_MODEL, "claude-sonnet-5-5"] },
-            { id: "claude-code", label: "Claude Code", external: true, available: !!claudeBinary(), defaultModel: CLAUDE_CODE_MODELS[0], models: CLAUDE_CODE_MODELS },
-            { id: "codex", label: "Codex", external: true, available: !!codexBinary(), defaultModel: listCodexModels()[0] ?? null, models: listCodexModels() },
-            { id: "ollama", label: "Local (Ollama)", external: new OllamaProvider().external, available: ollama.available, defaultModel: ollama.models[0] ?? null, models: ollama.models },
-          ],
-        });
-      },
+      handle: async ({ res }) => send(res, 200, { providers: await listAIProviders() }),
     },
     {
       method: "GET",
