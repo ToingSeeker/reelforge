@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AIProposal, Timeline } from "@reelforge/core/schema";
+import type { AIProposal, Timeline, TimelineOp } from "@reelforge/core/schema";
+import { isSlashCommand, parseSlash, planSlash, slashSuggestions, type SlashCommandInfo } from "@reelforge/core/slash";
 import type { ProjectContext } from "@reelforge/core/context";
 import { ApiError, type AIProviderInfo, type Client } from "../api.ts";
 import type { Notify } from "../editor.ts";
@@ -22,6 +23,8 @@ interface Props {
   onRun: (run: AiRun | null) => void;
   /** Bring this panel into view (from the activity card). */
   onOpen: () => void;
+  /** Apply a slash command's edits directly, as one undo step. */
+  onCommand: (label: string, ops: TimelineOp[]) => void;
 }
 
 const MODEL_KEY = "rf.aiModel";
@@ -53,6 +56,8 @@ export function AIDirector(p: Props) {
   const [result, setResult] = useState<{ phase: "applied"; instruction: string; summary: string } | { phase: "failed"; instruction: string; error: string } | null>(null);
   const [, setTick] = useState(0);
   const [consent, setConsent] = useState<{ instruction: string; context: ProjectContext | null } | null>(null);
+  const [active, setActive] = useState(0);
+  const [menuOff, setMenuOff] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
   const projectId = p.timeline?.project.id ?? null;
 
@@ -185,6 +190,34 @@ export function AIDirector(p: Props) {
     }
   };
 
+  // Slash commands edit the selected clips right away: no model, no proposal, one undo step.
+  const runSlash = (input: string) => {
+    if (!p.timeline) return;
+    const parsed = parseSlash(input);
+    if (!parsed.ok) return p.notify("error", parsed.error);
+    const plan = planSlash(p.timeline, p.selection, parsed.command);
+    if (!plan.ok) return p.notify("error", plan.error);
+    p.onCommand(plan.label, plan.ops);
+    setText("");
+    const n = plan.ops.length;
+    const skipped = plan.skipped ? ` (${plan.skipped} skipped)` : "";
+    p.notify("info", `${plan.label} on ${n} clip${n === 1 ? "" : "s"}${skipped}. Undo with ⌘Z.`);
+  };
+
+  const slash = isSlashCommand(text);
+  const suggestions = menuOff ? [] : slashSuggestions(text);
+  const pick = suggestions[Math.min(active, suggestions.length - 1)];
+  const complete = (c: SlashCommandInfo) => {
+    setText(`/${c.name}${c.usage.includes(" ") ? " " : ""}`);
+    setActive(0);
+  };
+  const submit = () => {
+    const value = text.trim();
+    if (!value) return;
+    if (slash) runSlash(value);
+    else void send(value);
+  };
+
   const grant = async () => {
     if (!p.client || !projectId || !consent) return;
     await p.client.setConsent(projectId, true, choice?.provider);
@@ -268,6 +301,9 @@ export function AIDirector(p: Props) {
               Tell the AI Director what you want. It proposes concrete timeline changes you can preview, then apply or reject. Nothing changes until you press
               Apply, and every applied proposal can be undone.
             </p>
+            <p className="rf-hint">
+              Shortcut: type <kbd>/</kbd> to change the selected clips instantly, e.g. <code>/bw</code>, <code>/zoom in</code> or <code>/fade 0.5</code>.
+            </p>
             <div className="rf-suggestions">
               {SUGGESTIONS.map((s) => (
                 <button key={s} className="rf-chip-btn" onClick={() => setText(s)}>
@@ -314,19 +350,62 @@ export function AIDirector(p: Props) {
         className="rf-director-input"
         onSubmit={(e) => {
           e.preventDefault();
-          if (text.trim()) void send(text.trim());
+          submit();
         }}
       >
+        {suggestions.length > 0 && (
+          <div className="rf-menu rf-slash-menu" role="listbox" id="rf-slash-list" aria-label="Slash commands">
+            {suggestions.map((c) => (
+              <button
+                key={c.name}
+                type="button"
+                role="option"
+                id={`rf-slash-${c.name}`}
+                aria-selected={c === pick}
+                className={`rf-menu-item${c === pick ? " is-active" : ""}`}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => complete(c)}
+              >
+                <span className="rf-slash-usage">{c.usage}</span>
+                <span className="rf-menu-text rf-menu-meta">{c.hint}</span>
+              </button>
+            ))}
+          </div>
+        )}
         {p.selection.length > 0 && <span className="rf-sel-chip" title="The AI Director will focus on the selected clips">{p.selection.length} selected</span>}
         <input
-          placeholder="Tell me what to edit, add, or change…"
+          placeholder="Tell me what to edit, or type / for shortcuts…"
           aria-label="Instruction for the AI Director"
+          role="combobox"
+          aria-expanded={suggestions.length > 0}
+          aria-controls="rf-slash-list"
+          aria-activedescendant={pick ? `rf-slash-${pick.name}` : undefined}
           value={text}
           maxLength={4000}
-          disabled={!!pending || !choice || !projectId}
-          onChange={(e) => setText(e.target.value)}
+          disabled={!!pending || !projectId}
+          onChange={(e) => {
+            setText(e.target.value);
+            setActive(0);
+            setMenuOff(false);
+          }}
+          onKeyDown={(e) => {
+            if (!suggestions.length || e.nativeEvent.isComposing) return;
+            const word = text.trim().slice(1).toLowerCase();
+            if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+              e.preventDefault();
+              const step = e.key === "ArrowDown" ? 1 : -1;
+              setActive((i) => (Math.min(i, suggestions.length - 1) + step + suggestions.length) % suggestions.length);
+            } else if (e.key === "Tab" || (e.key === "Enter" && pick && pick.name !== word)) {
+              // Enter completes a half-typed name; on a full one it runs the command.
+              e.preventDefault();
+              if (pick) complete(pick);
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              setMenuOff(true);
+            }
+          }}
         />
-        <button className="rf-send" disabled={!text.trim() || !!pending || !choice} aria-label="Send">
+        <button className="rf-send" disabled={!text.trim() || !!pending || (!choice && !slash)} aria-label={slash ? "Run command" : "Send"}>
           <Icon name="send" size={17} />
         </button>
       </form>
