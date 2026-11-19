@@ -5,7 +5,7 @@
 import type { AiFx, Clip, ClipPropsPatch, Timeline, TimelineOp } from "./schema.ts";
 import { secondsToFrames } from "./timebase.ts";
 import { MOTION_PRESETS, motionPatch, PICTURE_EFFECTS, type MotionPreset, type PictureEffect } from "./effects.ts";
-import { FX_CATALOG, fxInfo } from "./fx-catalog.ts";
+import { FX_ALIASES, FX_CATALOG, fxInfo } from "./fx-catalog.ts";
 
 /**
  * What a step can be applied to: "picture" = clips on video / overlay tracks, "video" = picture
@@ -111,6 +111,18 @@ const FX_COMMANDS: SlashCommandInfo[] = FX_CATALOG.map((f) => ({
   usage: `/fx ${f.fx}${f.keys.includes("text") ? " [text]" : ""}`,
   hint: `${f.label} · ${f.about}`,
 }));
+
+/**
+ * Everything the autocomplete needs, as plain data, for a client that can't import this module (the phone
+ * remote's suggestions are a JS copy of slashSuggestions working on this). `aliases` are the other names
+ * /fx accepts for an effect.
+ */
+export function slashCatalog(): { commands: SlashCommandInfo[]; fx: (SlashCommandInfo & { aliases: string[] })[] } {
+  return {
+    commands: SLASH_COMMANDS.map((c) => ({ ...c })),
+    fx: FX_COMMANDS.map((c, i) => ({ ...c, aliases: Object.keys(FX_ALIASES).filter((a) => FX_ALIASES[a] === FX_CATALOG[i]!.fx) })),
+  };
+}
 
 /** The chain splits on ";"; the part being typed is the last one. */
 function lastPart(input: string): { before: string; part: string } {
