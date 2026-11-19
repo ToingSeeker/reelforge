@@ -537,3 +537,50 @@ test("manual edit: a lease lapses on its own when the phone goes quiet", () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("manual edit: undo stays with the phone that made the steps, retries survive a lost lease, a lapse is announced", (t) => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-edit-")));
+  const db = openDatabase(join(home, "reelforge.db"));
+  t.after(() => {
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 1_000_000;
+  const lapsed: string[] = [];
+  const edits = new EditSessions(db, { now: () => now, onExpire: (pid) => lapsed.push(pid) });
+  t.after(() => edits.close());
+  const project = new ProjectStore(db).create({ name: "P", settings: { width: 1080, height: 1920 } }, "desktop");
+  const { clip } = addClip(db, home, project.id);
+  const sid = crypto.randomUUID();
+  edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d1", deviceName: "Phone 1", agentBusy: false });
+  const rev = () => new ProjectStore(db).get(project.id).revision;
+  const trimId = crypto.randomUUID();
+  const trim = { projectId: project.id, sessionId: sid, commandId: trimId, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 60 }] };
+  const first = edits.apply("d1", { ...trim, baseRevision: rev() });
+  assert.equal(first.duplicate, false);
+
+  // The lease lapses (phone away): it's dropped AND announced, without anyone asking for it.
+  now += LEASE_MS + 100;
+  t.mock.timers.tick(LEASE_MS + 100);
+  assert.deepEqual(lapsed, [project.id]);
+  assert.equal(edits.lease(project.id), null);
+
+  // The trim's answer was lost; the retry after the lapse still gets the same answer, not LEASE_LOST.
+  assert.deepEqual(edits.apply("d1", { ...trim, baseRevision: first.revision - 1 }), { revision: first.revision, duplicate: true });
+  // The same id can't be replayed as another command, or by another phone.
+  assert.throws(() => edits.travel("d1", "undo", { projectId: project.id, sessionId: sid, commandId: trimId, baseRevision: rev() }), /already used/);
+  assert.throws(() => edits.apply("d2", { ...trim, baseRevision: rev() }), /already used/);
+
+  // Another phone takes over, reusing the first phone's session id: refused, so it can't reach those undo steps.
+  assert.throws(() => edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d2", deviceName: "Phone 2", agentBusy: false }), /belongs to another phone/);
+  const sid2 = crypto.randomUUID();
+  edits.begin({ projectId: project.id, sessionId: sid2, deviceId: "d2", deviceName: "Phone 2", agentBusy: false });
+  assert.equal(edits.history(project.id, { sessionId: sid2, deviceId: "d2" }).canUndo, false, "the trim is phone 1's");
+  assert.equal(edits.history(project.id, { sessionId: sid, deviceId: "d2" }).canUndo, false, "knowing the id isn't enough");
+  assert.equal(edits.history(project.id, { sessionId: sid, deviceId: "d1" }).canUndo, true);
+  assert.throws(() => edits.travel("d2", "undo", { projectId: project.id, sessionId: sid2, commandId: crypto.randomUUID(), baseRevision: rev() }), /Nothing of this editing session/);
+  // The first phone resumes its own session later (its id is still its own).
+  edits.end("d2", project.id, sid2);
+  assert.equal(edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d1", deviceName: "Phone 1", agentBusy: false }).lease.deviceId, "d1");
+});

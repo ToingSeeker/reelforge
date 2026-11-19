@@ -319,5 +319,15 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX motion_graphics_project ON motion_graphics (project_id, created_at);
     `,
   },
+  {
+    version: 10,
+    name: "phone_edit_lookups",
+    sql: `
+      -- The phone editor looks edits up by command id (a retry must not apply twice) and by channel
+      -- (its sessions' summaries). Without these, every phone edit re-read the project's whole history.
+      CREATE INDEX edit_operations_command ON edit_operations (project_id, json_extract(payload, '$.commandId'));
+      CREATE INDEX edit_operations_channel ON edit_operations (project_id, json_extract(payload, '$.channel'), revision);
+    `,
+  },
 ];
 

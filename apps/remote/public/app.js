@@ -11,7 +11,7 @@ const app = document.getElementById('app');
 const toastEl = document.getElementById('toast');
 
 // ── routes ──────────────────────────────────────────────────────────────────
-// #/projects · #/session[/<id>] · #/review/<project>/<version> · #/review/<project>/rev/<revision>
+// #/projects · #/session[/<id>] · #/review/<project>/<version> · #/review/<project>/rev/<revision>[/s/<session>]
 // #/edit/<project>/<revision> · #/exports · #/pair[=CODE]
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 function route() {
@@ -21,7 +21,7 @@ function route() {
   if ((m = new RegExp(`^#/session/(${UUID})$`, 'i').exec(hash))) return { name: 'session', id: m[1] };
   if (hash === '#/session') return { name: 'session', id: null };
   if ((m = new RegExp(`^#/review/(${UUID})/(${UUID})$`, 'i').exec(hash))) return { name: 'review', id: m[1], version: m[2] };
-  if ((m = new RegExp(`^#/review/(${UUID})/rev/(\\d{1,9})$`, 'i').exec(hash))) return { name: 'review-rev', id: m[1], revision: Number(m[2]) };
+  if ((m = new RegExp(`^#/review/(${UUID})/rev/(\\d{1,9})(?:/s/(${UUID}))?$`, 'i').exec(hash))) return { name: 'review-rev', id: m[1], revision: Number(m[2]), session: m[3] ?? null };
   if ((m = new RegExp(`^#/edit/(${UUID})/(\\d{1,9})$`, 'i').exec(hash))) return { name: 'edit', id: m[1], revision: Number(m[2]) };
   if (hash === '#/exports') return { name: 'exports' };
   return { name: 'projects' };
@@ -770,7 +770,8 @@ function reviewRevisionScreen(r) {
   core.openProject(p.id);
   const d = detailOf(p.id);
   const n = r.revision;
-  const s = d?.manual?.find((x) => x.toRevision === n) ?? null;
+  // The editing session that led here (Done names it): its last step may sit under a later desktop edit.
+  const s = (r.session ? d?.manual?.find((x) => x.sessionId === r.session) : null) ?? d?.manual?.find((x) => x.toRevision === n) ?? null;
   const current = p.revision === n;
   if (!live.exportOptions.has(p.id) && isLive()) void core.command('export.options', { projectId: p.id }, { wait: false });
   const opts = live.exportOptions.get(p.id);

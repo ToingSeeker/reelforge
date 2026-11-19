@@ -19,6 +19,8 @@ export const CAPTION_PRESETS = Object.freeze({
 export const CAPTION_FONTS = Object.freeze({ Anton: 'Anton-Regular.ttf', 'Poppins Bold': 'Poppins-Bold.ttf', 'Poppins SemiBold': 'Poppins-SemiBold.ttf' });
 export const resolveCaptionStyle = (patch) => ({ ...CAPTION_PRESETS.bold, ...(patch ?? {}) });
 
+/** core schema.ts MAX_FRAME: the longest a timeline may run (24 h at 240 fps). */
+export const MAX_FRAME = 24 * 60 * 60 * 240;
 /** Engine limits (schema.ts): what the controls clamp to. */
 export const LIMITS = Object.freeze({ scale: [0.05, 10], pos: [-2, 2], gainDb: [-60, 12], captionY: [0.05, 0.95], captionSize: [0.015, 0.2], captionText: 300 });
 
@@ -29,21 +31,27 @@ export const framesToSeconds = (f, fps) => (f * fps.den) / fps.num;
 /** Nearest frame to a time; never float-accumulated (core timebase.ts rounds the same way). */
 export const secondsToFrames = (s, fps) => Math.round((s * fps.num) / fps.den);
 
-/** 00:03.20 (minutes:seconds.hundredths) from an exact frame; hours appear past 59:59. */
+/**
+ * 00:03.20 (minutes:seconds.hundredths) from an exact frame; hours appear past 59:59. Above 100 fps
+ * hundredths can't name every frame, so it shows thousandths. Rounded to the nearest, so typing back
+ * what's shown always lands on the same frame (parseTimecode).
+ */
 export function timecode(frames, fps) {
   const total = Math.max(0, framesToSeconds(frames, fps));
-  let cs = Math.floor(total * 100 + 1e-6);
-  const h = Math.floor(cs / 360000);
-  cs -= h * 360000;
-  const m = Math.floor(cs / 6000);
-  cs -= m * 6000;
-  const s = Math.floor(cs / 100);
-  cs -= s * 100;
-  const mmss = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+  const fine = fpsValue(fps) > 100;
+  const per = fine ? 1000 : 100;
+  let u = Math.round(total * per);
+  const h = Math.floor(u / (3600 * per));
+  u -= h * 3600 * per;
+  const m = Math.floor(u / (60 * per));
+  u -= m * 60 * per;
+  const s = Math.floor(u / per);
+  u -= s * per;
+  const mmss = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(u).padStart(fine ? 3 : 2, '0')}`;
   return h ? `${h}:${mmss}` : mmss;
 }
 
-/** Parses "1:02.5", "62.5", "00:03.20" into the nearest frame; null if it isn't a time. */
+/** A typed time ("3.2", "0:03,20", "1:02:03.5") to the nearest frame; null if it isn't a time. */
 export function parseTimecode(text, fps) {
   const t = String(text ?? '').trim();
   const m = /^(?:(\d+):)?(?:(\d+):)?(\d+(?:[.,]\d+)?)$/.exec(t);
@@ -102,12 +110,29 @@ function evenWords(text, duration) {
   return parts.map((w, i) => ({ text: w, start: Math.floor((i * duration) / parts.length), end: Math.floor(((i + 1) * duration) / parts.length) }));
 }
 
+/** core timeline-ops.ts canPlace: which media a track kind takes. */
+export function canPlace(asset, kind) {
+  if (kind === 'video' || kind === 'overlay') return asset.kind === 'image' || (asset.kind === 'video' && asset.hasVideo);
+  if (kind === 'audio') return asset.kind === 'audio' || (asset.kind === 'video' && asset.hasAudio);
+  return false;
+}
+
+/** core putCaption: word timings are clamped into the caption and kept in order, never rejected. */
+function fitWords(words, duration) {
+  return words
+    .map((w) => ({ text: w.text, start: Math.min(Math.max(0, w.start), duration), end: Math.min(Math.max(0, w.end), duration) }))
+    .map((w) => ({ ...w, end: Math.max(w.start, w.end) }))
+    .sort((a, b) => a.start - b.start);
+}
+
 function checkClip(m, c) {
   const track = trackOf(m, c.trackId) ?? fail('track not found');
   const asset = assetOf(m, c.assetId) ?? fail('media not found');
+  if (!canPlace(asset, track.kind)) fail(`That media can't go on ${track.label}.`);
   if (!Number.isInteger(c.start) || c.start < 0) fail('The clip would start before 00:00.');
   if (!Number.isInteger(c.duration) || c.duration < 1) fail('A clip must be at least one frame long.');
   if (c.sourceIn < 0) fail('That trims past the start of the source media.');
+  if (clipEnd(c) > MAX_FRAME) fail('That runs past the longest a timeline can be.');
   if (asset.durationFrames !== null && c.sourceIn + c.duration > asset.durationFrames) fail('That trims past the end of the source media.');
   for (const o of m.clips) if (o.id !== c.id && o.trackId === c.trackId && o.start < clipEnd(c) && c.start < clipEnd(o)) fail(`It would overlap another clip on ${track.label}.`);
 }
@@ -144,7 +169,9 @@ export function applyOps(model, ops) {
       case 'clip.move': {
         const c = clip(op.clipId);
         unlocked(m, c.trackId);
-        put({ ...c, start: op.start, trackId: op.trackId ?? c.trackId });
+        const trackId = op.trackId ?? c.trackId;
+        unlocked(m, trackId);
+        put({ ...c, start: op.start, trackId });
         break;
       }
       case 'clip.trim': {
@@ -200,14 +227,17 @@ export function applyOps(model, ops) {
         if (i < 0) fail('That caption is gone (changed on the Mac?).');
         const c = m.captions[i];
         unlocked(m, c.trackId);
-        const text = op.text ?? c.text;
+        // The engine's schema trims the text and wants at least a character and a frame (schema.ts).
+        const text = op.text !== undefined ? String(op.text).trim() : c.text;
         const duration = op.duration ?? c.duration;
         const start = op.start ?? c.start;
-        if (!text.trim()) fail('A caption needs some text.');
-        if (duration < 1) fail('A caption must be at least one frame long.');
+        if (!text) fail('A caption needs some text.');
+        if (!Number.isInteger(duration) || duration < 1) fail('A caption must be at least one frame long.');
+        if (!Number.isInteger(start) || start < 0) fail('A caption can’t start before 00:00.');
+        if (start + duration > MAX_FRAME) fail('That runs past the longest a timeline can be.');
         for (const o of m.captions) if (o.id !== c.id && o.trackId === c.trackId && o.start < start + duration && start < o.start + o.duration) fail('It would overlap the next or previous caption.');
-        const words = op.text !== undefined && op.text !== c.text ? evenWords(text, duration) : c.words.map((w) => ({ ...w, start: Math.min(w.start, duration), end: Math.min(w.end, duration) }));
-        m.captions[i] = { ...c, text, start, duration, words };
+        const words = op.words ?? (op.text !== undefined && text !== c.text ? evenWords(text, duration) : c.words);
+        m.captions[i] = { ...c, text, start, duration, words: fitWords(words, duration) };
         break;
       }
       default:
@@ -258,10 +288,40 @@ export function positionAt(seg, frame) {
   const t = seg.duration <= 1 ? 0 : clamp01((frame - seg.start) / (seg.duration - 1));
   return { x: p.xEnd === null || p.xEnd === undefined ? p.x : p.x + (p.xEnd - p.x) * t, y: p.yEnd === null || p.yEnd === undefined ? p.y : p.y + (p.yEnd - p.y) * t };
 }
+/**
+ * A track's clips as the render plan plays them (core render-plan.ts segmentsFor): a dissolve into a
+ * clip (transitionIn ≥ 2, butted against the clip before) overlaps both by `inH` frames each side,
+ * as far as the media's handles allow.
+ */
+export function planSegments(model, trackId) {
+  const segs = clipsOn(model, trackId).map((c) => ({ ...c, clipId: c.id, renderStart: c.start, renderEnd: c.start + c.duration, renderSourceIn: c.sourceIn, inH: 0, outH: 0 }));
+  for (let i = 1; i < segs.length; i++) {
+    const a = segs[i - 1];
+    const b = segs[i];
+    if (b.props.transitionIn < 2 || a.start + a.duration !== b.start) continue;
+    const aFrames = assetOf(model, a.assetId)?.durationFrames ?? null;
+    const bFrames = assetOf(model, b.assetId)?.durationFrames ?? null;
+    const handleA = aFrames === null ? Infinity : aFrames - (a.sourceIn + a.duration);
+    const handleB = bFrames === null ? Infinity : b.sourceIn;
+    const hh = Math.max(0, Math.min(Math.floor(b.props.transitionIn / 2), handleA, handleB, a.duration, b.duration));
+    if (hh === 0) continue;
+    a.outH = hh;
+    a.renderEnd += hh;
+    b.inH = hh;
+    b.renderStart -= hh;
+    b.renderSourceIn -= hh;
+  }
+  return segs;
+}
+
+/** core render-plan.ts pictureAlpha; takes a planSegments segment (a bare clip works too: no dissolve). */
 export function pictureAlpha(seg, frame) {
-  if (frame < seg.start || frame >= seg.start + seg.duration) return 0;
+  const from = seg.renderStart ?? seg.start;
+  const to = seg.renderEnd ?? seg.start + seg.duration;
+  if (frame < from || frame >= to) return 0;
   const p = seg.props;
   let a = p.opacity;
+  if (seg.inH > 0) a *= clamp01((frame - (seg.start - seg.inH)) / (2 * seg.inH));
   if (p.fadeIn > 0) a *= clamp01((frame - seg.start) / p.fadeIn);
   if (p.fadeOut > 0) a *= clamp01(1 - (frame - (seg.start + seg.duration - p.fadeOut)) / p.fadeOut);
   return a;

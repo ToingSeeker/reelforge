@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { AssetStore, openDatabase, ProjectStore, ReelForgeError, TimelineStore } from "@reelforge/core";
-import { ensureThumbnail, importMedia, probeFile, relinkMedia, resolveSource, sourceInputArgs } from "../src/index.ts";
+import { ensureFilmstrip, ensureThumbnail, importMedia, probeFile, relinkMedia, resolveSource, sourceInputArgs, sourceStill, STILL_SUPERSEDED } from "../src/index.ts";
 import { fixtures } from "./fixtures.ts";
 
 const f = fixtures();
@@ -187,3 +187,25 @@ test("mov sources never follow external data references", () => {
   assert.ok(!sourceInputArgs("/x/a.wav").includes("-enable_drefs"));
 });
 
+
+test("phone editor pictures: a still the phone moved on from is skipped; the filmstrip is one seek per tile", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "reelforge-frames-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const db = openDatabase(join(home, "db.sqlite"));
+  const project = new ProjectStore(db).create({ name: "F" }, "cli");
+  const { imported } = await importMedia(db, project.id, [f.landscape], "cli");
+  const asset = imported[0]!;
+  const cache = join(home, "cache");
+
+  await assert.rejects(sourceStill(cache, asset, 500_000, () => false), (e: Error) => e.message === STILL_SUPERSEDED);
+  const still = await sourceStill(cache, asset, 500_000);
+  assert.deepEqual([...readFileSync(still).subarray(0, 3)], [0xff, 0xd8, 0xff]);
+
+  // 2 s of 320×180: two tiles a second apart, each 160×90, side by side.
+  const strip = await ensureFilmstrip(cache, asset);
+  assert.equal(strip.count, 2);
+  assert.ok(Math.abs(strip.stepUs - 1_000_000) < 60_000);
+  const p = await probe(strip.path);
+  assert.deepEqual([p.width, p.height], [320, 90]);
+  assert.deepEqual(readdirSync(join(cache, "stills", "strips")), [basename(strip.path)], "the per-tile files are cleaned up");
+});

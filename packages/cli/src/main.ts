@@ -787,7 +787,7 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     version: VERSION,
     thumbnail: (asset) => ensureThumbnail(resolveCacheDir(env), asset),
     frames: {
-      still: (asset, timeUs) => sourceStill(resolveCacheDir(env), asset, timeUs),
+      still: (asset, timeUs, wanted) => sourceStill(resolveCacheDir(env), asset, timeUs, wanted),
       filmstrip: (asset) => ensureFilmstrip(resolveCacheDir(env), asset),
     },
     ai: {

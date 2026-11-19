@@ -3,9 +3,10 @@
 //
 //   lease     the Mac lets one phone edit a project at a time (edit.begin); a heartbeat keeps it, and it
 //             lapses by itself if this phone goes away, so a closed tab never leaves the project locked.
-//   queue     edits are queued in order, each with a command id and the revision it was made against. A
-//             retry after a lost answer reuses the id (the Mac applies it once); a revision that moved
-//             (the desktop edited) is a conflict the user resolves, never an overwrite.
+//   queue     edits are queued in order, each with a command id and the revision it was made against
+//             (`base`, moved forward only by the Mac's answers to the edits before it). A retry after a lost
+//             answer reuses the id (the Mac applies it once); a revision that moved (the desktop edited,
+//             even while this phone was offline) is a conflict the user resolves, never an overwrite.
 //   guess     the screen shows an edit at once (edit-model.js, the engine's rules in JS) and replaces the
 //             guess with the Mac's answer. "Saved" only ever means the Mac answered.
 //   preview   paused, the picture is composited here from source stills with the export's own placement
@@ -62,6 +63,9 @@ export function leaveEditor() {
   if (!ed) return;
   const e = ed;
   ed = null;
+  // A slider still settling is kept as a queued edit, not lost; it's sent when Edit opens again.
+  e.stashDrafts();
+  e.persistState();
   e.dispose({ endSession: e.pending.length === 0 && !e.hasDrafts() });
 }
 
@@ -79,6 +83,8 @@ function store(projectId, value) {
 }
 
 const uuid = () => crypto.randomUUID();
+/** Volume sliders start at −30 dB, lower only when a clip is already quieter (set on the Mac). */
+const gainMin = (db) => Math.max(M.LIMITS.gainDb[0], Math.min(-30, Math.floor(db)));
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const round2 = (x) => Math.round(x * 100) / 100;
 
@@ -90,7 +96,8 @@ class Editor {
     const prev = stored(projectId);
     // A session left open (app closed, connection lost) is resumed: same id, same unsent edits.
     this.sessionId = prev?.sessionId ?? uuid();
-    this.pending = Array.isArray(prev?.pending) ? prev.pending : [];
+    // Each queued edit keeps the revision it was made against (older saves: the saved model's revision).
+    this.pending = Array.isArray(prev?.pending) ? prev.pending.map((p) => ({ ...p, base: Number.isInteger(p.base) ? p.base : (prev.model?.revision ?? null) })) : [];
     this.textDrafts = prev?.textDrafts ?? {};
     this.model = prev?.model ?? null;
     this.tool = prev?.tool ?? 'clip';
@@ -116,6 +123,13 @@ class Editor {
     this.disposed = false;
     this.build();
     this.timers = [setInterval(() => this.heartbeat(), HEARTBEAT_MS), setInterval(() => this.tick(), 1000)];
+    // Where the playhead was is saved when the app goes to the background, not on every seek.
+    this.onHide = () => {
+      if (document.visibilityState !== 'hidden') return;
+      this.persistState();
+      core.persistNow();
+    };
+    document.addEventListener('visibilitychange', this.onHide);
     host.pausePlayers?.();
     // Said once per phone: undo here can't reach edits made before this session or on the Mac.
     if (!saved.prefs.editUndoHint) {
@@ -163,7 +177,7 @@ class Editor {
     if (this.disposed) return;
     store(this.projectId, {
       sessionId: this.sessionId,
-      pending: this.pending.map(({ commandId, kind, ops, label }) => ({ commandId, kind, ops, label })),
+      pending: this.pending.map(({ commandId, kind, ops, label, base, sent }) => ({ commandId, kind, ops, label, base, sent })),
       textDrafts: this.textDrafts,
       model: this.model,
       tool: this.tool,
@@ -237,7 +251,8 @@ class Editor {
 
   /** The Mac's answer replaces the guess. */
   take(r) {
-    if (r.model) {
+    // Revisions only grow (undo is a new revision too): a late answer never rolls the screen back.
+    if (r.model && !(this.model && r.model.revision < this.model.revision)) {
       this.model = r.model;
       this.lastSync = Date.now();
     }
@@ -275,7 +290,8 @@ class Editor {
     const d = host.detailOf(this.projectId);
     if (liveNow && m && this.phase === 'ready' && !this.pending.length && !this.drafts.size && !this.playing && Date.now() - this.lastAck > 3000) {
       const pv = d?.preview;
-      const rendering = (core.macCache(core.activePairing().macId).snapshot?.jobs ?? []).some((j) => j.projectId === this.projectId && j.kind === 'preview');
+      const macId = core.activePairing()?.macId;
+      const rendering = (macId ? (core.macCache(macId).snapshot?.jobs ?? []) : []).some((j) => j.projectId === this.projectId && j.kind === 'preview');
       if (!rendering && (!pv || pv.revision !== m.revision) && !this.previewAsked.has(m.revision) && m.durationFrames > 0) {
         this.previewAsked.add(m.revision);
         void core.command('preview.start', { projectId: this.projectId }, { wait: false });
@@ -295,12 +311,20 @@ class Editor {
       host.toast(e.message, 'error');
       return false;
     }
-    this.pending.push({ commandId: uuid(), kind: 'apply', ops, label });
+    this.pending.push({ commandId: uuid(), kind: 'apply', ops, label, base: this.nextBase() });
     this.saveError = null;
     this.persistState();
     this.refresh();
     this.pump();
     return true;
+  }
+
+  /**
+   * The revision a new edit is made against: the one the queued edit before it was made against (the
+   * Mac's answer moves it forward), or the Mac's latest when nothing is queued.
+   */
+  nextBase() {
+    return this.pending.length ? this.pending.at(-1).base : (this.model?.revision ?? null);
   }
 
   /** Sends queued edits one by one, in order. */
@@ -312,7 +336,14 @@ class Editor {
       while (this.pending.length && this.phase === 'ready' && !this.disposed) {
         const item = this.pending[0];
         const type = item.kind === 'apply' ? 'edit.apply' : `edit.${item.kind}`;
-        const r = await core.command(type, { projectId: this.projectId, sessionId: this.sessionId, commandId: item.commandId, baseRevision: this.model.revision, operations: item.ops, label: item.label }, { timeout: 20_000 });
+        // The revision this edit was made against, never "whatever the Mac has now": a desktop edit made
+        // while this phone was offline must come back as a conflict, not be edited over.
+        const base = item.base ?? this.model.revision;
+        if (!item.sent) {
+          item.sent = true;
+          this.persistState();
+        }
+        const r = await core.command(type, { projectId: this.projectId, sessionId: this.sessionId, commandId: item.commandId, baseRevision: base, operations: item.ops, label: item.label }, { timeout: 20_000 });
         if (this.disposed) return;
         if (!r || r.timeout) {
           // Not delivered or no answer: it stays first in line with the same id; the retry can't double it.
@@ -321,6 +352,8 @@ class Editor {
         }
         if (r.t === 'edit') {
           this.pending.shift();
+          // Edits queued on top of this one were made against its result.
+          for (const p of this.pending) if (p.base === base) p.base = r.revision;
           this.take(r);
           this.lastAck = Date.now();
           this.ensureSelection();
@@ -341,6 +374,7 @@ class Editor {
           return this.open();
         }
         // The Mac refused this edit (the rules changed under it): drop it, show why, keep the rest.
+        // (The ones after it were made on top of it; they go to the Mac as they are and it decides.)
         this.pending.shift();
         this.saveError = `${item.label}: ${r.message}`;
         host.toast(`Not applied: ${r.message}`, 'error');
@@ -363,7 +397,7 @@ class Editor {
     }
     if (this.drafts.size) return this.discardDrafts();
     if (!this.model?.history?.canUndo || this.pending.length) return;
-    this.pending.push({ commandId: uuid(), kind: 'undo', ops: null, label: 'Undo' });
+    this.pending.push({ commandId: uuid(), kind: 'undo', ops: null, label: 'Undo', base: this.model.revision });
     this.persistState();
     this.refresh();
     this.pump();
@@ -371,7 +405,7 @@ class Editor {
 
   redo() {
     if (!this.model?.history?.canRedo || this.pending.length || this.drafts.size) return;
-    this.pending.push({ commandId: uuid(), kind: 'redo', ops: null, label: 'Redo' });
+    this.pending.push({ commandId: uuid(), kind: 'redo', ops: null, label: 'Redo', base: this.model.revision });
     this.persistState();
     this.refresh();
     this.pump();
@@ -409,6 +443,15 @@ class Editor {
     for (const key of [...this.drafts.keys()]) this.commitDraft(key);
     for (const [captionId, text] of Object.entries(this.textDrafts)) this.commitText(captionId, text);
   }
+  /** Slider/stepper drafts become queued edits right away (leaving the screen mid-gesture). */
+  stashDrafts() {
+    for (const [key, d] of [...this.drafts]) {
+      clearTimeout(d.timer);
+      this.drafts.delete(key);
+      if (this.model) this.pending.push({ commandId: uuid(), kind: 'apply', ops: d.ops, label: d.label, base: this.nextBase() });
+    }
+  }
+
   discardDrafts() {
     for (const d of this.drafts.values()) clearTimeout(d.timer);
     this.drafts.clear();
@@ -450,7 +493,7 @@ class Editor {
     this.dispose({ endSession: false });
     ed = null;
     core.openProject(this.projectId, true);
-    host.go(`#/review/${this.projectId}/rev/${revision}`);
+    host.go(`#/review/${this.projectId}/rev/${revision}/s/${this.sessionId}`);
   }
 
   /** Back: leave cleanly, or ask what to do with changes that haven't reached the Mac. */
@@ -461,8 +504,9 @@ class Editor {
       if (save) {
         if (!(await this.settle())) return host.toast('Some changes haven’t reached your Mac yet. They stay on this phone; open Edit again to send them.', 'error');
       } else {
-        // What's in flight can't be recalled; everything after it is dropped.
-        this.pending = this.busy ? this.pending.slice(0, 1) : [];
+        // What reached the Mac without an answer can't be recalled (it may already be applied): it stays
+        // queued, so its outcome is settled with the same id. Everything after it is dropped.
+        this.pending = this.busy || this.pending[0]?.sent ? this.pending.slice(0, 1) : [];
         this.discardDrafts();
       }
       if (this.live && this.phase === 'ready') await core.command('edit.end', { projectId: this.projectId, sessionId: this.sessionId }, { timeout: 8000 });
@@ -478,7 +522,7 @@ class Editor {
         'div',
         { class: 'stack' },
         h('p', { text: `${unsent === 1 ? 'One change hasn’t' : `${unsent} changes haven’t`} reached your Mac yet.` }),
-        h('p', { class: 'muted small', text: 'Changes your Mac already saved stay on the timeline either way; Undo in the editor takes them back.' }),
+        h('p', { class: 'muted small', text: 'Changes your Mac already saved stay on the timeline either way; Undo in the editor takes them back. A change already on its way to the Mac can’t be called back.' }),
         button('Keep editing', { kind: 'mint', full: true, onclick: closeSheet }),
         button('Save & leave', { full: true, iconName: 'check', disabled: !this.live, onclick: () => leave({ save: true }) }),
         !this.live ? h('p', { class: 'muted small', text: 'Saving needs your Mac online.' }) : null,
@@ -509,7 +553,8 @@ class Editor {
     this.refresh();
     while (!this.disposed && this.waiting) {
       await core.sleep(1500);
-      const busy = (core.macCache(core.activePairing().macId).snapshot?.asks ?? []).some((x) => x.projectId === this.projectId);
+      const macId = core.activePairing()?.macId;
+      const busy = (macId ? (core.macCache(macId).snapshot?.asks ?? []) : []).some((x) => x.projectId === this.projectId);
       if (!busy && this.live) {
         this.waiting = false;
         return this.open();
@@ -536,6 +581,7 @@ class Editor {
     const o = await core.command('edit.open', { projectId: this.projectId });
     if (!o || o.t === 'error') return host.toast(o?.message ?? 'Your Mac isn’t connected.', 'error');
     this.take(o);
+    // The conflicted edit was refused for certain (that was the answer), so dropping it is safe.
     if (how === 'theirs') this.pending = [];
     else {
       // Re-check each against the Mac's version; keep the ones that still make sense.
@@ -545,7 +591,7 @@ class Editor {
         if (p.kind !== 'apply') continue;
         try {
           v = M.applyOps(v, p.ops);
-          kept.push({ ...p, commandId: uuid() });
+          kept.push({ ...p, commandId: uuid(), sent: false, base: this.model.revision });
         } catch (e) {
           host.toast(`${p.label} no longer fits: ${e.message}`, 'error');
         }
@@ -564,6 +610,10 @@ class Editor {
     this.disposed = true;
     for (const t of this.timers ?? []) clearInterval(t);
     for (const d of this.drafts.values()) clearTimeout(d.timer);
+    for (const t of [this.textTimer, this.stillTimer, this.saveTimer]) clearTimeout(t);
+    document.removeEventListener('visibilitychange', this.onHide);
+    this.resizer?.disconnect();
+    this.stopGestures?.();
     cancelAnimationFrame(this.raf);
     this.video?.pause();
     for (const s of this.stills.values()) if (s.url) URL.revokeObjectURL(s.url);
@@ -600,7 +650,6 @@ class Editor {
     this.updateTime();
     this.drawSoon();
     this.panelSoon();
-    this.saveSoon();
   }
 
   saveSoon() {
@@ -678,10 +727,11 @@ class Editor {
     });
     this.video.addEventListener('ended', () => this.video.pause());
     this.video.muted = false;
-    new ResizeObserver(() => {
+    this.resizer = new ResizeObserver(() => {
       this.sizeCanvas();
       this.renderTimeline();
-    }).observe(this.frameEl);
+    });
+    this.resizer.observe(this.frameEl);
   }
 
   setTool(id) {
@@ -847,7 +897,7 @@ class Editor {
     const v = this.view();
     const total = v ? M.durationFrames(v) : 0;
     const fps = this.fps;
-    const short = (f) => M.timecode(f, fps).replace(/\.\d\d$/, '');
+    const short = (f) => M.timecode(f, fps).replace(/\.\d+$/, '');
     this.timeEl.replaceChildren(h('b', { text: short(this.playhead) }), h('span', { class: 'muted', text: ` / ${short(total)}` }));
     this.timeEl.setAttribute('aria-label', `${M.timecode(this.playhead, fps)} of ${M.timecode(total, fps)}`);
   }
@@ -886,13 +936,15 @@ class Editor {
     host.toast('Full screen isn’t available here.');
   }
 
-  /** Picture clips under the playhead, bottom layer first. */
+  /** Picture clips under the playhead, bottom layer first; through a dissolve both clips are under it. */
   activeSegments(v = this.view(), frame = this.playhead) {
     if (!v) return [];
     const out = [];
     for (const t of M.pictureTracks(v)) {
       if (t.hidden) continue;
-      for (const c of M.clipsOn(v, t.id)) if (frame >= c.start && frame < M.clipEnd(c)) out.push({ clip: c, track: t, asset: M.assetOf(v, c.assetId) });
+      for (const seg of M.planSegments(v, t.id)) {
+        if (frame >= seg.renderStart && frame < seg.renderEnd) out.push({ clip: M.clipById(v, seg.id), seg, track: t, asset: M.assetOf(v, seg.assetId) });
+      }
     }
     return out;
   }
@@ -919,14 +971,14 @@ class Editor {
     for (const seg of this.activeSegments(v)) {
       const { clip, asset } = seg;
       if (!asset || asset.kind === 'audio') continue;
-      const sourceFrame = asset.kind === 'image' ? 0 : clip.sourceIn + (this.playhead - clip.start);
+      const sourceFrame = asset.kind === 'image' ? 0 : seg.seg.renderSourceIn + (this.playhead - seg.seg.renderStart);
       const pic = this.picture(asset, sourceFrame);
       if (!pic) {
         missing = true;
         continue;
       }
       const pl = M.placement(clip, this.playhead, pic.w, pic.h, W, H);
-      const alpha = M.pictureAlpha(clip, this.playhead);
+      const alpha = M.pictureAlpha(seg.seg, this.playhead);
       ctx.save();
       ctx.globalAlpha = alpha;
       const p = clip.props;
@@ -1000,6 +1052,7 @@ class Editor {
       const img = new Image();
       img.src = url;
       await img.decode();
+      if (this.disposed) return URL.revokeObjectURL(url);
       this.stills.set(key, { url, img });
       if (this.stills.size > 80) {
         const [k0, s0] = this.stills.entries().next().value;
@@ -1025,6 +1078,7 @@ class Editor {
           const img = new Image();
           img.src = url;
           await img.decode();
+          if (this.disposed) return URL.revokeObjectURL(url);
           this.strips.set(asset.id, { url, img, count: r.count, stepUs: r.stepUs });
           this.renderTimeline();
           this.drawSoon();
@@ -1198,11 +1252,11 @@ class Editor {
       let patch;
       if (now.length >= 2 && first.length >= 2) {
         const k = d(now[0], now[1]) / Math.max(1, d(first[0], first[1]));
-        patch = { scale: round2(clamp(p.scale * k, 0.25, 4)) };
+        patch = { scale: round2(clamp(p.scale * k, ...M.LIMITS.scale)) };
       } else {
         const dx = (now[0].x - first[0].x) / start.rect.width;
         const dy = (now[0].y - first[0].y) / start.rect.height;
-        patch = { x: round2(clamp(p.x + dx, -1, 1)), y: round2(clamp(p.y + dy, -1, 1)) };
+        patch = { x: round2(clamp(p.x + dx, ...M.LIMITS.pos)), y: round2(clamp(p.y + dy, ...M.LIMITS.pos)) };
       }
       this.gesture = { ops: [{ type: 'clip.update', clipId: clip.id, props: patch }], label: 'Framing' };
       this.drawSoon();
@@ -1289,7 +1343,7 @@ class Editor {
     for (let s = 0, i = 0; s <= end && i < 2000; s = ++i * minor) {
       const isMajor = i % 5 === 0;
       const x = PAD + s * pps;
-      ticks.push(h('span', { class: `tick${isMajor ? ' major' : ''}`, vars: { '--x': `${x}px` } }, isMajor ? h('i', { text: M.timecode(M.secondsToFrames(s, this.fps), this.fps).replace(/\.\d\d$/, '') }) : null));
+      ticks.push(h('span', { class: `tick${isMajor ? ' major' : ''}`, vars: { '--x': `${x}px` } }, isMajor ? h('i', { text: M.timecode(M.secondsToFrames(s, this.fps), this.fps).replace(/\.\d+$/, '') }) : null));
     }
     void ppf;
     return h('div', { class: 'ed-ruler', 'data-zone': 'ruler' }, ticks);
@@ -1369,7 +1423,7 @@ class Editor {
   placePlayhead() {
     if (!this.playheadEl) return;
     this.playheadEl.style.setProperty('--x', `${this.xOf(this.playhead)}px`);
-    this.playheadEl.firstChild.textContent = M.timecode(this.playhead, this.fps).replace(/\.\d\d$/, '');
+    this.playheadEl.firstChild.textContent = M.timecode(this.playhead, this.fps).replace(/\.\d+$/, '');
   }
 
   follow() {
@@ -1401,12 +1455,24 @@ class Editor {
     const pts = new Map();
     let g = null; // { mode: 'seek'|'trim'|'pan'|'pinch'|'tap', ... }
     const contentX = (clientX) => clientX - el.getBoundingClientRect().left + el.scrollLeft;
+    // A trim's auto-scroll loop ends with the trim, however it ends (lifted, pinched over, left the screen).
+    const stopTrim = () => {
+      if (g?.mode !== 'trim') return;
+      cancelAnimationFrame(g.raf);
+      g.stopped = true;
+      this.root.classList.remove('trimming', 'trim-limit');
+    };
+    this.stopGestures = () => {
+      stopTrim();
+      g = null;
+    };
 
     el.addEventListener('pointerdown', (e) => {
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (pts.size === 2) {
         // Pinch takes over whatever the first finger started (a trim in progress is abandoned, not applied).
         const [a, b] = [...pts.values()];
+        stopTrim();
         this.gesture = null;
         this.snapEl.hidden = true;
         g = { mode: 'pinch', dist: Math.abs(a.x - b.x) || 1, pps: this.pps, anchor: this.frameAt(contentX((a.x + b.x) / 2)), mid: (a.x + b.x) / 2 };
@@ -1476,8 +1542,7 @@ class Editor {
       if (g.mode === 'seek') this.scrubbing = false;
       if (g.mode === 'seek') this.drawSoon();
       if (g.mode === 'trim') {
-        cancelAnimationFrame(g.raf);
-        this.root.classList.remove('trimming');
+        stopTrim();
         this.snapEl.hidden = true;
         const ghost = this.gesture;
         this.gesture = null;
@@ -1572,6 +1637,7 @@ class Editor {
     const dir = g.clientX < r.left + edge ? -1 : g.clientX > r.right - edge ? 1 : 0;
     if (!dir) return;
     const step = () => {
+      if (g.stopped || this.disposed) return;
       el.scrollLeft += dir * 8;
       this.trimTo(g, g.clientX);
       g.raf = requestAnimationFrame(step);
@@ -1720,7 +1786,9 @@ class Editor {
     const off = !this.editable() || M.trackOf(v, c.trackId)?.locked;
     const set = (patch, label = 'Framing', key = 'frame') => this.draft(`${key}:${c.id}`, [{ type: 'clip.update', clipId: c.id, props: patch }], label);
     const animated = p.scaleEnd !== null || p.xEnd !== null || p.yEnd !== null;
-    const scaleIn = h('input', { class: 'ed-range', type: 'range', min: 25, max: 400, step: 1, value: Math.round(p.scale * 100), 'aria-label': 'Scale, percent', disabled: off || null });
+    // The slider covers the usual range, widened to include a value set on the Mac, so touching it never jumps.
+    const scalePct = Math.round(p.scale * 100);
+    const scaleIn = h('input', { class: 'ed-range', type: 'range', min: Math.min(25, scalePct), max: Math.max(400, scalePct), step: 1, value: scalePct, 'aria-label': 'Scale, percent', disabled: off || null });
     scaleIn.addEventListener('input', () => set({ scale: Number(scaleIn.value) / 100 }));
     const pct = (x) => `${x > 0 ? '+' : ''}${Math.round(x * 100)}`;
     return [
@@ -1730,7 +1798,7 @@ class Editor {
         { class: 'ed-seg', role: 'radiogroup', 'aria-label': 'Fit or fill' },
         [['contain', 'Fit'], ['cover', 'Fill']].map(([id, label]) => h('button', { class: `ed-seg-btn${p.fit === id ? ' on' : ''}`, type: 'button', role: 'radio', 'aria-checked': p.fit === id ? 'true' : 'false', disabled: off || null, onclick: () => this.submit([{ type: 'clip.update', clipId: c.id, props: { fit: id } }], label === 'Fit' ? 'Fit to frame' : 'Fill frame') }, label)),
       ),
-      h('div', { class: 'ed-row' }, h('span', { class: 'ed-label', text: 'Scale' }), scaleIn, numberField({ value: Math.round(p.scale * 100), suffix: '%', label: 'Scale percent', min: 25, max: 400, disabled: off, onCommit: (n) => set({ scale: n / 100 }) })),
+      h('div', { class: 'ed-row' }, h('span', { class: 'ed-label', text: 'Scale' }), scaleIn, numberField({ value: scalePct, suffix: '%', label: 'Scale percent', min: M.LIMITS.scale[0] * 100, max: M.LIMITS.scale[1] * 100, disabled: off, onCommit: (n) => set({ scale: n / 100 }) })),
       h(
         'div',
         { class: 'ed-row wrap' },
@@ -1882,7 +1950,7 @@ class Editor {
     const out = [h('h2', { class: 'ed-h', text: 'Audio' })];
     if (c && a?.hasAudio) {
       const p = c.props;
-      const gain = h('input', { class: 'ed-range', type: 'range', min: -30, max: 12, step: 0.5, value: p.gainDb, 'aria-label': 'Clip volume in decibels', disabled: off || track.locked || null });
+      const gain = h('input', { class: 'ed-range', type: 'range', min: gainMin(p.gainDb), max: M.LIMITS.gainDb[1], step: 0.5, value: p.gainDb, 'aria-label': 'Clip volume in decibels', disabled: off || track.locked || null });
       gain.addEventListener('input', () => this.draft(`gain:${c.id}`, [{ type: 'clip.update', clipId: c.id, props: { gainDb: Number(gain.value) } }], 'Clip volume'));
       const fade = (key, label) =>
         stepper({
@@ -1907,7 +1975,7 @@ class Editor {
         const clips = M.clipsOn(v, t.id);
         const g = clips[0].props.gainDb;
         const same = clips.every((x) => x.props.gainDb === g);
-        const r = h('input', { class: 'ed-range', type: 'range', min: -30, max: 12, step: 0.5, value: g, 'aria-label': `${t.label} volume in decibels`, disabled: off || t.locked || null });
+        const r = h('input', { class: 'ed-range', type: 'range', min: gainMin(g), max: M.LIMITS.gainDb[1], step: 0.5, value: g, 'aria-label': `${t.label} volume in decibels`, disabled: off || t.locked || null });
         r.addEventListener('input', () => this.draft(`trackgain:${t.id}`, clips.map((x) => ({ type: 'clip.update', clipId: x.id, props: { gainDb: Number(r.value) } })), `${t.label} volume`));
         out.push(
           h('div', { class: 'ed-row' }, h('span', { class: 'ed-label', text: t.label }), r, h('span', { class: 'ed-val tabular', text: `${same ? `${g > 0 ? '+' : ''}${g}` : 'mixed'} dB` }), toggle(t.muted, `Mute ${t.label}`, off || t.locked, () => this.submit([{ type: 'track.update', trackId: t.id, muted: !t.muted }], t.muted ? `Unmute ${t.label}` : `Mute ${t.label}`))),

@@ -157,15 +157,16 @@ export interface RemoteEditing {
   projectId: string;
   deviceId: string;
   deviceName: string;
-  sessionId: string;
+  /** Only in answers to the phone that holds the lease; never broadcast (it names that phone's session). */
+  sessionId?: string;
   startedAt: string;
   expiresAt: string;
 }
 
 /** Source pictures for the phone's editor (from @reelforge/media). */
 export interface RemoteFrames {
-  /** The source at `timeUs`, ≤ 720 px. */
-  still(asset: Asset, timeUs: number): Promise<string>;
+  /** The source at `timeUs`, ≤ 720 px. `wanted` false when its turn comes: skipped (the phone moved on). */
+  still(asset: Asset, timeUs: number, wanted?: () => boolean): Promise<string>;
   /** Evenly spaced pictures of the whole source in one strip. */
   filmstrip(asset: Asset): Promise<{ path: string; count: number; stepUs: number }>;
 }
@@ -367,6 +368,8 @@ export class RemoteManager {
   readonly #startedAt = new Date().toISOString();
   /** Manual editing from phones: one lease per project. */
   readonly #edits: EditSessions;
+  /** The still each phone asked for last; older ones still queued are skipped. */
+  readonly #wantStill = new Map<string, string>();
 
   constructor(opts: RemoteManagerOptions) {
     this.#opts = { ...opts };
@@ -374,7 +377,8 @@ export class RemoteManager {
     this.#devicesFile = join(opts.dir, "devices.json");
     this.#handledFile = join(opts.dir, "handled.json");
     this.#pushFile = join(opts.dir, "push.json");
-    this.#edits = new EditSessions(opts.db);
+    // A lease that lapses by itself is announced, so other phones stop showing "X is editing".
+    this.#edits = new EditSessions(opts.db, { onExpire: () => this.#daemon?.sendSnapshot() });
   }
 
   // ── files ────────────────────────────────────────────────────────────────
@@ -556,6 +560,7 @@ export class RemoteManager {
 
   /** For process shutdown: disconnect without touching auto-start. */
   async close(): Promise<void> {
+    this.#edits.close();
     await this.#teardown();
     this.#stopCaffeinate();
     clearInterval(this.#powerTimer);
@@ -672,6 +677,7 @@ export class RemoteManager {
     if (!gone || (onlyUnconfirmed && gone.confirmed)) return;
     const rest = f.devices.filter((d) => d.id !== deviceId);
     this.#edits.releaseDevice(deviceId);
+    this.#wantStill.delete(deviceId);
     // New broadcast key, so the removed phone can't read what is said from now on; the others get it sealed
     // with their own keys before anything is sealed with it.
     const next = { broadcastKey: randomBytes(32).toString("base64"), devices: rest };
@@ -826,7 +832,7 @@ export class RemoteManager {
       exports: exports.slice(0, 30),
       asks,
       jobs,
-      editing: this.#edits.leases().map(editingOf),
+      editing: this.#edits.leases().map((l) => editingOf(l)),
     };
   }
 
@@ -1189,9 +1195,9 @@ export class RemoteManager {
         t: "edit",
         projectId,
         ...extra,
-        lease: lease ? { ...editingOf(lease), mine: lease.deviceId === deviceId && lease.sessionId === sid } : null,
+        lease: lease ? { ...editingOf(lease, deviceId), mine: lease.deviceId === deviceId && lease.sessionId === sid } : null,
         agent: ask ? { instruction: ask.instruction, startedAt: ask.startedAt } : null,
-        model: edits.model(projectId, sid),
+        model: edits.model(projectId, sid ? { sessionId: sid, deviceId } : null),
       };
     };
     switch (cmd.type) {
@@ -1245,15 +1251,23 @@ export class RemoteManager {
     if (!asset) throw new ReelForgeError("NOT_FOUND", "That media isn't in this project.");
     if (cmd.type === "edit.strip") {
       const strip = await frames.filmstrip(asset);
-      const blob = await this.#daemon!.putBlob(deviceId, { type: "image/jpeg", data: readFileSync(strip.path).toString("base64") });
+      const blob = await this.#connected().putBlob(deviceId, { type: "image/jpeg", data: readFileSync(strip.path).toString("base64") });
       return { t: "strip", projectId, assetId, blob, count: strip.count, stepUs: strip.stepUs };
     }
     const frame = Number(cmd.sourceFrame);
     if (!Number.isInteger(frame) || frame < 0) throw new ReelForgeError("VALIDATION_ERROR", "bad frame");
     const fps = tl.project.settings.fps;
-    const path = await frames.still(asset, (frame * fps.den * 1_000_000) / fps.num);
-    const blob = await this.#daemon!.putBlob(deviceId, { type: "image/jpeg", data: readFileSync(path).toString("base64") });
+    const want = `${projectId}:${assetId}:${frame}`;
+    this.#wantStill.set(deviceId, want);
+    const path = await frames.still(asset, (frame * fps.den * 1_000_000) / fps.num, () => this.#wantStill.get(deviceId) === want);
+    const blob = await this.#connected().putBlob(deviceId, { type: "image/jpeg", data: readFileSync(path).toString("base64") });
     return { t: "still", projectId, assetId, sourceFrame: frame, blob };
+  }
+
+  /** The relay connection, or a clean error if the remote was stopped while a command ran. */
+  #connected(): RemoteDaemon {
+    if (!this.#daemon) throw new ReelForgeError("UNAVAILABLE", "The phone remote is off on this Mac.");
+    return this.#daemon;
   }
 
   #deviceName(deviceId: string): string {
@@ -1274,7 +1288,7 @@ export class RemoteManager {
     const size = statSync(path).size;
     reply({ t: "file", state: "sending", transferId, jobId, name: basename(path), type: "video/mp4", size, pieces: Math.max(1, Math.ceil(size / PIECE_BYTES)) });
     try {
-      await this.#daemon!.sendFile(deviceId, transferId, path, size);
+      await this.#connected().sendFile(deviceId, transferId, path, size);
       reply({ t: "file", state: "sent", transferId, jobId });
     } catch (e) {
       reply({ t: "file", state: errText(e) === "cancelled" ? "cancelled" : "failed", transferId, jobId, message: errText(e) });
@@ -1297,7 +1311,7 @@ export class RemoteManager {
     this.#uploads.set(uploadId, abort);
     reply({ t: "upload", uploadId, state: "receiving" });
     try {
-      const got = await this.#daemon!.receiveFile(deviceId, uploadId, Math.ceil(size / PIECE_BYTES), createWriteStream(path, { mode: 0o600 }), abort.signal);
+      const got = await this.#connected().receiveFile(deviceId, uploadId, Math.ceil(size / PIECE_BYTES), createWriteStream(path, { mode: 0o600 }), abort.signal);
       if (got !== size) throw new Error("the file arrived incomplete");
       const asset = await this.#opts.media.importFile(projectId, path);
       reply({ t: "upload", uploadId, state: "imported", projectId, assetId: asset.assetId, filename: asset.filename });
@@ -1609,8 +1623,9 @@ function uuidOf(value: unknown, what: string): string {
   return value;
 }
 
-function editingOf(l: EditLease): RemoteEditing {
-  return { projectId: l.projectId, deviceId: l.deviceId, deviceName: l.deviceName, sessionId: l.sessionId, startedAt: l.startedAt, expiresAt: new Date(l.expiresAt).toISOString() };
+/** Who is editing what. The session id is only told to the phone that holds the lease (`viewer`). */
+function editingOf(l: EditLease, viewer?: string): RemoteEditing {
+  return { projectId: l.projectId, deviceId: l.deviceId, deviceName: l.deviceName, ...(viewer === l.deviceId ? { sessionId: l.sessionId } : {}), startedAt: l.startedAt, expiresAt: new Date(l.expiresAt).toISOString() };
 }
 
 /** What an edit failure says beyond its message: revisions, who holds the lease, which operation failed. */
