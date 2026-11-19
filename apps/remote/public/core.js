@@ -26,27 +26,40 @@ function load() {
       drafts: raw.drafts && typeof raw.drafts === 'object' ? raw.drafts : {},
       outbox: Array.isArray(raw.outbox) ? raw.outbox : [],
       prefs: { notify: { exports: true, proposals: true, failures: true }, model: {}, askedNotify: false, ...(raw.prefs ?? {}) },
+      edits: raw.edits && typeof raw.edits === 'object' ? raw.edits : {},
     };
   } catch {
-    return { pairings: [], active: null, macs: {}, drafts: {}, outbox: [], prefs: { notify: { exports: true, proposals: true, failures: true }, model: {}, askedNotify: false } };
+    return { pairings: [], active: null, macs: {}, drafts: {}, outbox: [], prefs: { notify: { exports: true, proposals: true, failures: true }, model: {}, askedNotify: false }, edits: {} };
   }
 }
 
 export const saved = load();
 let saveTimer = 0;
-export function persist() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+function write() {
+  saveTimer = 0;
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(saved));
+  } catch {
+    // full: drop cached details first, they come back from the Mac
+    for (const m of Object.values(saved.macs)) m.details = {};
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(saved));
-    } catch {
-      // full: drop cached details first, they come back from the Mac
-      for (const m of Object.values(saved.macs)) m.details = {};
-      try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(saved));
-      } catch {}
-    }
-  }, 150);
+    } catch {}
+  }
+}
+export function persist() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(write, 150);
+}
+/** Writes now if a save is waiting: the page may be about to go (reload, app switch, closed tab). */
+export function persistNow() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer);
+  write();
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', persistNow);
+  document.addEventListener('visibilitychange', () => document.visibilityState === 'hidden' && persistNow());
 }
 
 /** Cached data for one Mac (snapshot, details, last project), created on first use. */
@@ -519,6 +532,14 @@ async function gotPoster(ev, revision) {
   }
 }
 
+/** A sealed blob the Mac put on the relay for this phone (stills, filmstrips), opened. */
+export async function fetchBlob(id) {
+  const res = await fetch(`/api/blob?id=${encodeURIComponent(id)}`, { headers: auth(), cache: 'no-store' });
+  if (!res.ok) throw new Error(`The relay answered ${res.status}.`);
+  const file = await unseal(keys.key, (await res.json()).c, `blob:${id}`);
+  return new Blob([Uint8Array.from(atob(file.data), (c) => c.charCodeAt(0))], { type: file.type });
+}
+
 /** Posters and previews saved earlier, so the app shows them before (or without) the Mac. */
 export async function restoreMedia() {
   const p = activePairing();
@@ -566,7 +587,8 @@ export async function loadPreview(projectId, pv) {
     });
     const meta = { jobId: pv.jobId, revision: pv.revision, updatedAt: pv.finishedAt ?? new Date().toISOString(), width: pv.width, height: pv.height };
     await cachePut(`preview/${activePairing().macId}/${projectId}`, blob, meta);
-    if (prev?.url) URL.revokeObjectURL(prev.url);
+    // The old URL is not revoked here: the Session player may still be playing it, and it lets go of it
+    // itself when the user loads the new one.
     live.previews.set(projectId, { ...meta, url: URL.createObjectURL(blob), state: 'ready', saved: false });
   } catch (e) {
     live.previews.set(projectId, { ...(prev ?? {}), state: prev?.url ? 'ready' : 'failed', error: e.message });
@@ -654,11 +676,12 @@ function onUploadEvent(ev) {
 export async function upload(projectId, file) {
   if (!live.agentOnline) throw new Error('Attachments need your Mac online.');
   const uploadId = `u_${crypto.randomUUID().replace(/-/g, '')}`;
-  live.uploads.set(uploadId, { name: file.name, progress: 0, state: 'sending', projectId });
+  // The file stays with the entry (in memory only) so a failed import can be tried again into the same project.
+  live.uploads.set(uploadId, { name: file.name, progress: 0, state: 'sending', projectId, file });
   changed();
   const sent = await command('upload.start', { projectId, uploadId, name: file.name, size: file.size }, { wait: false });
   if (!sent) {
-    live.uploads.set(uploadId, { name: file.name, state: 'failed', error: 'Your Mac isn’t connected.', projectId });
+    live.uploads.set(uploadId, { name: file.name, state: 'failed', error: 'Your Mac isn’t connected.', projectId, file });
     return changed();
   }
   const pieces = Math.max(1, Math.ceil(file.size / PIECE_BYTES));
@@ -684,12 +707,80 @@ export async function upload(projectId, file) {
   }
 }
 
+/** Sends a failed or cancelled file again, into the project it was meant for. */
+export async function retryUpload(uploadId) {
+  const u = live.uploads.get(uploadId);
+  if (!u?.file || !['failed', 'cancelled'].includes(u.state)) return;
+  live.uploads.delete(uploadId);
+  try {
+    await upload(u.projectId, u.file);
+  } catch (e) {
+    live.uploads.set(uploadId, { ...u, error: e.message });
+    changed();
+  }
+}
+
 export function cancelUpload(uploadId) {
   const u = live.uploads.get(uploadId);
   if (!u) return;
   live.uploads.set(uploadId, { ...u, state: 'cancelled' });
   void command('upload.cancel', { uploadId }, { wait: false });
   changed();
+}
+
+// ── renaming and deleting projects ──────────────────────────────────────────
+/** Renames a project on the Mac (its ProjectStore.rename). Answers { t: 'project.renamed', project } | error | null. */
+export async function renameProject(projectId, name) {
+  const r = await command('project.rename', { projectId, name }, { timeout: 20_000 });
+  if (r?.t === 'project.renamed') {
+    const cache = macCache(activePairing().macId);
+    if (cache.snapshot) cache.snapshot = { ...cache.snapshot, projects: (cache.snapshot.projects ?? []).map((p) => (p.id === projectId ? { ...p, ...r.project } : p)) };
+    persist();
+    changed();
+  }
+  return r;
+}
+
+/**
+ * Deletes a project on the Mac, for good. Answers { t: 'project.deleted', project } | error | null. What this
+ * phone kept for it (cached details, the poster) goes too; what's left in the queue for it fails on the Mac.
+ */
+export async function deleteProject(projectId) {
+  const r = await command('project.delete', { projectId }, { timeout: 20_000 });
+  if (r?.t === 'project.deleted' || (r?.t === 'error' && r.code === 'NOT_FOUND')) forgetProject(projectId);
+  return r;
+}
+
+function forgetProject(projectId) {
+  const cache = macCache(activePairing().macId);
+  if (cache.snapshot) {
+    const s = cache.snapshot;
+    cache.snapshot = { ...s, projects: (s.projects ?? []).filter((p) => p.id !== projectId), exports: (s.exports ?? []).filter((x) => x.projectId !== projectId), jobs: (s.jobs ?? []).filter((j) => j.projectId !== projectId) };
+  }
+  delete cache.details[projectId];
+  if (cache.lastProject === projectId) cache.lastProject = null;
+  persist();
+  changed();
+}
+
+// ── new projects ────────────────────────────────────────────────────────────
+/**
+ * Creates a project on the Mac (the same ProjectStore.create its New project uses). `requestId` is the form's
+ * own, kept until the Mac confirms: asking again with it after a timeout gets the project already made, never
+ * a second one. Answers { t: 'project.created', project, existing } | { t: 'error', ... } | null (not sent).
+ */
+export async function createProject({ requestId, name, format }) {
+  const r = await command('project.create', { requestId, name, format }, { timeout: 20_000 });
+  if (r?.t === 'project.created') {
+    const cache = macCache(activePairing().macId);
+    if (cache.snapshot) {
+      const list = cache.snapshot.projects ?? [];
+      if (!list.some((x) => x.id === r.project.id)) cache.snapshot = { ...cache.snapshot, projects: [r.project, ...list] };
+    }
+    persist();
+    changed();
+  }
+  return r;
 }
 
 // ── instructions: the outbox and the relay's queue ──────────────────────────
@@ -800,6 +891,7 @@ function onQueueEvent(ev) {
   if (ev.proposalId) item.proposalId = ev.proposalId;
   if (ev.message) item.error = ev.message;
   if (ev.currentRevision) item.currentRevision = ev.currentRevision;
+  item.reason = ev.reason ?? null;
   if (before !== item.state) {
     if (item.state === 'accepted') notice('Your Mac took the instruction.');
     else if (item.state === 'done') notice('Review ready.');

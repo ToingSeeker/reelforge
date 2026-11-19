@@ -22,12 +22,14 @@ import {
   WorkflowRunStore,
   planCaptions,
   planSpeechCaptions,
+  type Analysis,
   type AnalysisKind,
   ProjectStore,
   ReelForgeError,
   TimelineStore,
   type Actor,
   type Database,
+  type Project,
   type RenderJob,
   type ErrorCode,
 } from "@reelforge/core";
@@ -119,6 +121,24 @@ export interface RunningServer {
     cancel(jobId: string): RenderJob;
     retry(jobId: string): RenderJob;
   };
+  /**
+   * The studio tools the phone remote reaches without HTTP: transcription for captions, AI-effect bakes and
+   * motion-graphic renders. Same runners (and the same one-at-a-time queues) as the API routes.
+   */
+  studio: {
+    /** Starts the analyses asked for (a running or fresh one is reused). */
+    analyze(projectId: string, assetId: string, kinds: AnalysisKind[], params: Record<string, unknown>): Analysis[];
+    fxStatus(projectId: string): { engine: { ok: boolean; reason?: string }; bakes: ({ key: string; state: string } & Record<string, unknown>)[] };
+    /** Starts every bake the timeline needs that isn't cached; returns the status. */
+    fxBake(projectId: string): ReturnType<RunningServer["studio"]["fxStatus"]>;
+    fxEngine(): { ok: boolean; reason?: string };
+    motionEngine(): { ok: boolean; reason?: string };
+    /** Validates the input (CreateMotionInputSchema), starts the render + import; poll motionStatus. */
+    motionCreate(projectId: string, input: unknown, actor: Actor): { key: string; state: string } & Record<string, unknown>;
+    motionStatus(projectId: string, key: string): { key: string; state: string } & Record<string, unknown>;
+    /** Same as DELETE /v1/projects/:id (refused with BUSY while anything still works on the project). */
+    deleteProject(projectId: string): Project;
+  };
   close(): Promise<void>;
 }
 
@@ -131,6 +151,7 @@ const STATUS: Record<ErrorCode, number> = {
   CONSENT_REQUIRED: 403,
   NOT_FOUND: 404,
   REVISION_CONFLICT: 409,
+  BUSY: 409,
   INTERNAL: 500,
 };
 
@@ -279,6 +300,46 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     if (st.state === "done") return { key, state: "running" as const, progress: 1 };
     return { key, ...st };
   };
+  const fxBake = (projectId: string) => {
+    if (fxAvailable().ok) {
+      const specs = fxBakesOf(projectId);
+      fxBaker.retain(projectId, new Set(specs.map((b) => b.key)));
+      for (const spec of specs) void fxBaker.ensure(spec, projectId);
+    }
+    return fxStatus(projectId);
+  };
+  const motionCreate = (projectId: string, raw: unknown, actor: Actor) => {
+    const input = parse(CreateMotionInputSchema, raw);
+    const project = projects.get(projectId);
+    const avail = motionAvailable();
+    if (!avail.ok) throw new ReelForgeError("UNAVAILABLE", avail.reason);
+    const spec = motionRenderSpec(input, project.settings);
+    const slot = `${project.id}:${spec.key}`;
+    if (!motionImports.has(slot) && !motionGraphics.list(project.id).some((g) => g.renderKey === spec.key)) {
+      const job = motion.ensure(spec).then(async (path) => {
+        const result = await importMedia(opts.db, project.id, [path], actor);
+        const asset = result.imported[0] ?? result.existing[0];
+        if (!asset) throw new Error(result.failed[0]?.error.message ?? "could not import the rendered graphic");
+        motionGraphics.record(project.id, asset.id, spec, input.durationFrames);
+        return asset.id;
+      });
+      job.catch((e: unknown) => motionErrors.set(slot, e instanceof Error ? e.message : String(e))).finally(() => motionImports.delete(slot));
+      motionErrors.delete(slot);
+      motionImports.set(slot, job);
+    }
+    return motionStatus(project.id, spec.key);
+  };
+  /** ProjectStore.delete plus what only this process knows: a motion graphic still rendering into it, queued bakes. */
+  const deleteProject = (projectId: string) => {
+    const pid = projects.get(projectId).id;
+    if ([...motionImports.keys()].some((slot) => slot.startsWith(`${pid}:`))) {
+      throw new ReelForgeError("BUSY", "A motion graphic for this project is still rendering. Delete it once that's done.", { projectId: pid });
+    }
+    const project = projects.delete(pid);
+    fxBaker.retain(pid, new Set());
+    for (const slot of [...motionErrors.keys()]) if (slot.startsWith(`${pid}:`)) motionErrors.delete(slot);
+    return project;
+  };
   const proposals = new ProposalStore(opts.db);
   const body = (req: IncomingMessage) => readJson(req) as Promise<never>;
   const pathsOf = (b: unknown): string[] => {
@@ -314,6 +375,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       pattern: re(`/v1/projects/${ID}`),
       handle: async ({ req, res, params: [id], actor }) => send(res, 200, { project: projects.rename(id!, await body(req), actor) }),
     },
+    { method: "DELETE", pattern: re(`/v1/projects/${ID}`), handle: ({ res, params: [id] }) => send(res, 200, { deleted: deleteProject(id!) }) },
     {
       method: "PATCH",
       pattern: re(`/v1/projects/${ID}/format`),
@@ -691,14 +753,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       // Start baking every AI effect the timeline uses that isn't cached yet; poll GET …/fx for progress.
       method: "POST",
       pattern: re(`/v1/projects/${ID}/fx/bake`),
-      handle: ({ res, params: [id] }) => {
-        if (fxAvailable().ok) {
-          const specs = fxBakesOf(id!);
-          fxBaker.retain(id!, new Set(specs.map((b) => b.key)));
-          for (const spec of specs) void fxBaker.ensure(spec, id!);
-        }
-        return send(res, 202, fxStatus(id!));
-      },
+      handle: ({ res, params: [id] }) => send(res, 202, fxBake(id!)),
     },
     {
       method: "GET",
@@ -709,27 +764,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       // Render a motion graphic and import it as an asset; poll GET …/motion/:key until it's done.
       method: "POST",
       pattern: re(`/v1/projects/${ID}/motion`),
-      handle: async ({ req, res, params: [id], actor }) => {
-        const input = parse(CreateMotionInputSchema, await readJson(req));
-        const project = projects.get(id!);
-        const avail = motionAvailable();
-        if (!avail.ok) throw new ReelForgeError("UNAVAILABLE", avail.reason);
-        const spec = motionRenderSpec(input, project.settings);
-        const slot = `${project.id}:${spec.key}`;
-        if (!motionImports.has(slot) && !motionGraphics.list(project.id).some((g) => g.renderKey === spec.key)) {
-          const job = motion.ensure(spec).then(async (path) => {
-            const result = await importMedia(opts.db, project.id, [path], actor);
-            const asset = result.imported[0] ?? result.existing[0];
-            if (!asset) throw new Error(result.failed[0]?.error.message ?? "could not import the rendered graphic");
-            motionGraphics.record(project.id, asset.id, spec, input.durationFrames);
-            return asset.id;
-          });
-          job.catch((e: unknown) => motionErrors.set(slot, e instanceof Error ? e.message : String(e))).finally(() => motionImports.delete(slot));
-          motionErrors.delete(slot);
-          motionImports.set(slot, job);
-        }
-        return send(res, 202, { motion: motionStatus(project.id, spec.key) });
-      },
+      handle: async ({ req, res, params: [id], actor }) => send(res, 202, { motion: motionCreate(id!, await readJson(req), actor) }),
     },
     {
       method: "GET",
@@ -800,7 +835,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       }
       if (req.method === "OPTIONS") {
         res.writeHead(204, {
-          "access-control-allow-methods": "GET, POST, PATCH, OPTIONS",
+          "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
           "access-control-allow-headers": "authorization, content-type, x-reelforge-actor, range",
           "access-control-max-age": "600",
         });
@@ -867,6 +902,19 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
             const job = retryRenderJob(opts.db, jobId);
             runner.enqueue(job.id);
             return job;
+          },
+        },
+        studio: {
+          analyze,
+          fxStatus,
+          fxBake,
+          fxEngine: () => fxAvailable(),
+          motionEngine: () => motionAvailable(),
+          motionCreate,
+          deleteProject,
+          motionStatus: (projectId, key) => {
+            if (!/^[0-9a-f]{16}$/.test(key)) throw new ReelForgeError("VALIDATION_ERROR", "invalid motion key");
+            return motionStatus(projects.get(projectId).id, key);
           },
         },
         close: () =>

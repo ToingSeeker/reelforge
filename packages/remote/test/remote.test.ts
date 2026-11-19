@@ -5,8 +5,10 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AssetStore, JobStore, openDatabase, ProjectStore, ProposalStore, TimelineStore, type RenderJob } from "@reelforge/core";
+import { AnalysisStore, AssetStore, JobStore, openDatabase, ProjectStore, ProposalStore, TimelineStore, type RenderJob } from "@reelforge/core";
 import {
+  EditSessions,
+  LEASE_MS,
   deriveDeviceKeys,
   normalisePairingCode,
   normaliseUrl,
@@ -344,6 +346,105 @@ test("queue: instructions wait on the relay while the Mac is away, run once, can
   assert.ok(creds.deviceId);
 });
 
+test("create: a project from the phone through ProjectStore.create; a retried request id never makes a second one", async (t) => {
+  const { db, p, m, make } = await paired(t);
+  const requestId = crypto.randomUUID();
+  const before = new ProjectStore(db).list().length;
+
+  // Bad names are refused by the domain rules, nothing is created, and the request id stays free.
+  const bad = await p.send("project.create", { requestId, name: "   ", format: "9:16" });
+  const err = await until("refused", () => p.reply(bad.id, "error"));
+  assert.equal(err.code, "VALIDATION_ERROR");
+  const odd = await p.send("project.create", { requestId, name: "Ok", format: "4:3" });
+  assert.equal((await until("format", () => p.reply(odd.id, "error"))).code, "VALIDATION_ERROR");
+  assert.equal(new ProjectStore(db).list().length, before);
+
+  // Two taps (or a retry after a timeout) with the same request id: one project, the second answer names it.
+  const [a, b] = await Promise.all([p.send("project.create", { requestId, name: "  Cafe Stories  ", format: "1:1" }), p.send("project.create", { requestId, name: "  Cafe Stories  ", format: "1:1" })]);
+  type Created = Ev & { project: { id: string; name: string; width: number; height: number; revision: number; durationFrames: number }; existing: boolean; requestId: string };
+  const ra = await until("created a", () => p.reply<Created>(a.id, "project.created"));
+  const rb = await until("created b", () => p.reply<Created>(b.id, "project.created"));
+  assert.equal(ra.project.id, rb.project.id);
+  assert.deepEqual([ra.existing, rb.existing].sort(), [false, true]);
+  assert.equal(ra.project.name, "Cafe Stories");
+  assert.deepEqual([ra.project.width, ra.project.height, ra.project.durationFrames], [1080, 1080, 0]);
+  const all = new ProjectStore(db).list();
+  assert.equal(all.length, before + 1);
+  assert.equal(all.filter((x) => x.name === "Cafe Stories").length, 1);
+  // The snapshot every phone reads lists it.
+  await until("in snapshot", () => p.events.some((e) => e.t === "snapshot" && (e.projects as { id: string }[]).some((x) => x.id === ra.project.id)));
+
+  // The record is on disk, not in memory: a restarted engine still finds the first project.
+  const again = make().createProject(m.status().devices[0]!.id, { requestId, name: "Cafe Stories", format: "1:1" });
+  assert.equal(again.existing, true);
+  assert.equal(again.project.id, ra.project.id);
+
+  // A new request id is a new project, 9:16 unless told otherwise.
+  const other = await p.send("project.create", { requestId: crypto.randomUUID(), name: "Neural Core" });
+  const ro = await until("created other", () => p.reply<Created>(other.id, "project.created"));
+  assert.notEqual(ro.project.id, ra.project.id);
+  assert.deepEqual([ro.project.width, ro.project.height], [1080, 1920]);
+});
+
+test("rename and delete from the phone: the domain rules, a phone editing by hand blocks a delete, a deleted project's lease goes", async (t) => {
+  const { db, home, p, m, url } = await paired(t);
+  const projects = new ProjectStore(db);
+  const project = projects.create({ name: "Old name" }, "desktop");
+  addClip(db, home, project.id);
+  const keep = projects.create({ name: "Keep me" }, "desktop");
+  const ask = async (type: string, extra: Record<string, unknown>, who = p) => {
+    const s = await who.send(type, extra);
+    return until(type, () => who.events.find((e) => e.id === s.id && e.t !== "snapshot" && e.t !== "live")) as Promise<Ev & { project: { id: string; name: string; revision: number }; code?: string; message?: string; details?: Record<string, unknown> }>;
+  };
+
+  // Rename: trimmed, on the current revision (an edit that landed meanwhile isn't a conflict), recorded as the phone's.
+  const bad = await ask("project.rename", { projectId: project.id, name: "   " });
+  assert.equal(bad.code, "VALIDATION_ERROR");
+  const renamed = await ask("project.rename", { projectId: project.id, name: "  Cafe Stories  " });
+  assert.equal(renamed.t, "project.renamed", String(renamed.message));
+  assert.equal(renamed.project.name, "Cafe Stories");
+  assert.equal(projects.get(project.id).name, "Cafe Stories");
+  assert.deepEqual(projects.history(project.id).at(-1)!.payload, { from: "Old name", to: "Cafe Stories" });
+  await until("renamed in snapshot", () => p.events.some((e) => e.t === "snapshot" && (e.projects as { id: string; name: string }[]).some((x) => x.id === project.id && x.name === "Cafe Stories")));
+
+  // Another phone editing it by hand: the delete waits for them, nothing is removed.
+  const { pairing } = await m.startPairing();
+  const creds2 = await pair(url, pairing!.code, "Second phone");
+  const p2 = phone(url, creds2);
+  t.after(() => p2.close());
+  const hello2 = await p2.send("device.hello", { name: "Second phone" });
+  await until("paired 2", () => p2.reply(hello2.id, "device"));
+  const s2 = crypto.randomUUID();
+  assert.equal((await ask("edit.begin", { projectId: project.id, sessionId: s2 }, p2)).t, "edit");
+  const blocked = await ask("project.delete", { projectId: project.id });
+  assert.equal(blocked.code, "BUSY");
+  assert.match(blocked.message ?? "", /Second phone is editing/);
+  assert.equal(projects.get(project.id).name, "Cafe Stories");
+  await ask("edit.end", { projectId: project.id, sessionId: s2 }, p2);
+
+  // This phone's own hand-editing session doesn't stop it; its lease goes with the project.
+  const mine = crypto.randomUUID();
+  assert.equal((await ask("edit.begin", { projectId: project.id, sessionId: mine })).t, "edit");
+  const deleted = await ask("project.delete", { projectId: project.id });
+  assert.equal(deleted.t, "project.deleted", String(deleted.message));
+  assert.deepEqual(deleted.project, { id: project.id, name: "Cafe Stories" });
+  assert.deepEqual(projects.list().map((x) => x.id), [keep.id]);
+  assert.deepEqual((m.state().editing as unknown[]).length, 0);
+  await until("gone from snapshot", () => p.events.some((e) => e.t === "snapshot" && !(e.projects as { id: string }[]).some((x) => x.id === project.id)));
+  assert.equal((await ask("project.delete", { projectId: project.id })).code, "NOT_FOUND");
+  // The editor can tell "the project is gone" from any other not-found.
+  const open = await ask("edit.open", { projectId: project.id });
+  assert.equal(open.code, "NOT_FOUND");
+  assert.equal(open.details?.projectId, project.id);
+
+  // Deleted on the Mac while a phone edits it: the lease doesn't outlive it, the next heartbeat says so.
+  const s3 = crypto.randomUUID();
+  assert.equal((await ask("edit.begin", { projectId: keep.id, sessionId: s3 })).t, "edit");
+  projects.delete(keep.id);
+  assert.deepEqual((m.state().editing as unknown[]).length, 0);
+  assert.equal((await ask("edit.heartbeat", { projectId: keep.id, sessionId: s3 })).code, "LEASE_LOST");
+});
+
 test("exports: approve a version at a named revision, render, download in sealed pieces; uploads import", async (t) => {
   const jobs: RenderJob[] = [];
   const imported: string[] = [];
@@ -426,4 +527,257 @@ test("exports: approve a version at a named revision, render, download in sealed
   assert.equal((await until("cancelled", () => p.reply(cancel.id, "job"))).state, "cancelled");
   void m;
   assert.ok(existsSync(job.outputPath!));
+});
+
+test("manual edit: a lease per project, idempotent edits on the shared reducer, conflicts never overwrite, undo stays in the session", async (t) => {
+  const { db, home, p, m, creds, url } = await paired(t, { ai: { providers: async () => [], propose: () => Promise.reject(new Error("unused")) } });
+  const project = new ProjectStore(db).create({ name: "Spider trade", settings: { width: 1080, height: 1920 } }, "desktop");
+  const { clip } = addClip(db, home, project.id);
+  const ask = async (type: string, extra: Record<string, unknown>) => {
+    const s = await p.send(type, { projectId: project.id, ...extra });
+    return until(type, () => p.events.find((e) => e.id === s.id && (e.t === "edit" || e.t === "error"))) as Promise<Ev & { model: { revision: number; clips: { id: string; start: number; duration: number; sourceIn: number; props: { scale: number } }[]; history: { canUndo: boolean; canRedo: boolean } }; revision: number; duplicate: boolean; code?: string; details?: Record<string, unknown>; lease: { mine: boolean } | null }>;
+  };
+  const sessionId = crypto.randomUUID();
+
+  // Read-only look first, then the lease.
+  const opened = await ask("edit.open", {});
+  assert.equal(opened.t, "edit");
+  assert.equal(opened.lease, null);
+  assert.equal(opened.model.clips.length, 1);
+  const begun = await ask("edit.begin", { sessionId });
+  assert.equal(begun.lease?.mine, true);
+  const base = begun.model.revision;
+
+  // A trim through the same operation the desktop uses; one command id, one revision.
+  const commandId = crypto.randomUUID();
+  const trim = await ask("edit.apply", { sessionId, commandId, baseRevision: base, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 60 }] });
+  assert.equal(trim.t, "edit", String(trim.message));
+  assert.equal(trim.revision, base + 1);
+  assert.equal(new TimelineStore(db).get(project.id).clips[0]!.duration, 60);
+  // The answer got lost and the phone sends it again: same result, not applied twice.
+  const again = await ask("edit.apply", { sessionId, commandId, baseRevision: base, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 60 }] });
+  assert.equal(again.duplicate, true);
+  assert.equal(new ProjectStore(db).get(project.id).revision, base + 1);
+
+  // The reducer's rules hold on the phone too: past the source's end is refused, nothing changes.
+  const bad = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: base + 1, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 9999 }] });
+  assert.equal(bad.code, "VALIDATION_ERROR");
+  assert.equal(new ProjectStore(db).get(project.id).revision, base + 1);
+
+  // While a phone edits, the agent and outside undo wait.
+  assert.throws(() => m.ask(project.id, { instruction: "zoom", provider: "x", model: "y" }), /editing this project by hand/);
+  assert.throws(() => m.history("undo", project.id, base + 1), /editing this project by hand/);
+
+  // Desktop edits in between: the phone's next edit names the old revision and is refused, not merged.
+  new TimelineStore(db).apply(project.id, { baseRevision: base + 1, operations: [{ type: "clip.update", clipId: clip.id, props: { scale: 1.5 } }] }, "desktop");
+  const conflict = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: base + 1, label: "Framing", operations: [{ type: "clip.update", clipId: clip.id, props: { scale: 2 } }] });
+  assert.equal(conflict.code, "REVISION_CONFLICT");
+  assert.equal(conflict.details?.currentRevision, base + 2);
+  assert.equal(new TimelineStore(db).get(project.id).clips[0]!.props.scale, 1.5, "the desktop's change stands");
+
+  // Undo is scoped to the session: the newest step is the desktop's, so the phone can't undo it.
+  const now = await ask("edit.open", {});
+  assert.equal(now.model.history.canUndo, false);
+  const split = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: base + 2, label: "Split", operations: [{ type: "clip.split", clipId: clip.id, frame: 30 }] });
+  assert.equal(split.model.clips.length, 2);
+  assert.equal(split.model.history.canUndo, true);
+  const undo = await ask("edit.undo", { sessionId, commandId: crypto.randomUUID(), baseRevision: split.revision });
+  assert.equal(undo.model.clips.length, 1);
+  assert.equal(undo.model.history.canRedo, true);
+  assert.equal(undo.model.history.canUndo, false, "the desktop's step under it isn't the phone's to undo");
+
+  // A second phone can't take the lease while the first holds it.
+  const { pairing } = await m.startPairing();
+  const creds2 = await pair(url, pairing!.code, "Second phone");
+  const p2 = phone(url, creds2);
+  t.after(() => p2.close());
+  const hello2 = await p2.send("device.hello", { name: "Second phone" });
+  await until("paired 2", () => p2.reply(hello2.id, "device"));
+  const s2 = await p2.send("edit.begin", { projectId: project.id, sessionId: crypto.randomUUID() });
+  const locked = await until("locked", () => p2.events.find((e) => e.id === s2.id && e.t === "error"));
+  assert.equal(locked.code, "EDIT_LOCKED");
+  assert.equal((locked.details as { deviceName: string }).deviceName, "Test iPhone");
+
+  // Done: the lease is released and the session is summarised for Review.
+  const end = await ask("edit.end", { sessionId });
+  assert.equal(end.lease, null);
+  const summary = (end as unknown as { summary: { fromRevision: number; toRevision: number; steps: string[]; undone: number } }).summary;
+  assert.deepEqual(summary.steps, ["Trim clip"]);
+  assert.equal(summary.undone, 1);
+  assert.equal(summary.toRevision, new ProjectStore(db).get(project.id).revision);
+  const after = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: summary.toRevision, label: "Split", operations: [{ type: "clip.split", clipId: clip.id, frame: 30 }] });
+  assert.equal(after.code, "LEASE_LOST");
+  void creds;
+});
+
+test("manual edit: a lease lapses on its own when the phone goes quiet", () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-lease-")));
+  const db = openDatabase(join(home, "reelforge.db"));
+  try {
+    let now = 1_000_000;
+    const edits = new EditSessions(db, { now: () => now });
+    const project = new ProjectStore(db).create({ name: "P", settings: { width: 1080, height: 1920 } }, "desktop");
+    const sid = crypto.randomUUID();
+    edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d1", deviceName: "Phone 1", agentBusy: false });
+    assert.throws(() => edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d2", deviceName: "Phone 2", agentBusy: false }), /Phone 1 is editing/);
+    assert.throws(() => edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d2", deviceName: "Phone 2", agentBusy: true }), /editing/);
+    now += LEASE_MS - 1000;
+    edits.heartbeat("d1", project.id, sid);
+    now += LEASE_MS - 1000;
+    assert.ok(edits.lease(project.id), "the heartbeat kept it");
+    now += 2000;
+    assert.equal(edits.lease(project.id), null, "no heartbeat: it lapsed");
+    assert.throws(() => edits.heartbeat("d1", project.id, sid), /ended/);
+    const other = edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d2", deviceName: "Phone 2", agentBusy: false });
+    assert.equal(other.lease.deviceName, "Phone 2");
+    assert.throws(() => edits.begin({ projectId: project.id, sessionId: crypto.randomUUID(), deviceId: "d3", deviceName: "Phone 3", agentBusy: true }), (e: Error & { code?: string }) => e.code === "EDIT_LOCKED");
+  } finally {
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("manual edit: undo stays with the phone that made the steps, retries survive a lost lease, a lapse is announced", (t) => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-edit-")));
+  const db = openDatabase(join(home, "reelforge.db"));
+  t.after(() => {
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 1_000_000;
+  const lapsed: string[] = [];
+  const edits = new EditSessions(db, { now: () => now, onExpire: (pid) => lapsed.push(pid) });
+  t.after(() => edits.close());
+  const project = new ProjectStore(db).create({ name: "P", settings: { width: 1080, height: 1920 } }, "desktop");
+  const { clip } = addClip(db, home, project.id);
+  const sid = crypto.randomUUID();
+  edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d1", deviceName: "Phone 1", agentBusy: false });
+  const rev = () => new ProjectStore(db).get(project.id).revision;
+  const trimId = crypto.randomUUID();
+  const trim = { projectId: project.id, sessionId: sid, commandId: trimId, label: "Trim clip", operations: [{ type: "clip.trim", clipId: clip.id, edge: "end", frame: 60 }] };
+  const first = edits.apply("d1", { ...trim, baseRevision: rev() });
+  assert.equal(first.duplicate, false);
+
+  // The lease lapses (phone away): it's dropped AND announced, without anyone asking for it.
+  now += LEASE_MS + 100;
+  t.mock.timers.tick(LEASE_MS + 100);
+  assert.deepEqual(lapsed, [project.id]);
+  assert.equal(edits.lease(project.id), null);
+
+  // The trim's answer was lost; the retry after the lapse still gets the same answer, not LEASE_LOST.
+  assert.deepEqual(edits.apply("d1", { ...trim, baseRevision: first.revision - 1 }), { revision: first.revision, duplicate: true });
+  // The same id can't be replayed as another command, or by another phone.
+  assert.throws(() => edits.travel("d1", "undo", { projectId: project.id, sessionId: sid, commandId: trimId, baseRevision: rev() }), /already used/);
+  assert.throws(() => edits.apply("d2", { ...trim, baseRevision: rev() }), /already used/);
+
+  // Another phone takes over, reusing the first phone's session id: refused, so it can't reach those undo steps.
+  assert.throws(() => edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d2", deviceName: "Phone 2", agentBusy: false }), /belongs to another phone/);
+  const sid2 = crypto.randomUUID();
+  edits.begin({ projectId: project.id, sessionId: sid2, deviceId: "d2", deviceName: "Phone 2", agentBusy: false });
+  assert.equal(edits.history(project.id, { sessionId: sid2, deviceId: "d2" }).canUndo, false, "the trim is phone 1's");
+  assert.equal(edits.history(project.id, { sessionId: sid, deviceId: "d2" }).canUndo, false, "knowing the id isn't enough");
+  assert.equal(edits.history(project.id, { sessionId: sid, deviceId: "d1" }).canUndo, true);
+  assert.throws(() => edits.travel("d2", "undo", { projectId: project.id, sessionId: sid2, commandId: crypto.randomUUID(), baseRevision: rev() }), /Nothing of this editing session/);
+  // The first phone resumes its own session later (its id is still its own).
+  edits.end("d2", project.id, sid2);
+  assert.equal(edits.begin({ projectId: project.id, sessionId: sid, deviceId: "d1", deviceName: "Phone 1", agentBusy: false }).lease.deviceId, "d1");
+});
+
+test("studio: AI effects reach the phone whole; captions are transcribed on the Mac and come back as one edit; no paths leave the Mac", async (t) => {
+  const analyzed: { assetId: string; params: Record<string, unknown> }[] = [];
+  let dbRef: ReturnType<typeof openDatabase> | null = null;
+  const studio: RemoteManagerOptions["studio"] = {
+    analyze: (projectId, assetId, kinds, params) => {
+      analyzed.push({ assetId, params });
+      return new AnalysisStore(dbRef!).enqueue(projectId, assetId, kinds, params);
+    },
+    fxStatus: () => ({ engine: { ok: true }, bakes: [{ key: "k1", state: "running", progress: 0.5, path: "/secret/cache/fx/k1.mp4" }] }),
+    fxBake: () => ({ engine: { ok: true }, bakes: [{ key: "k1", state: "queued" }] }),
+    fxEngine: () => ({ ok: true }),
+    motionEngine: () => ({ ok: false, reason: "renderer not installed" }),
+    motionCreate: () => ({ key: "0123456789abcdef", state: "running", progress: 0.2 }),
+    motionStatus: () => ({ key: "0123456789abcdef", state: "done", asset: { id: "00000000-0000-4000-8000-0000000000aa", filename: "Title card.mov", kind: "video", durationFrames: 121, sourcePath: "/Users/someone/generated/motion/x.mov" } }),
+    deleteProject: (projectId) => new ProjectStore(dbRef!).delete(projectId),
+  };
+  const { db, home, p } = await paired(t, { studio });
+  dbRef = db;
+  const project = new ProjectStore(db).create({ name: "Talking head", settings: { width: 1080, height: 1920 } }, "desktop");
+  writeFileSync(join(home, "talk.mp4"), "fake");
+  const st = statSync(join(home, "talk.mp4"));
+  const asset = new AssetStore(db).add(project.id, { path: join(home, "talk.mp4"), sizeBytes: st.size, mtimeMs: st.mtimeMs }, {
+    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: true, hasAlpha: false,
+    videoCodec: "h264", audioCodec: "aac", sampleRate: 48000, channels: 2, rotation: 0,
+  }, "desktop").asset;
+  const timeline = new TimelineStore(db);
+  const tl0 = timeline.get(project.id);
+  const v1 = tl0.tracks.find((x) => x.kind === "video")!.id;
+  const fx = [{ fx: "lean-in", start: 10, end: 40, opts: { zoom: 1.6 } }];
+  timeline.apply(project.id, { baseRevision: tl0.project.revision, operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 0, duration: 90, props: { aiEffects: fx } }] }, "desktop");
+  const ask = async (type: string, extra: Record<string, unknown> = {}) => {
+    const s = await p.send(type, { projectId: project.id, ...extra });
+    return until(type, () => p.events.find((e) => e.id === s.id)) as Promise<Ev & Record<string, any>>;
+  };
+
+  // The editor's model carries the effect list itself (it used to be a count).
+  const opened = await ask("edit.open");
+  assert.deepEqual(opened.model.clips[0].aiEffects, fx);
+  assert.equal("aiEffects" in opened.model.clips[0].props, false);
+
+  // Catalogues and engine status; the fx and motion answers never carry a file path.
+  const info = await ask("studio.info");
+  assert.equal(info.t, "studio");
+  assert.equal(info.fx.catalog.length, 45);
+  assert.deepEqual(info.fx.catalog.find((f: { fx: string }) => f.fx === "lean-in").numeric, ["speed", "zoom"]);
+  assert.equal(info.motion.engine.ok, false);
+  const card = info.motion.templates.find((x: { id: string }) => x.id === "title-card");
+  assert.deepEqual(card.fields.find((f: { key: string }) => f.key === "align"), { key: "align", kind: "choice", options: ["center", "left"] });
+  assert.deepEqual(card.fields.find((f: { key: string }) => f.key === "title"), { key: "title", kind: "text", max: 80, required: true });
+  assert.equal(card.fields.find((f: { key: string }) => f.key === "accent").kind, "color");
+  const status = await ask("fx.status");
+  assert.deepEqual(status.bakes, [{ key: "k1", state: "running", progress: 0.5, error: null }]);
+  const motion = await ask("motion.status", { key: "0123456789abcdef" });
+  assert.deepEqual(motion.motion.asset, { id: "00000000-0000-4000-8000-0000000000aa", filename: "Title card.mov", kind: "video", durationFrames: 121 });
+  assert.doesNotMatch(JSON.stringify([status, motion]), /secret|\/Users\//);
+
+  // Captions: no transcript yet, so the Mac starts one (with the language asked for) and says so.
+  const first = await ask("captions.plan", { language: "id", maxWords: 3 });
+  assert.equal(first.t, "captions", String(first.message));
+  assert.equal(first.state, "transcribing");
+  assert.deepEqual(analyzed, [{ assetId: asset.id, params: { language: "id" } }]);
+  // Polling while it runs doesn't start it again.
+  const store = new AnalysisStore(db);
+  const a = store.latest(project.id, asset.id, "transcript")!;
+  assert.ok(store.claim(a.id));
+  store.progress(a.id, 0.4);
+  const polled = await ask("captions.plan", { poll: true });
+  assert.equal(polled.state, "transcribing");
+  assert.equal(polled.missing[0].progress, 0.4);
+  assert.equal(analyzed.length, 1);
+  // Done: the captions come back as ONE captions.replace for the phone's own queue (nothing applied yet).
+  store.complete(a.id, "test", { language: "id", text: "halo semua apa kabar", segments: [{ startUs: 0, endUs: 2_000_000, text: "halo semua apa kabar", words: [
+    { text: "halo", startUs: 0, endUs: 400_000, confidence: 1 }, { text: "semua", startUs: 400_000, endUs: 900_000, confidence: 1 },
+    { text: "apa", startUs: 1_000_000, endUs: 1_300_000, confidence: 1 }, { text: "kabar", startUs: 1_300_000, endUs: 2_000_000, confidence: 1 },
+  ] }] } as never);
+  const rev = new ProjectStore(db).get(project.id).revision;
+  const ready = await ask("captions.plan", { poll: true, maxWords: 2 });
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.ops.length, 1);
+  assert.equal(ready.ops[0].type, "captions.replace");
+  assert.deepEqual(ready.ops[0].captions.map((c: { text: string }) => c.text), ["halo semua", "apa kabar"]);
+  assert.equal(new ProjectStore(db).get(project.id).revision, rev);
+  // …which the phone sends like any edit: one undoable step of its session.
+  const sessionId = crypto.randomUUID();
+  const begun = await ask("edit.begin", { sessionId });
+  const applied = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: begun.model.revision, label: "Generate captions", operations: ready.ops });
+  assert.equal(applied.t, "edit", String(applied.message));
+  assert.equal(timeline.get(project.id).captions.length, 2);
+  assert.equal(applied.model.history.label.undo, "Generate captions");
+  // And a failed transcript is reported on a poll rather than silently restarted.
+  const failedSource = store.enqueue(project.id, asset.id, ["transcript"], {})[0]!;
+  store.fail(failedSource.id, "whisper crashed");
+  const failed = await ask("captions.plan", { poll: true });
+  assert.equal(failed.state, "failed");
+  assert.match(failed.missing[0].error, /whisper crashed/);
+  assert.equal(analyzed.length, 1);
 });

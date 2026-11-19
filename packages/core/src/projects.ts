@@ -160,6 +160,32 @@ export class ProjectStore {
     });
   }
 
+  /**
+   * Remove a project and everything recorded about it (timeline, assets, captions, proposals, jobs,
+   * history). Only rows: the media files, exports and generated files stay on disk. Refused with BUSY while
+   * a render or an analysis of its media is queued or running, so no runner writes into a project that's gone.
+   */
+  delete(id: string): Project {
+    const pid = parse(ProjectIdSchema, id);
+    return transaction(this.#db, () => {
+      const project = this.get(pid);
+      const render = this.#db
+        .prepare("SELECT 1 FROM render_jobs WHERE project_id = ? AND state IN ('queued', 'analyzing', 'rendering', 'muxing') LIMIT 1")
+        .get(pid);
+      if (render) throw new ReelForgeError("BUSY", "A render of this project is still running. Cancel it or wait for it to finish, then delete.", { projectId: pid });
+      const analysis = this.#db
+        .prepare(
+          `SELECT 1 FROM analyses a JOIN assets s ON s.id = a.asset_id
+            WHERE s.project_id = ? AND a.state IN ('queued', 'running') LIMIT 1`,
+        )
+        .get(pid);
+      if (analysis) throw new ReelForgeError("BUSY", "This project's media is still being analysed (transcription, scenes or beats). Delete it once that's done.", { projectId: pid });
+      // Every table hangs off projects with ON DELETE CASCADE (workflow_runs keep their record: SET NULL).
+      this.#db.prepare("DELETE FROM projects WHERE id = ?").run(pid);
+      return project;
+    });
+  }
+
   history(id: string): EditOperation[] {
     const pid = this.get(id).id;
     const rows = this.#db

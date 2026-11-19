@@ -7,6 +7,8 @@ export type ErrorCode =
   | "UNAVAILABLE"
   /** The user hasn't allowed sending this project's context to an external AI provider. */
   | "CONSENT_REQUIRED"
+  /** Something is still working on it (a render, a transcription); try again once it's done. */
+  | "BUSY"
   | "INTERNAL";
 
 /** Every failure that crosses a boundary (CLI, REST, MCP) is one of these. */

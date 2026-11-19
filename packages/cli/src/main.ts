@@ -30,7 +30,7 @@ import {
   type TimelineOp,
 } from "@reelforge/core";
 import { ANTHROPIC_DEFAULT_MODEL, consentRecipient, credentialSource, listAIProviders, listOllamaModels, OllamaProvider, propose, providerFor, providerReady, setCredential } from "@reelforge/ai";
-import { AnalysisRunner, createRenderJob, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob } from "@reelforge/media";
+import { AnalysisRunner, createRenderJob, ensureFilmstrip, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob, sourceStill } from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 import { ConnectorAuth, ConnectorManager, createMcpServer } from "@reelforge/mcp";
 import { RemoteManager } from "@reelforge/remote";
@@ -50,6 +50,7 @@ const EXIT: Record<ErrorCode, number> = {
   UNAUTHORIZED: 5,
   UNAVAILABLE: 6,
   CONSENT_REQUIRED: 7,
+  BUSY: 8,
 };
 
 const USAGE = `reelforge ${VERSION} — AI-native video editing engine
@@ -59,6 +60,7 @@ Usage:
   reelforge project list | get <id> | history <id>
   reelforge project create --name <name> [--width 1080] [--height 1920] [--fps 30]
   reelforge project rename <id> --name <name> --base-revision <n>
+  reelforge project delete <id> --yes        (project data only; media files and exports stay)
 
   reelforge media import <project> <file>...
   reelforge media list <project>
@@ -366,6 +368,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
       "cli",
     ),
   }),
+  "project delete": ({ db, args, values }) => {
+    const id = need(args[0], "<project>");
+    if (!values.yes) invalid("deleting a project can't be undone: pass --yes to confirm");
+    return { deleted: new ProjectStore(db).delete(id) };
+  },
   "project history": ({ db, args }) => ({ operations: new ProjectStore(db).history(need(args[0], "<project>")) }),
 
   "media import": async ({ db, args, io }) => {
@@ -786,6 +793,10 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     dir: join(home, "remote"),
     version: VERSION,
     thumbnail: (asset) => ensureThumbnail(resolveCacheDir(env), asset),
+    frames: {
+      still: (asset, timeUs, wanted) => sourceStill(resolveCacheDir(env), asset, timeUs, wanted),
+      filmstrip: (asset) => ensureFilmstrip(resolveCacheDir(env), asset),
+    },
     ai: {
       providers: async () => (await listAIProviders()).map((p) => ({ ...p, ready: providerReady(p), recipient: consentRecipient(p.id) })),
       propose: (projectId, input, signal) => propose(db, projectId, providerFor(input.provider), { instruction: input.instruction, model: input.model }, { signal }),
@@ -827,7 +838,7 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     allowedOrigins: values["allow-origin"] ?? [],
     ...(env.REELFORGE_DEBUG ? { log: (line: string) => io.err(`[reelforge-server] ${line}\n`) } : {}),
   });
-  remoteManager.attach({ render: srv.render });
+  remoteManager.attach({ render: srv.render, studio: srv.studio });
   const engineFile = join(home, ENGINE_FILE);
   if (background) {
     const f: EngineFile = { pid: process.pid, url: srv.url, token, version: VERSION, startedAt, background: true };

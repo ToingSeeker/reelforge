@@ -30,6 +30,8 @@ interface Props {
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
   onRename: (name: string) => Promise<void>;
+  /** Asks first (DeleteProjectDialog), then deletes the current project. */
+  onDelete: () => void;
   /** Agent lifecycle, mapped in activity.ts. */
   logoState: LogoState;
   /** Short text for the agent state (also what reduced-motion users get instead of the animation). */
@@ -115,7 +117,7 @@ function SaveStatus({ current, offline, loading, busy }: { current: Project | nu
   );
 }
 
-function ProjectSwitcher({ projects, current, onSelectProject, onNewProject, onRename }: Props) {
+function ProjectSwitcher({ projects, current, onSelectProject, onNewProject, onRename, onDelete }: Props) {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -222,6 +224,19 @@ function ProjectSwitcher({ projects, current, onSelectProject, onNewProject, onR
               <Icon name="pencil" size={14} />
             </span>
             Rename “{current.name}”
+          </button>
+          <button
+            role="menuitem"
+            className="rf-menu-item is-danger"
+            onClick={() => {
+              setOpen(false);
+              onDelete();
+            }}
+          >
+            <span className="rf-menu-check">
+              <Icon name="trash" size={14} />
+            </span>
+            Delete “{current.name}”…
           </button>
           <button
             role="menuitem"

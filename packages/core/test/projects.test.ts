@@ -91,7 +91,7 @@ test("migrations run once per database", (t) => {
   openDatabase(path).close();
   const db = openDatabase(path);
   const rows = db.prepare("SELECT version FROM schema_migrations").all();
-  assert.deepEqual(rows.map((r) => r.version), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.deepEqual(rows.map((r) => r.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 });
 
 test("resize changes the format, bumps revision, and is a no-op when unchanged", (t) => {

@@ -145,6 +145,17 @@ button:disabled {
   border-color: transparent;
   background: #ffffff;
 }
+.rf-btn-danger {
+  border-color: transparent;
+  background: var(--error);
+  color: #fff;
+  font-weight: 600;
+}
+.rf-btn-danger:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--error);
+  filter: brightness(1.08);
+}
 .rf-btn-mint {
   border-color: rgba(214, 242, 230, 0.5);
   background: linear-gradient(180deg, #bce9d7, var(--accent-mint));
@@ -2933,6 +2944,16 @@ select.rf-input {
 .rf-form-error {
   color: var(--error);
   font-size: 12px;
+}
+.rf-delete-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.rf-delete-note {
+  color: var(--text-secondary);
 }
 .rf-dialog-actions {
   display: flex;
