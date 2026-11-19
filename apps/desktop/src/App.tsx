@@ -622,6 +622,7 @@ export function App() {
               onOpenSettings={() => setSettingsOpen(true)}
               onRun={setAiRun}
               onOpen={() => openRail("director")}
+              onCommand={apply}
             />
           </section>
           <Preview

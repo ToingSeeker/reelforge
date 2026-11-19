@@ -27,4 +27,5 @@ export * from "./effects.ts";
 export * from "./fx-catalog.ts";
 export * from "./fx-bake.ts";
 export * from "./motion-catalog.ts";
+export * from "./slash.ts";
 export { MotionGraphicStore, type MotionGraphic } from "./motion-graphics.ts";

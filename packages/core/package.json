@@ -15,7 +15,8 @@
     "./captions": "./src/captions.ts",
     "./effects": "./src/effects.ts",
     "./fx-catalog": "./src/fx-catalog.ts",
-    "./motion-catalog": "./src/motion-catalog.ts"
+    "./motion-catalog": "./src/motion-catalog.ts",
+    "./slash": "./src/slash.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
