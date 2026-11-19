@@ -781,3 +781,64 @@ test("studio: AI effects reach the phone whole; captions are transcribed on the 
   assert.match(failed.missing[0].error, /whisper crashed/);
   assert.equal(analyzed.length, 1);
 });
+
+test("slash commands from the phone: worked out on the Mac by core's code, applied only through the phone's edit queue", async (t) => {
+  const { db, home, p } = await paired(t);
+  const project = new ProjectStore(db).create({ name: "Slash", settings: { width: 1080, height: 1920 } }, "desktop");
+  writeFileSync(join(home, "clip.mp4"), "fake");
+  const st = statSync(join(home, "clip.mp4"));
+  const asset = new AssetStore(db).add(project.id, { path: join(home, "clip.mp4"), sizeBytes: st.size, mtimeMs: st.mtimeMs }, {
+    kind: "video", durationUs: 10_000_000, width: 1080, height: 1920, fps: { num: 30, den: 1 }, vfr: false, hasVideo: true, hasAudio: true, hasAlpha: false,
+    videoCodec: "h264", audioCodec: "aac", sampleRate: 48000, channels: 2, rotation: 0,
+  }, "desktop").asset;
+  const timeline = new TimelineStore(db);
+  const tl0 = timeline.get(project.id);
+  const v1 = tl0.tracks.find((x) => x.kind === "video")!.id;
+  const clipId = crypto.randomUUID();
+  timeline.apply(project.id, { baseRevision: tl0.project.revision, operations: [{ type: "clip.add", trackId: v1, assetId: asset.id, start: 30, duration: 150, clipId }] }, "desktop");
+  const ask = async (type: string, extra: Record<string, unknown> = {}) => {
+    const s = await p.send(type, { projectId: project.id, ...extra });
+    return until(type, () => p.events.find((e) => e.id === s.id)) as Promise<Ev & Record<string, any>>;
+  };
+
+  // The autocomplete catalogue rides along with the studio info.
+  const info = await ask("studio.info");
+  assert.ok(info.slash.commands.some((c: { name: string }) => c.name === "noir"));
+  assert.equal(info.slash.fx.length, 45);
+  assert.ok(info.slash.fx.find((c: { name: string }) => c.name === "fx spotlight").aliases.includes("glitter"));
+
+  // A chain with an AI effect at the playhead: one clip.update, nothing applied on the Mac yet.
+  const rev = new ProjectStore(db).get(project.id).revision;
+  const plan = await ask("slash.plan", { text: "/noir; /fx led Hello World; /fade in 1", clipIds: [clipId], playhead: 60 });
+  assert.equal(plan.t, "slash", String(plan.message));
+  assert.equal(plan.ok, true, plan.error);
+  assert.equal(plan.revision, rev);
+  assert.equal(plan.ops.length, 1);
+  assert.equal(plan.ops[0].type, "clip.update");
+  assert.equal(plan.ops[0].props.grayscale, 1);
+  assert.equal(plan.ops[0].props.fadeIn, 30);
+  // Source frames: playhead 60 is 30 frames into a clip starting at 30; 3 s at 30 fps; text kept as typed.
+  assert.deepEqual(plan.ops[0].props.aiEffects, [{ fx: "led-sign", start: 30, end: 120, text: "Hello World" }]);
+  assert.match(plan.label, /Noir look/);
+  assert.equal(new ProjectStore(db).get(project.id).revision, rev);
+
+  // Errors come back as answers the phone can show, not as failures.
+  const typo = await ask("slash.plan", { text: "/blr", clipIds: [clipId], playhead: 0 });
+  assert.deepEqual([typo.t, typo.ok], ["slash", false]);
+  assert.match(typo.error, /Unknown command \/blr/);
+  const none = await ask("slash.plan", { text: "/bw", clipIds: [], playhead: 0 });
+  assert.match(none.error, /Select a clip/);
+  // Only slash commands, only real ids.
+  assert.equal((await ask("slash.plan", { text: "make it pop", clipIds: [clipId] })).t, "error");
+  assert.equal((await ask("slash.plan", { text: "/bw", clipIds: ["../x"] })).t, "error");
+
+  // The phone sends the plan like any edit: one undoable step of its session, labelled as the command.
+  const sessionId = crypto.randomUUID();
+  const begun = await ask("edit.begin", { sessionId });
+  const applied = await ask("edit.apply", { sessionId, commandId: crypto.randomUUID(), baseRevision: begun.model.revision, label: plan.label, operations: plan.ops });
+  assert.equal(applied.t, "edit", String(applied.message));
+  const clip = timeline.get(project.id).clips.find((c) => c.id === clipId)!;
+  assert.equal(clip.props.grayscale, 1);
+  assert.equal(clip.props.aiEffects?.[0]?.fx, "led-sign");
+  assert.equal(applied.model.history.label.undo, plan.label);
+});

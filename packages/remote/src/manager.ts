@@ -20,10 +20,13 @@ import {
   FX_NUMERIC_OPTIONS,
   JobStore,
   MOTION_TEMPLATES,
+  parseSlash,
   planCaptions,
+  planSlash,
   ProjectStore,
   ProposalStore,
   ReelForgeError,
+  slashCatalog,
   TimelineStore,
   type AIProposal,
   type Analysis,
@@ -1268,6 +1271,8 @@ export class RemoteManager {
         }
         case "captions.plan":
           return reply(this.#planCaptions(cmd));
+        case "slash.plan":
+          return reply(this.#planSlash(cmd));
         case "media.thumb": {
           const projectId = uuidOf(cmd.projectId, "project");
           const assetId = uuidOf(cmd.assetId, "asset");
@@ -1411,6 +1416,7 @@ export class RemoteManager {
         templates: Object.entries(MOTION_TEMPLATES).map(([id, t]) => ({ id, label: t.label, description: t.description, defaultSeconds: t.defaultSeconds, defaults: t.defaults, fields: motionFields(t.schema, t.defaults) })),
         maxSeconds: 60,
       },
+      slash: slashCatalog(),
       engine: this.#opts.engine?.() ?? null,
       macName: this.macName(),
       version: this.#opts.version,
@@ -1450,6 +1456,27 @@ export class RemoteManager {
       revision: tl.project.revision,
       ops: [{ type: "captions.replace", trackId: plan.trackId, captions: plan.captions.map((c) => ({ captionId: randomUUID(), start: c.start, duration: c.duration, text: c.text, words: c.words })) }],
     };
+  }
+
+  /**
+   * A slash command typed in the phone's editor ("/noir; /zoom in"), worked out by the same core code as the
+   * desktop's AI Director. Nothing is applied here: the operations go back to the phone, which sends them
+   * through its own edit queue (one undo step of its session). The phone settles its queue first, so the
+   * timeline planned on is the one it shows; `revision` lets it check that.
+   */
+  #planSlash(cmd: RemoteCommand): Record<string, unknown> {
+    const projectId = uuidOf(cmd.projectId, "project");
+    const text = typeof cmd.text === "string" ? cmd.text : "";
+    if (!text.trim().startsWith("/") || text.length > 2000) throw new ReelForgeError("VALIDATION_ERROR", "bad slash command");
+    const clipIds = Array.isArray(cmd.clipIds) ? cmd.clipIds.slice(0, 500).map((x) => uuidOf(x, "clip")) : [];
+    const playhead = typeof cmd.playhead === "number" && Number.isInteger(cmd.playhead) && cmd.playhead >= 0 ? cmd.playhead : 0;
+    const tl = new TimelineStore(this.#opts.db).get(projectId);
+    const revision = tl.project.revision;
+    const parsed = parseSlash(text);
+    if (!parsed.ok) return { t: "slash", projectId, ok: false, error: parsed.error, revision };
+    const plan = planSlash(tl, clipIds, parsed.command, { playhead });
+    if (!plan.ok) return { t: "slash", projectId, ok: false, error: plan.error, revision };
+    return { t: "slash", projectId, ok: true, label: plan.label, ops: plan.ops, skipped: plan.skipped, revision };
   }
 
   /** A source still or filmstrip for the editor, as a sealed blob for the phone that asked. */
