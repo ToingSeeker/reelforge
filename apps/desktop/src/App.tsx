@@ -3,7 +3,7 @@ import type { AIProposal, Asset, CaptionStylePatch, ClipPropsPatch, Project, Tim
 import { applyOperations, canPlace, clipEnd } from "@reelforge/core/timeline-ops";
 import { SettingsDialog } from "./components/SettingsDialog.tsx";
 import { AutomationLab } from "./components/AutomationLab.tsx";
-import { createClient, resolveApiInfo, type Client } from "./api.ts";
+import { ApiError, createClient, resolveApiInfo, type Client } from "./api.ts";
 import { useEditor } from "./editor.ts";
 import { backgroundEngine, onFileDrop, pickExportPath, pickMediaFiles } from "./native.ts";
 import { useExports, usePreview } from "./render.ts";
@@ -25,6 +25,7 @@ import { useAgentActivity, type AiRun } from "./activity.ts";
 import type { FxBaking, PreviewMode } from "./components/Preview.tsx";
 import { Timeline, type AssetDropHandler } from "./components/Timeline.tsx";
 import { NewProjectDialog } from "./components/NewProjectDialog.tsx";
+import { DeleteProjectDialog } from "./components/DeleteProjectDialog.tsx";
 import { Welcome } from "./components/Welcome.tsx";
 import { RailPlaceholder } from "./components/Placeholder.tsx";
 import { EffectsPanel } from "./components/EffectsPanel.tsx";
@@ -64,6 +65,7 @@ export function App() {
   const [workspace, setWorkspace] = useState<Workspace>("edit");
   const [rail, setRail] = useState<RailItem>("media");
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [deleting, setDeleting] = useState<Project | null>(null);
   const [toast, setToast] = useState<{ tone: "info" | "error"; text: string; id: number } | null>(null);
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [playhead, setPlayhead] = useState(0);
@@ -317,6 +319,21 @@ export function App() {
     await refresh();
   };
 
+  /** Throws on failure so the dialog can show why (BUSY while a render is running, …). */
+  const deleteProject = async (p: Project) => {
+    if (!client) return;
+    try {
+      await client.deleteProject(p.id);
+    } catch (e) {
+      // Already gone (deleted from the phone or the CLI meanwhile): the outcome the user asked for.
+      if (!(e instanceof ApiError && e.code === "NOT_FOUND")) throw e;
+    }
+    setDeleting(null);
+    // The list loses it; the selection falls back to the next project on its own.
+    await refresh();
+    notify("info", `“${p.name}” was deleted. Its media files and exports are still on disk.`);
+  };
+
   const resizeProject = async (width: number, height: number) => {
     if (!client || !tl) return;
     try {
@@ -403,7 +420,7 @@ export function App() {
   // Keyboard: ⌘Z / ⇧⌘Z, S split, ⌫ delete, ⇧⌫ ripple, ←/→ frame (⇧ = 1s), Home/End.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (isTyping(e.target) || dialogOpen || !tl) return;
+      if (isTyping(e.target) || dialogOpen || deleting || !tl) return;
       const mod = e.metaKey || e.ctrlKey;
       const second = Math.round(fps.num / fps.den);
       if (mod && e.key.toLowerCase() === "z") {
@@ -511,6 +528,7 @@ export function App() {
         onSelectProject={selectProject}
         onNewProject={() => setDialogOpen(true)}
         onRename={renameProject}
+        onDelete={() => current && setDeleting(current)}
         canUndo={!!tl?.history.canUndo}
         canRedo={!!tl?.history.canRedo}
         onUndo={() => void editor.undo()}
@@ -766,6 +784,7 @@ export function App() {
         />
       )}
       {dialogOpen && <NewProjectDialog onCancel={() => setDialogOpen(false)} onCreate={createProject} />}
+      {deleting && <DeleteProjectDialog project={deleting} onCancel={() => setDeleting(null)} onDelete={() => deleteProject(deleting)} />}
       {toast && (
         <div key={toast.id} className={`rf-toast rf-toast-${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>
           {toast.text}

@@ -105,7 +105,8 @@ export class EditSessions {
   /** The live lease on a project, if any (lapsed ones are dropped here). */
   lease(projectId: string): EditLease | null {
     const l = this.#leases.get(projectId);
-    if (l && l.expiresAt <= this.#now()) {
+    // Lapsed, or the project was deleted (on the Mac: the lease is otherwise kept alive by heartbeats).
+    if (l && (l.expiresAt <= this.#now() || !this.#db.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId))) {
       this.#drop(projectId);
       return null;
     }
@@ -169,6 +170,11 @@ export class EditSessions {
   /** Drops a project's lease without asking (the phone that held it was unpaired). */
   releaseDevice(deviceId: string): void {
     for (const [pid, l] of this.#leases) if (l.deviceId === deviceId) this.#drop(pid);
+  }
+
+  /** Drops the lease on a project that was deleted. */
+  releaseProject(projectId: string): void {
+    if (this.#leases.has(projectId)) this.#drop(projectId);
   }
 
   /**
@@ -286,8 +292,10 @@ export class EditSessions {
         ...(t.kind === "caption" ? { captionStyle: resolveCaptionStyle(t.captionStyle), stylePatch: t.captionStyle ?? {} } : {}),
       })),
       clips: tl.clips.map((c) => {
+        // AI effects travel whole (fx names, source-frame times, text, options, asset ids: no paths), so the
+        // phone can list and edit them; they stay out of `props` like the core default list keeps them.
         const { aiEffects, ...props } = resolveClipProps(c.props);
-        return { id: c.id, trackId: c.trackId, assetId: c.assetId, start: c.start, duration: c.duration, sourceIn: c.sourceIn, props, aiEffects: aiEffects.length };
+        return { id: c.id, trackId: c.trackId, assetId: c.assetId, start: c.start, duration: c.duration, sourceIn: c.sourceIn, props, aiEffects };
       }),
       captions: tl.captions.slice(0, MAX_CAPTIONS).map((c) => ({ id: c.id, trackId: c.trackId, start: c.start, duration: c.duration, text: c.text, words: c.words })),
       captionsTruncated: tl.captions.length > MAX_CAPTIONS,

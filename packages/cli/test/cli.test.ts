@@ -39,6 +39,20 @@ test("create → list → rename → history, all JSON", async (t) => {
   assert.deepEqual(h.json.operations.map((o: any) => o.kind), ["project.create", "project.rename"]);
 });
 
+test("project delete needs --yes, then removes the project", async (t) => {
+  const run = harness(t);
+  const id = (await run("project", "create", "--name", "Gone")).json.project.id;
+  const unconfirmed = await run("project", "delete", id);
+  assert.equal(unconfirmed.code, 2);
+  assert.match(unconfirmed.error.message, /--yes/);
+  assert.equal((await run("project", "list")).json.projects.length, 1, "nothing deleted without --yes");
+  const d = await run("project", "delete", id, "--yes");
+  assert.equal(d.code, 0);
+  assert.equal(d.json.deleted.name, "Gone");
+  assert.equal((await run("project", "list")).json.projects.length, 0);
+  assert.equal((await run("project", "delete", id, "--yes")).code, 3);
+});
+
 test("errors are JSON on stderr with distinct exit codes", async (t) => {
   const run = harness(t);
   const missing = await run("project", "create");

@@ -19,6 +19,23 @@ export const CAPTION_PRESETS = Object.freeze({
 export const CAPTION_FONTS = Object.freeze({ Anton: 'Anton-Regular.ttf', 'Poppins Bold': 'Poppins-Bold.ttf', 'Poppins SemiBold': 'Poppins-SemiBold.ttf' });
 export const resolveCaptionStyle = (patch) => ({ ...CAPTION_PRESETS.bold, ...(patch ?? {}) });
 
+/** core effects.ts MOTION_PRESETS: one-tap camera moves (scale and position only). */
+export const MOTION_PRESETS = Object.freeze([
+  { key: 'none', label: 'None', hint: 'Still frame', motion: { scale: 1, scaleEnd: null, x: 0, xEnd: null, y: 0, yEnd: null } },
+  { key: 'zoomIn', label: 'Zoom in', hint: '100 → 125 %', motion: { scale: 1, scaleEnd: 1.25, x: 0, xEnd: null, y: 0, yEnd: null } },
+  { key: 'zoomOut', label: 'Zoom out', hint: '125 → 100 %', motion: { scale: 1.25, scaleEnd: 1, x: 0, xEnd: null, y: 0, yEnd: null } },
+  { key: 'pushIn', label: 'Slow push', hint: '100 → 108 %', motion: { scale: 1, scaleEnd: 1.08, x: 0, xEnd: null, y: 0, yEnd: null } },
+  { key: 'panLeft', label: 'Pan left', hint: 'Drift to the left', motion: { scale: 1.2, scaleEnd: null, x: 0.08, xEnd: -0.08, y: 0, yEnd: null } },
+  { key: 'panRight', label: 'Pan right', hint: 'Drift to the right', motion: { scale: 1.2, scaleEnd: null, x: -0.08, xEnd: 0.08, y: 0, yEnd: null } },
+  { key: 'kenBurns', label: 'Ken Burns', hint: 'Zoom and drift', motion: { scale: 1.1, scaleEnd: 1.25, x: 0.04, xEnd: -0.04, y: 0.02, yEnd: -0.02 } },
+]);
+/** core motionPresetOf: the preset a clip's motion matches exactly, or null for a hand-made one. */
+export function motionPresetOf(p) {
+  return MOTION_PRESETS.find((m) => Object.keys(m.motion).every((k) => p[k] === m.motion[k]))?.key ?? null;
+}
+
+/** core timeline-ops.ts DEFAULT_STILL_SECONDS: how long a photo lands on the timeline. */
+export const DEFAULT_STILL_SECONDS = 3;
 /** core schema.ts MAX_FRAME: the longest a timeline may run (24 h at 240 fps). */
 export const MAX_FRAME = 24 * 60 * 60 * 240;
 /** Engine limits (schema.ts): what the controls clamp to. */
@@ -137,6 +154,17 @@ function checkClip(m, c) {
   for (const o of m.clips) if (o.id !== c.id && o.trackId === c.trackId && o.start < clipEnd(c) && c.start < clipEnd(o)) fail(`It would overlap another clip on ${track.label}.`);
 }
 
+/** core putCaption + the operation schema: some text, at least a frame, no overlap on its track. */
+function checkCaption(m, c) {
+  if (!c.text) fail('A caption needs some text.');
+  if (c.text.length > LIMITS.captionText) fail(`A caption holds up to ${LIMITS.captionText} characters.`);
+  if (!Number.isInteger(c.start) || c.start < 0) fail('A caption can’t start before 00:00.');
+  if (!Number.isInteger(c.duration) || c.duration < 1) fail('A caption must be at least one frame long.');
+  if (c.start + c.duration > MAX_FRAME) fail('That runs past the longest a timeline can be.');
+  for (const o of m.captions) if (o.id !== c.id && o.trackId === c.trackId && o.start < c.start + c.duration && c.start < o.start + o.duration) fail('It would overlap another caption.');
+  return { ...c, words: fitWords(c.words ?? evenWords(c.text, c.duration), c.duration) };
+}
+
 function unlocked(m, trackId) {
   const t = trackOf(m, trackId) ?? fail('track not found');
   if (t.locked) fail(`${t.label} is locked on the Mac.`);
@@ -163,7 +191,20 @@ export function applyOps(model, ops) {
       case 'clip.update': {
         const c = clip(op.clipId);
         unlocked(m, c.trackId);
-        put({ ...c, props: { ...c.props, ...op.props } });
+        // AI effects ride in props on the Mac; the phone keeps the list beside them (edit.ts model()).
+        const { aiEffects, ...props } = op.props ?? {};
+        put({ ...c, ...(aiEffects !== undefined ? { aiEffects: aiEffects.map((e) => ({ ...e })) } : {}), props: { ...c.props, ...props } });
+        break;
+      }
+      case 'clip.add': {
+        unlocked(m, op.trackId);
+        const asset = assetOf(m, op.assetId) ?? fail('That media isn’t in this project (removed on the Mac?).');
+        const sourceIn = op.sourceIn ?? 0;
+        const duration = op.duration ?? (asset.durationFrames === null ? secondsToFrames(DEFAULT_STILL_SECONDS, m.fps) : asset.durationFrames - sourceIn);
+        if (!op.clipId) fail('A new clip needs its id.');
+        if (clipById(m, op.clipId)) fail('That clip already exists.');
+        const { aiEffects = [], ...props } = op.props ?? {};
+        put({ id: op.clipId, trackId: op.trackId, assetId: op.assetId, start: op.start, duration, sourceIn, props: { ...DEFAULT_CLIP_PROPS, ...props }, aiEffects });
         break;
       }
       case 'clip.move': {
@@ -215,6 +256,7 @@ export function applyOps(model, ops) {
         const t = { ...m.tracks[i] };
         if (op.muted !== undefined) t.muted = op.muted;
         if (op.hidden !== undefined) t.hidden = op.hidden;
+        if (op.locked !== undefined) t.locked = op.locked;
         if (op.captionStyle) {
           t.stylePatch = { ...(t.stylePatch ?? {}), ...op.captionStyle };
           t.captionStyle = resolveCaptionStyle(t.stylePatch);
@@ -238,6 +280,31 @@ export function applyOps(model, ops) {
         for (const o of m.captions) if (o.id !== c.id && o.trackId === c.trackId && o.start < start + duration && start < o.start + o.duration) fail('It would overlap the next or previous caption.');
         const words = op.words ?? (op.text !== undefined && text !== c.text ? evenWords(text, duration) : c.words);
         m.captions[i] = { ...c, text, start, duration, words: fitWords(words, duration) };
+        break;
+      }
+      case 'caption.add': {
+        const t = unlocked(m, op.trackId);
+        if (t.kind !== 'caption') fail('Captions go on a caption track.');
+        if (!op.captionId) fail('A new caption needs its id.');
+        if (captionById(m, op.captionId)) fail('That caption already exists.');
+        m.captions.push(checkCaption(m, { id: op.captionId, trackId: op.trackId, start: op.start, duration: op.duration, text: String(op.text ?? '').trim(), words: op.words ?? null }));
+        break;
+      }
+      case 'caption.delete': {
+        const targets = [...new Set(op.captionIds)].map((id) => captionById(m, id) ?? fail('That caption is gone (changed on the Mac?).'));
+        for (const c of targets) unlocked(m, c.trackId);
+        const gone = new Set(targets.map((c) => c.id));
+        m.captions = m.captions.filter((c) => !gone.has(c.id));
+        break;
+      }
+      case 'captions.replace': {
+        const t = unlocked(m, op.trackId);
+        if (t.kind !== 'caption') fail('Captions go on a caption track.');
+        m.captions = m.captions.filter((c) => c.trackId !== op.trackId);
+        for (const c of op.captions) {
+          if (!c.captionId) fail('Each new caption needs its id.');
+          m.captions.push(checkCaption(m, { id: c.captionId, trackId: op.trackId, start: c.start, duration: c.duration, text: String(c.text ?? '').trim(), words: c.words ?? null }));
+        }
         break;
       }
       default:

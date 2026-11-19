@@ -167,7 +167,7 @@ detail and result are written to `workflow_runs` as it progresses, so the Automa
 | Method | Path | |
 |---|---|---|
 | GET/POST | `/v1/projects` | list / create |
-| GET/PATCH | `/v1/projects/:id` | get / rename (`baseRevision`) |
+| GET/PATCH/DELETE | `/v1/projects/:id` | get / rename (`baseRevision`) / delete (project data only; media files and exports stay on disk) |
 | GET | `/v1/projects/:id/history` | edit_operations |
 | GET | `/v1/projects/:id/timeline` | tracks, clips, assets, `history.canUndo/canRedo` |
 | POST | `/v1/projects/:id/operations` | `{baseRevision, operations}` |
@@ -217,4 +217,5 @@ Set `REELFORGE_DEBUG=1` to log engine requests (method, path, status, origin, ne
 | `UNAVAILABLE` (FFmpeg / model / key missing) | 503 | 6 |
 | `CONSENT_REQUIRED` | 403 | 7 |
 | `REVISION_CONFLICT` | 409 | 4 |
+| `BUSY` (a render or transcription is still running) | 409 | 8 |
 | `INTERNAL` | 500 | 1 |

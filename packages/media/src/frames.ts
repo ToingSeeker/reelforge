@@ -85,7 +85,10 @@ export async function sourceStill(cacheDir: string, asset: Asset, timeUs: number
   usable(asset);
   const t = asset.kind === "image" ? 0 : Math.max(0, Math.min(Math.round(timeUs), Math.max(0, (asset.durationUs ?? 0) - 1000)));
   const dir = join(cacheDir, "stills");
-  const out = join(dir, `${asset.id}-${asset.sizeBytes}-${t}.jpg`);
+  // Pictures with transparency (motion graphics, PNGs) keep it: a PNG with alpha, so the phone's live
+  // preview shows what's underneath instead of a black box.
+  const alpha = asset.hasAlpha;
+  const out = join(dir, `${asset.id}-${asset.sizeBytes}-${t}.${alpha ? "png" : "jpg"}`);
   try {
     return await once(out, stillLimit, async (tmp) => {
       if (!wanted()) throw new ReelForgeError("VALIDATION_ERROR", STILL_SUPERSEDED, { assetId: asset.id, superseded: true });
@@ -97,8 +100,9 @@ export async function sourceStill(cacheDir: string, asset: Asset, timeUs: number
           ...(t > 0 ? ["-ss", (t / 1_000_000).toFixed(6)] : []),
           ...sourceInputArgs(asset.sourcePath),
           "-frames:v", "1",
-          "-vf", `scale=${STILL_MAX}:${STILL_MAX}:force_original_aspect_ratio=decrease:force_divisible_by=2,scale=out_color_matrix=bt709`,
-          "-q:v", "4",
+          "-vf", `scale=${STILL_MAX}:${STILL_MAX}:force_original_aspect_ratio=decrease:force_divisible_by=2,scale=out_color_matrix=bt709${alpha ? ",format=rgba" : ""}`,
+          // The temp name has no extension, so the encoder is named: PNG keeps the alpha, JPEG doesn't.
+          ...(alpha ? ["-c:v", "png", "-pix_fmt", "rgba"] : ["-q:v", "4"]),
           ...SINGLE_IMAGE,
           `file:${tmp}`,
         ],

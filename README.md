@@ -191,6 +191,7 @@ pnpm cli project create --name "YouTube cut" --width 1920 --height 1080 --fps 29
 pnpm cli project list
 pnpm cli project rename <project> --name "Final" --base-revision 1
 pnpm cli project history <project>
+pnpm cli project delete <project> --yes                     # project data only; media files and exports stay
 
 # Media and timeline (times: frames 90, seconds 2.5s, timecode 00:00:03:00 or 00:03.10)
 pnpm cli media import <project> ~/Footage/*.mp4 ~/Music/track.wav

@@ -142,6 +142,7 @@ export function createClient(info: ApiInfo) {
       request<{ project: Project }>("POST", "/v1/projects", input).then((r) => r.project),
     renameProject: (id: string, name: string, baseRevision: number) =>
       request<{ project: Project }>("PATCH", `/v1/projects/${encodeURIComponent(id)}`, { name, baseRevision }).then((r) => r.project),
+    deleteProject: (id: string) => request<{ deleted: Project }>("DELETE", `/v1/projects/${encodeURIComponent(id)}`).then((r) => r.deleted),
     resizeProject: (id: string, width: number, height: number, baseRevision: number) =>
       request<{ project: Project }>("PATCH", `/v1/projects/${encodeURIComponent(id)}/format`, { width, height, baseRevision }).then((r) => r.project),
     history: (id: string) =>

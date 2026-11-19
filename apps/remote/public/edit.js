@@ -14,6 +14,7 @@
 //             the revision it shows ("Rendered").
 import * as core from './core.js';
 import * as M from './edit-model.js';
+import * as S from './edit-studio.js';
 import { ago, button, closeSheet, h, icon, iconButton, sheet } from './ui.js';
 
 const { saved, live } = core;
@@ -24,13 +25,28 @@ const PAD = 34;
 const MIN_PPS = 6;
 const MAX_PPS = 260;
 const SNAP_PX = 10;
+// iPad and wider: the desktop's studio layout (rail · preview · inspector over a full-width timeline with
+// track heads). Must match the @media block in style.css.
+const WIDE_MQ = '(min-width: 700px) and (min-height: 520px)';
+const HEAD_W = 204;
+const WIDE_PAD = 14;
+const LANE_ICON = { video: 'video', overlay: 'layers', audio: 'audio', caption: 'cc' };
+const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+// The desktop's rail, in its order where it has one: picture and sound tools, then the studio tools that
+// need the Mac to do work (AI effects, media, templates, the agent), Settings last.
 const TOOLS = [
   ['clip', 'Clip', 'clip'],
   ['frame', 'Frame', 'frame'],
   ['captions', 'Captions', 'cc'],
   ['audio', 'Audio', 'audio'],
-  ['style', 'Style', 'sliders'],
+  ['style', 'Look', 'sliders'],
+  ['fx', 'AI FX', 'spark'],
+  ['media', 'Media', 'film'],
+  ['templates', 'Templates', 'layers'],
+  ['director', 'Director', 'director'],
+  ['settings', 'Settings', 'settings'],
 ];
+const TOOL_IDS = new Set(TOOLS.map(([id]) => id));
 const LOOKS = [
   ['vignette', 'Vignette', 'Darker corners', true],
   ['grayscale', 'Black & white', 'No colour', true],
@@ -38,6 +54,15 @@ const LOOKS = [
   ['blur', 'Blur', 'Soft focus', true],
   ['sharpen', 'Sharpen', 'Crisper edges', false],
   ['grain', 'Film grain', 'Moving noise', false],
+];
+// One tap sets all six look values; only what the export engine can render (no saturation or contrast).
+const PRESETS = [
+  ['none', 'None', {}],
+  ['muted', 'Muted', { grayscale: 0.35, sepia: 0.15, vignette: 0.25 }],
+  ['bw', 'B&W', { grayscale: 1, vignette: 0.2 }],
+  ['sepia', 'Sepia', { sepia: 0.8, vignette: 0.25 }],
+  ['dreamy', 'Dreamy', { blur: 0.15, vignette: 0.15 }],
+  ['film', 'Film', { grain: 0.35, sharpen: 0.2, sepia: 0.1, vignette: 0.35 }],
 ];
 
 let host = null; // { toast, go, render, projectById, detailOf, pausePlayers }
@@ -83,6 +108,8 @@ function store(projectId, value) {
 }
 
 const uuid = () => crypto.randomUUID();
+/** A clip's AI effects: a list from current Macs, a bare count from older ones. */
+const fxCountOf = (c) => (typeof c.aiEffects === 'number' ? c.aiEffects : (c.aiEffects?.length ?? 0));
 /** Volume sliders start at −30 dB, lower only when a clip is already quieter (set on the Mac). */
 const gainMin = (db) => Math.max(M.LIMITS.gainDb[0], Math.min(-30, Math.floor(db)));
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
@@ -100,7 +127,7 @@ class Editor {
     this.pending = Array.isArray(prev?.pending) ? prev.pending.map((p) => ({ ...p, base: Number.isInteger(p.base) ? p.base : (prev.model?.revision ?? null) })) : [];
     this.textDrafts = prev?.textDrafts ?? {};
     this.model = prev?.model ?? null;
-    this.tool = prev?.tool ?? 'clip';
+    this.tool = TOOL_IDS.has(prev?.tool) ? prev.tool : 'clip';
     this.playhead = prev?.playhead ?? 0;
     this.sel = prev?.sel ?? { clipId: null, captionId: null };
     this.phase = 'opening'; // opening | agent | stopping | locked | ready | conflict | lost | ending | failed
@@ -121,6 +148,18 @@ class Editor {
     this.lastAck = 0;
     this.previewAsked = new Set();
     this.disposed = false;
+    // Phone: the tool's settings are a sheet over the timeline, shut until a tool is tapped, so the picture
+    // gets the room. Not remembered: the editor always opens on the picture.
+    this.panelOpen = false;
+    this.wideMQ = matchMedia(WIDE_MQ);
+    this.wide = this.wideMQ.matches;
+    this.onWide = () => {
+      this.wide = this.wideMQ.matches;
+      this.placeStatus();
+      this.tlKey = null;
+      this.refresh();
+    };
+    this.wideMQ.addEventListener('change', this.onWide);
     this.build();
     this.timers = [setInterval(() => this.heartbeat(), HEARTBEAT_MS), setInterval(() => this.tick(), 1000)];
     // Where the playhead was is saved when the app goes to the background, not on every seek.
@@ -196,6 +235,7 @@ class Editor {
     }
     const r = await core.command('edit.open', { projectId: this.projectId });
     if (this.disposed) return;
+    if (this.gone(r)) return this.projectGone();
     if (!r || r.t === 'error') {
       this.phase = 'failed';
       this.failText = r?.message ?? 'Your Mac isn’t connected.';
@@ -224,6 +264,7 @@ class Editor {
       this.phase = 'lost';
       return this.refresh();
     }
+    if (this.gone(r)) return this.projectGone();
     if (r.t === 'error') {
       if (r.code === 'EDIT_LOCKED') {
         this.lease = { deviceName: r.details?.deviceName ?? 'Another phone', expiresAt: r.details?.expiresAt };
@@ -249,12 +290,28 @@ class Editor {
     this.pump();
   }
 
+  /** The Mac says this project doesn't exist any more (deleted there, or from another phone). */
+  gone(r) {
+    return r?.t === 'error' && r.code === 'NOT_FOUND' && r.details?.projectId === this.projectId && !r.details?.assetId;
+  }
+
+  /** Nothing here can reach a deleted project: drop what was queued for it and go back to the gallery. */
+  projectGone() {
+    const lost = this.pending.length + this.drafts.size + Object.keys(this.textDrafts).length;
+    store(this.projectId, null);
+    this.dispose({ endSession: false });
+    ed = null;
+    host.toast(`This project was deleted on your Mac.${lost ? ' Changes that hadn’t reached it were dropped.' : ''}`, 'error');
+    host.go('#/projects');
+  }
+
   /** The Mac's answer replaces the guess. */
   take(r) {
     // Revisions only grow (undo is a new revision too): a late answer never rolls the screen back.
     if (r.model && !(this.model && r.model.revision < this.model.revision)) {
       this.model = r.model;
       this.lastSync = Date.now();
+      S.fxRevisionChanged(this);
     }
     if ('lease' in r) this.lease = r.lease;
     if ('agent' in r) this.agent = r.agent;
@@ -297,8 +354,21 @@ class Editor {
         void core.command('preview.start', { projectId: this.projectId }, { wait: false });
       }
     }
+    this.watchUploads();
     core.openProject(this.projectId);
     this.refreshStatus();
+  }
+
+  /** Media sent from this phone: progress in the Media panel, and the timeline reloaded once it's imported. */
+  watchUploads() {
+    const mine = [...live.uploads.entries()].filter(([, u]) => u.projectId === this.projectId);
+    this.seenImports ??= new Set(mine.filter(([, u]) => u.state === 'imported').map(([id]) => id));
+    const fresh = mine.filter(([id, u]) => u.state === 'imported' && !this.seenImports.has(id));
+    for (const [id] of fresh) this.seenImports.add(id);
+    if (fresh.length && this.phase === 'ready') void this.syncFromMac();
+    const sig = JSON.stringify(mine.map(([id, u]) => [id, u.state, Math.round((u.progress ?? 0) * 50)]));
+    if (this.tool === 'media' && sig !== this.uploadSig) this.repaint();
+    this.uploadSig = sig;
   }
 
   /** Queues one edit (one undo step). The screen shows it at once; the Mac decides. */
@@ -351,6 +421,7 @@ class Editor {
           return;
         }
         if (r.t === 'edit') {
+          this.rebased = 0;
           this.pending.shift();
           // Edits queued on top of this one were made against its result.
           for (const p of this.pending) if (p.base === base) p.base = r.revision;
@@ -361,7 +432,11 @@ class Editor {
           this.refresh();
           continue;
         }
+        if (this.gone(r)) return this.projectGone();
         if (r.code === 'REVISION_CONFLICT') {
+          // The revision moved only because media arrived (an import from this phone, a rendered template):
+          // nothing on the timeline changed, so the queued edits go on top without asking.
+          if ((this.rebased = (this.rebased ?? 0) + 1) <= 3 && (await this.rebaseOverImports())) continue;
           this.phase = 'conflict';
           this.conflict = { current: r.details?.currentRevision ?? null };
           this.persistState();
@@ -577,6 +652,82 @@ class Editor {
     );
   }
 
+  /**
+   * After a conflict: if the Mac's timeline differs from ours only by new media (tracks, clips and captions
+   * are what this phone last saw), the queued edits are re-based on the new revision and sent as they are.
+   */
+  async rebaseOverImports() {
+    const o = await core.command('edit.open', { projectId: this.projectId });
+    if (this.disposed || o?.t !== 'edit' || !o.model || !this.model) return false;
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const timelineOf = (m) => ({ tracks: m.tracks, clips: m.clips, captions: m.captions, fps: m.fps, width: m.width, height: m.height });
+    if (!same(timelineOf(o.model), timelineOf(this.model))) return false;
+    const goneMedia = this.model.assets.some((a) => !o.model.assets.some((b) => b.id === a.id));
+    if (goneMedia) return false;
+    const from = this.model.revision;
+    this.take(o);
+    for (const p of this.pending) if (p.base === from || p.base === null) p.base = o.model.revision;
+    // The refused edit was refused for certain: a fresh id, so it is applied once on the new revision.
+    if (this.pending[0]) Object.assign(this.pending[0], { commandId: uuid(), sent: false });
+    this.persistState();
+    return true;
+  }
+
+  /** Loads the timeline as the Mac has it now (media arrived), when nothing of ours is waiting. */
+  async syncFromMac() {
+    if (!this.live || this.disposed) return;
+    if (this.pending.length && !(await this.settle())) return;
+    const o = await core.command('edit.open', { projectId: this.projectId });
+    if (this.disposed || o?.t !== 'edit') return;
+    this.take(o);
+    this.ensureSelection();
+    this.refresh();
+  }
+
+  /** Ends hand-editing cleanly (edits saved first) and goes somewhere else in the app. */
+  async leaveTo(hash) {
+    this.flushDrafts();
+    if (this.live && this.phase === 'ready' && !(await this.settle())) {
+      return host.toast('Some changes haven’t reached your Mac yet. They stay on this phone; try again in a moment.', 'error');
+    }
+    if (this.live && this.phase === 'ready') await core.command('edit.end', { projectId: this.projectId, sessionId: this.sessionId }, { timeout: 8000 });
+    if (!this.pending.length) store(this.projectId, null);
+    else this.persistState();
+    this.dispose({ endSession: false });
+    ed = null;
+    core.openProject(this.projectId, true);
+    host.go(hash);
+    return true;
+  }
+
+  /** The AI Director from the editor: the instruction goes to the agent once this session has ended. */
+  async askAgent(text) {
+    const left = await this.leaveTo(`#/session/${this.projectId}`);
+    if (!left) return;
+    core.addInstruction(this.projectId, text);
+    host.render();
+  }
+
+  project() {
+    return host.projectById(this.projectId);
+  }
+  modelLabel() {
+    return host.modelLabel?.(this.projectId) ?? '';
+  }
+  openDeviceSheet() {
+    host.deviceSheet?.();
+  }
+  say(text, kind = 'info') {
+    host.toast(text, kind);
+  }
+  /** Rebuilds the panel now (studio panels change state outside the timeline: progress, catalogues). */
+  repaint() {
+    if (this.disposed) return;
+    this.panelKey = null;
+    this.renderPanel();
+    this.refreshChrome(this.view());
+  }
+
   async resolve(how) {
     const o = await core.command('edit.open', { projectId: this.projectId });
     if (!o || o.t === 'error') return host.toast(o?.message ?? 'Your Mac isn’t connected.', 'error');
@@ -612,6 +763,12 @@ class Editor {
     for (const d of this.drafts.values()) clearTimeout(d.timer);
     for (const t of [this.textTimer, this.stillTimer, this.saveTimer]) clearTimeout(t);
     document.removeEventListener('visibilitychange', this.onHide);
+    for (const ev of ['pointerup', 'pointercancel']) window.removeEventListener(ev, this.panelLift, true);
+    if (this.panelOutside) {
+      window.removeEventListener('pointerdown', this.panelOutside[0], true);
+      window.removeEventListener('click', this.panelOutside[1], true);
+    }
+    this.wideMQ?.removeEventListener('change', this.onWide);
     this.resizer?.disconnect();
     this.stopGestures?.();
     cancelAnimationFrame(this.raf);
@@ -664,18 +821,21 @@ class Editor {
     this.undoBtn = iconButton('undo', 'Undo', () => this.undo(), { cls: 'ed-ic' });
     this.redoBtn = iconButton('redo', 'Redo', () => this.redo(), { cls: 'ed-ic' });
     this.doneBtn = h('button', { class: 'ed-done', type: 'button', onclick: () => this.done() }, 'Done');
-    const header = h(
+    this.statusEl = h('div', { class: 'ed-status', role: 'status', 'aria-live': 'polite' });
+    // iPad: the status sits in the middle of the header, where the desktop has Edit · Automate · Review.
+    this.statusSlot = h('div', { class: 'ed-top-mid' });
+    this.header = h(
       'header',
       { class: 'ed-top' },
       iconButton('back', 'Back', () => this.back(), { cls: 'ed-ic' }),
-      h('span', { class: 'ed-brand' }, h('img', { src: '/mark.svg', alt: '', width: 26, height: 26 }), h('span', { class: 'ed-word', text: 'ReelForge' })),
-      h('span', { class: 'ed-sep', 'aria-hidden': 'true' }),
+      h('span', { class: 'ed-brand', 'aria-hidden': 'true' }, h('img', { src: '/mark.svg', alt: '', width: 30, height: 30 }), h('b', { class: 'ed-word', text: 'ReelForge' }), h('span', { class: 'ed-sep' })),
       h('div', { class: 'ed-title' }, this.titleEl, this.saveEl),
+      this.statusSlot,
       this.undoBtn,
       this.redoBtn,
       this.doneBtn,
     );
-    this.statusEl = h('div', { class: 'ed-status', role: 'status', 'aria-live': 'polite' });
+    const header = this.header;
 
     // preview
     this.canvas = h('canvas', { class: 'ed-canvas', 'aria-label': 'Preview' });
@@ -690,29 +850,114 @@ class Editor {
     this.stage = h('div', { class: 'ed-stage' }, this.frameEl);
     this.bindPreviewGestures();
 
+    // preview bar (iPad): format, Live/Rendered, full screen — the desktop's preview header
+    this.fmtEl = h('span', { class: 'ed-chip tabular' });
+    this.modeLive = h('button', { class: 'ed-pvseg-btn', type: 'button', title: 'Live: composited here from stills, follows every edit', onclick: () => this.playing && this.video.pause() }, 'Live');
+    this.modeRendered = h('button', { class: 'ed-pvseg-btn', type: 'button', title: 'Rendered: the Mac’s preview render, played back', onclick: () => !this.playing && this.togglePlay() }, 'Rendered');
+    this.pvNote = h('span', { class: 'ed-pv-note ellipsis' });
+    const pvBar = h(
+      'div',
+      { class: 'ed-pvbar' },
+      this.fmtEl,
+      h('div', { class: 'ed-pvseg', role: 'group', 'aria-label': 'Preview mode' }, this.modeLive, this.modeRendered),
+      this.pvNote,
+      h('span', { class: 'grow' }),
+      iconButton('maximize', 'Full screen', () => this.fullscreen(), { cls: 'ed-ic sm' }),
+    );
+    this.scrubFill = h('div', { class: 'ed-scrub-fill' });
+    this.scrubEl = h('div', { class: 'ed-scrub', role: 'slider', tabindex: '0', 'aria-label': 'Playhead' }, this.scrubFill);
+    this.bindScrubber();
+
     // transport
-    this.playBtn = iconButton('play', 'Play', () => this.togglePlay(), { cls: 'ed-ic' });
+    this.playBtn = iconButton('play', 'Play', () => this.togglePlay(), { cls: 'ed-ic ed-play' });
     this.timeEl = h('span', { class: 'ed-time tabular' });
     this.muteBtn = iconButton('volume', 'Mute', () => {
       this.video.muted = !this.video.muted;
       this.updateTransport();
     }, { cls: 'ed-ic' });
-    this.fullBtn = iconButton('maximize', 'Full screen', () => this.fullscreen(), { cls: 'ed-ic' });
-    const transport = h('div', { class: 'ed-transport' }, this.playBtn, h('span', { class: 'grow center' }, this.timeEl), this.muteBtn, this.fullBtn);
+    this.fullBtn = iconButton('maximize', 'Full screen', () => this.fullscreen(), { cls: 'ed-ic ed-full' });
+    this.splitBtn = iconButton('split', 'Split here', () => this.splitHere(), { cls: 'ed-ic ed-split' });
+    this.prevBtn = iconButton('skipBack', 'Previous edit point', () => this.jumpEdit(-1), { cls: 'ed-ic ed-skip' });
+    this.nextBtn = iconButton('skipForward', 'Next edit point', () => this.jumpEdit(1), { cls: 'ed-ic ed-skip' });
+    const transport = h('div', { class: 'ed-transport' }, this.timeEl, h('div', { class: 'ed-tbtns' }, this.prevBtn, this.playBtn, this.nextBtn), h('div', { class: 'ed-tright' }, this.splitBtn, this.muteBtn, this.fullBtn));
 
-    // timeline
+    // timeline: toolbar (iPad) over the scrolling tracks
+    this.tlSplitBtn = iconButton('scissors', 'Split at the playhead', () => this.splitHere(), { cls: 'ed-ic sm' });
+    this.tlDeleteBtn = iconButton('trash', 'Delete the selected clip', () => {
+      const c = this.selectedClip(this.view());
+      if (c && this.editable()) this.deleteSheet(c);
+    }, { cls: 'ed-ic sm' });
+    this.tlMeta = h('span', { class: 'ed-tlbar-meta tabular' });
+    this.zoomEl = h('input', { class: 'ed-range ed-zoom', type: 'range', min: 0, max: 100, step: 1, 'aria-label': 'Timeline zoom' });
+    this.zoomEl.addEventListener('input', () => this.setZoom(MIN_PPS * (MAX_PPS / MIN_PPS) ** (Number(this.zoomEl.value) / 100)));
+    const tlBar = h(
+      'div',
+      { class: 'ed-tlbar' },
+      this.tlSplitBtn,
+      this.tlDeleteBtn,
+      h('span', { class: 'ed-tlbar-div', 'aria-hidden': 'true' }),
+      this.tlMeta,
+      h('span', { class: 'grow' }),
+      iconButton('minus', 'Zoom out', () => this.setZoom(this.pps / 1.4), { cls: 'ed-ic sm' }),
+      this.zoomEl,
+      iconButton('plus', 'Zoom in', () => this.setZoom(this.pps * 1.4), { cls: 'ed-ic sm' }),
+      iconButton('fit', 'Fit the timeline to the window', () => this.fitTimeline(), { cls: 'ed-ic sm' }),
+    );
     this.tlContent = h('div', { class: 'ed-tl-content' });
     this.tlScroll = h('div', { class: 'ed-tl-scroll', role: 'group', 'aria-label': 'Timeline. Drag the ruler to seek, drag clip edges to trim, pinch to zoom.' }, this.tlContent);
-    this.tl = h('div', { class: 'ed-tl' }, this.tlScroll);
+    this.tl = h('section', { class: 'ed-tl', 'aria-label': 'Timeline' }, tlBar, this.tlScroll);
     this.bindTimelineGestures();
 
     this.panel = h('section', { class: 'ed-panel', 'aria-label': 'Tool settings' });
+    // A rebuild between finger-down and finger-up would swallow the tap (press and release land on
+    // different elements), so the panel waits for the finger to lift.
+    this.panel.addEventListener('pointerdown', () => (this.panelPressed = true));
+    const lift = () => {
+      if (!this.panelPressed) return;
+      this.panelPressed = false;
+      // After the click this release produces has run.
+      setTimeout(() => this.renderPanel(), 0);
+    };
+    for (const ev of ['pointerup', 'pointercancel']) window.addEventListener(ev, lift, true);
+    this.panelLift = lift;
+    this.inspTitle = h('div', { class: 'ed-insp-title ellipsis' });
+    this.inspSub = h('div', { class: 'ed-insp-sub ellipsis' });
+    const inspHead = h('div', { class: 'ed-insp-head' }, this.inspTitle, this.inspSub);
+    // Phone only: the sheet's grabber. A tap anywhere else in the editor shuts the sheet.
+    const sheetBar = h('div', { class: 'ed-sheetbar' }, h('span', { class: 'ed-grab', 'aria-hidden': 'true' }));
+    // On the picture or the timeline that tap does only that: it never also lands on what lies under
+    // it (a clip, the playhead, play), so it is caught on the window before the editor's own handlers.
+    // The header's buttons (back, undo, redo) still do their job as the sheet shuts.
+    const outside = (e) => {
+      if (this.wide || !this.panelOpen || !this.root?.contains(e.target)) return;
+      if (e.target.closest('.ed-right, .ed-dock')) return;
+      if (!this.main.contains(e.target)) return this.closePanel();
+      e.preventDefault();
+      e.stopPropagation();
+      this.swallowClick = true;
+      setTimeout(() => (this.swallowClick = false), 600);
+      this.closePanel();
+    };
+    const swallow = (e) => {
+      if (!this.swallowClick) return;
+      this.swallowClick = false;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    window.addEventListener('pointerdown', outside, true);
+    window.addEventListener('click', swallow, true);
+    this.panelOutside = [outside, swallow];
     this.dockEl = h(
       'nav',
       { class: 'ed-dock', 'aria-label': 'Edit tools' },
-      TOOLS.map(([id, label, ic]) => h('button', { class: 'ed-tool', type: 'button', 'data-tool': id, 'aria-pressed': 'false', onclick: () => this.setTool(id) }, icon(ic, { size: 22 }), h('span', { text: label }))),
+      TOOLS.map(([id, label, ic]) => h('button', { class: 'ed-tool', type: 'button', 'data-tool': id, 'aria-pressed': 'false', title: label, onclick: () => this.setTool(id) }, icon(ic, { size: 22 }), h('span', { text: label }))),
     );
-    this.root = h('div', { class: 'editor' }, header, this.statusEl, this.stage, transport, this.tl, this.panel, this.dockEl);
+    // Phone: picture, transport, timeline, settings, tools in one column (the wrappers are display: contents).
+    // iPad: the desktop studio — tool rail · preview · inspector, the timeline across the bottom.
+    this.pvCard = h('section', { class: 'ed-pv', 'aria-label': 'Preview' }, pvBar, this.stage, this.scrubEl, transport);
+    this.main = h('div', { class: 'ed-main' }, this.dockEl, this.pvCard, h('aside', { class: 'ed-right', 'aria-label': 'Inspector' }, sheetBar, inspHead, this.panel), this.tl);
+    this.root = h('div', { class: 'editor' }, header, this.statusEl, this.main);
+    this.placeStatus();
 
     this.video.addEventListener('play', () => {
       this.playing = true;
@@ -734,11 +979,147 @@ class Editor {
     this.resizer.observe(this.frameEl);
   }
 
+  /** Split at the playhead: the selected clip if the playhead is inside it, else the picture under it. */
+  splitHere() {
+    const v = this.view();
+    if (!v || !this.editable()) return;
+    const inside = (c) => c && this.playhead > c.start && this.playhead < M.clipEnd(c) && !M.trackOf(v, c.trackId)?.locked;
+    let c = this.selectedClip(v);
+    if (!inside(c)) {
+      const under = v.clips.filter(inside);
+      c = under.find((x) => M.assetOf(v, x.assetId)?.kind !== 'audio') ?? under[0] ?? null;
+    }
+    if (!c) return host.toast('Move the playhead inside a clip to split it.');
+    this.sel.clipId = c.id;
+    this.submit([{ type: 'clip.split', clipId: c.id, frame: this.playhead, newClipId: uuid() }], 'Split clip');
+  }
+
+  /** iPad: the status rides in the header's middle; phone: a bar under the header. */
+  placeStatus() {
+    if (this.wide) this.statusSlot.append(this.statusEl);
+    else if (this.statusEl.parentNode !== this.root) this.root.insertBefore(this.statusEl, this.main);
+  }
+
+  /** Previous / next edit point (clip edges, start, end), like the desktop's transport. */
+  jumpEdit(dir) {
+    const v = this.view();
+    if (!v) return;
+    const total = M.durationFrames(v);
+    const pts = [...new Set([0, total, ...v.clips.flatMap((c) => [c.start, M.clipEnd(c)])])].sort((a, b) => a - b);
+    const t = dir < 0 ? pts.filter((p) => p < this.playhead).at(-1) : pts.find((p) => p > this.playhead);
+    if (t === undefined) return;
+    if (this.playing) this.video.pause();
+    this.seek(t, { follow: true });
+  }
+
+  /** The thin scrubber under the picture: tap or drag anywhere on it to move the playhead. */
+  bindScrubber() {
+    const el = this.scrubEl;
+    const at = (e) => {
+      const v = this.view();
+      if (!v) return;
+      const r = el.getBoundingClientRect();
+      this.seek(((e.clientX - r.left) / Math.max(1, r.width)) * M.durationFrames(v), { follow: true });
+    };
+    el.addEventListener('pointerdown', (e) => {
+      el.setPointerCapture?.(e.pointerId);
+      this.scrubbing = true;
+      at(e);
+    });
+    el.addEventListener('pointermove', (e) => el.hasPointerCapture?.(e.pointerId) && at(e));
+    const end = () => {
+      this.scrubbing = false;
+      this.drawSoon();
+    };
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+    el.addEventListener('keydown', (e) => {
+      const step = e.shiftKey ? Math.round(M.fpsValue(this.fps)) : 1;
+      if (e.key === 'ArrowLeft') this.seek(this.playhead - step, { follow: true });
+      else if (e.key === 'ArrowRight') this.seek(this.playhead + step, { follow: true });
+      else return;
+      e.preventDefault();
+    });
+  }
+
+  /** Zoom keeping the playhead where it is on screen. */
+  setZoom(pps) {
+    const el = this.tlScroll;
+    const screenX = this.xOf(this.playhead) - el.scrollLeft;
+    this.pps = clamp(pps, MIN_PPS, MAX_PPS);
+    this.renderTimeline();
+    el.scrollLeft = this.xOf(this.playhead) - screenX;
+    this.saveSoon();
+  }
+
+  fitTimeline() {
+    const v = this.view();
+    if (!v) return;
+    const secs = Math.max(1, M.framesToSeconds(M.durationFrames(v), this.fps));
+    this.pps = clamp((this.tlScroll.clientWidth - this.x0() - 24) / secs, MIN_PPS, MAX_PPS);
+    this.renderTimeline();
+    this.tlScroll.scrollLeft = 0;
+    this.saveSoon();
+  }
+
+  /** iPad's preview header, inspector header and timeline toolbar. */
+  refreshChrome(v) {
+    if (!this.wide) return;
+    const W = v?.width ?? 1080;
+    const H = v?.height ?? 1920;
+    const g = gcd(W, H) || 1;
+    const fps = this.fps;
+    const fpsLabel = Number((fps.num / fps.den).toFixed(2));
+    this.fmtEl.replaceChildren(icon(W >= H ? 'monitor' : 'phone', { size: 15 }), h('span', { text: `${W / g}:${H / g}` }), h('span', { class: 'ed-chip-meta', text: `${W}×${H} · ${fpsLabel} fps` }));
+    this.modeLive.setAttribute('aria-pressed', this.playing ? 'false' : 'true');
+    this.modeRendered.setAttribute('aria-pressed', this.playing ? 'true' : 'false');
+    this.modeRendered.disabled = !this.playing && !live.previews.get(this.projectId)?.url;
+    if (!v) return;
+    // inspector header: what the panel works on (the desktop's file name · track · length)
+    const studio = { media: ['Media', `${v.assets.length} item${v.assets.length === 1 ? '' : 's'} in this project`], templates: ['Templates', 'Motion graphics, rendered on your Mac'], director: ['AI Director', 'Proposes a version; you decide'], settings: ['Settings', `${v.name ?? 'Project'} · revision ${v.revision}`] }[this.tool];
+    if (studio) {
+      this.inspTitle.textContent = studio[0];
+      this.inspSub.textContent = studio[1];
+    } else if (this.tool === 'captions') {
+      const c = M.captionById(v, this.sel.captionId);
+      this.inspTitle.textContent = 'Captions';
+      this.inspSub.textContent = `${v.captions.length} caption${v.captions.length === 1 ? '' : 's'}${c ? ` · ${M.timecode(c.start, fps)}` : ''}`;
+    } else {
+      const c = this.selectedClip(v);
+      const t = c ? M.trackOf(v, c.trackId) : null;
+      this.inspTitle.textContent = c ? (M.assetOf(v, c.assetId)?.filename ?? 'Clip') : 'No clip selected';
+      this.inspSub.textContent = c ? `${t?.label ?? ''} · ${M.framesToSeconds(c.duration, fps).toFixed(2)} s${t?.locked ? ' · locked' : ''}` : 'Tap a clip in the timeline';
+    }
+    // timeline toolbar
+    const clips = v.clips.length;
+    const sel = this.selectedClip(v);
+    this.tlMeta.textContent = `${clips} clip${clips === 1 ? '' : 's'} · ${M.timecode(M.durationFrames(v), fps)}${sel ? ' · 1 selected' : ''}`;
+    this.tlDeleteBtn.disabled = !sel || !this.editable() || !!M.trackOf(v, sel.trackId)?.locked;
+    this.tlSplitBtn.disabled = !this.editable();
+    this.zoomEl.value = String(Math.round((100 * Math.log(this.pps / MIN_PPS)) / Math.log(MAX_PPS / MIN_PPS)));
+    this.zoomEl.style.setProperty('--p', `${this.zoomEl.value}%`);
+  }
+
   setTool(id) {
+    // Phone: a tool opens its sheet; the open tool tapped again shuts it.
+    if (!this.wide) {
+      const open = this.tool !== id || !this.panelOpen;
+      if (!open) return this.closePanel();
+      this.panelOpen = true;
+      if (this.tool === id) return this.refresh();
+    }
     if (this.tool === id) return;
     this.flushDrafts();
     this.tool = id;
     this.persistState();
+    this.refresh();
+  }
+
+  closePanel() {
+    if (!this.panelOpen) return;
+    this.flushDrafts();
+    if (this.panel.contains(document.activeElement)) document.activeElement.blur();
+    this.panelOpen = false;
     this.refresh();
   }
 
@@ -749,8 +1130,9 @@ class Editor {
     this.titleEl.textContent = v?.name ?? p?.name ?? 'Project';
     this.root.dataset.tool = this.tool;
     this.root.dataset.phase = this.phase;
+    this.root.classList.toggle('panel-open', this.panelOpen);
     for (const b of this.dockEl.querySelectorAll('.ed-tool')) {
-      const on = b.dataset.tool === this.tool;
+      const on = b.dataset.tool === this.tool && (this.wide || this.panelOpen);
       b.classList.toggle('on', on);
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     }
@@ -759,6 +1141,7 @@ class Editor {
     this.renderPanel();
     this.updateTransport();
     this.refreshPreviewMode();
+    this.refreshChrome(v);
     this.drawSoon();
   }
 
@@ -788,7 +1171,6 @@ class Editor {
 
     let text;
     let kind = 'ok';
-    const editorOpen = st.editor === 'open';
     switch (this.phase) {
       case 'opening':
         text = st.live ? 'Opening the editor…' : 'Waiting for your Mac…';
@@ -823,8 +1205,12 @@ class Editor {
         kind = 'error';
         break;
       default:
-        text = `Manual editing${this.agentStopped ? ' · Agent stopped' : ''}${editorOpen ? ' · Mac editor open' : ''}`;
+        text = `Manual editing${this.agentStopped ? ' · Agent stopped' : ''}`;
     }
+    // The plain case lives in the header ("Saved · editing by hand"); the bar is for anything else.
+    const plain = kind === 'ok' && !this.agentStopped;
+    this.statusEl.hidden = plain;
+    if (kind === 'ok') this.saveEl.append(h('span', { class: 'ed-mode', text: `${save ? ' · ' : ''}editing by hand` }));
     this.statusEl.className = `ed-status ${kind}`;
     this.statusEl.replaceChildren(h('span', { class: `dot ${kind === 'ok' ? 'ok' : kind === 'neutral' ? 'neutral' : kind === 'warn' ? 'warn' : 'error'}`, 'aria-hidden': 'true' }), h('span', { class: 'ellipsis', text }));
     if (this.phase === 'locked' || this.phase === 'failed' || (this.phase === 'agent' && !this.waiting)) {
@@ -872,12 +1258,23 @@ class Editor {
       label = current ? `Rendered · revision ${pv.revision}` : `Rendered before your latest edits (revision ${pv?.revision ?? '?'})`;
       tone = current ? 'ok' : 'warn';
     } else {
-      const fx = this.activeSegments().some((s) => s.clip.aiEffects || s.clip.props.grain > 0 || s.clip.props.sharpen > 0);
+      const fx = this.activeSegments().some((s) => fxCountOf(s.clip) || s.clip.props.grain > 0 || s.clip.props.sharpen > 0);
       label = fx ? 'Live · AI effects, grain and sharpen show in the render' : 'Live preview';
     }
     this.badge.textContent = label;
     this.badge.className = `ed-badge ${tone}`;
+    this.syncNote();
+    if (this.wide) this.refreshChrome(this.view());
     this.updateTransport();
+  }
+
+  /** iPad shows the picture badge's text in the preview header instead of over the picture. */
+  syncNote() {
+    const extra = this.badge.dataset.extra ?? '';
+    const text = this.badge.textContent === 'Live preview' && !extra ? '' : `${this.badge.textContent}${extra}`;
+    this.pvNote.textContent = text;
+    this.pvNote.title = text;
+    this.pvNote.className = `ed-pv-note ellipsis ${this.badge.classList.contains('warn') ? 'warn' : this.badge.classList.contains('ok') ? 'ok' : ''}`;
   }
 
   updateTransport() {
@@ -898,7 +1295,7 @@ class Editor {
     const total = v ? M.durationFrames(v) : 0;
     const fps = this.fps;
     const short = (f) => M.timecode(f, fps).replace(/\.\d+$/, '');
-    this.timeEl.replaceChildren(h('b', { text: short(this.playhead) }), h('span', { class: 'muted', text: ` / ${short(total)}` }));
+    this.timeEl.replaceChildren(h('b', { text: M.timecode(this.playhead, fps) }), h('span', { class: 'muted', text: ` / ${short(total)}` }));
     this.timeEl.setAttribute('aria-label', `${M.timecode(this.playhead, fps)} of ${M.timecode(total, fps)}`);
   }
 
@@ -1024,7 +1421,8 @@ class Editor {
       if (!best || Math.abs(f - sourceFrame) < Math.abs(best.f - sourceFrame)) best = { f, img: v.img };
     }
     if (best && Math.abs(best.f - sourceFrame) < M.fpsValue(this.fps) * 2) return { src: best.img, x: 0, y: 0, sw: best.img.naturalWidth, sh: best.img.naturalHeight, w: best.img.naturalWidth, h: best.img.naturalHeight, low: true };
-    const strip = this.strip(asset);
+    // The strip is a JPEG: for media with transparency it would paint a box, so it waits for the PNG still.
+    const strip = asset.hasAlpha ? null : this.strip(asset);
     if (strip?.img) {
       const tw = strip.img.naturalWidth / strip.count;
       const us = (sourceFrame * this.fps.den * 1e6) / this.fps.num;
@@ -1224,6 +1622,7 @@ class Editor {
     }
     this.badge.classList.toggle('loading', !!this.loadingFrame && !this.playing);
     if (!this.playing) this.badge.dataset.extra = this.loadingFrame ? (this.live ? ' · loading frame' : ' · thumbnail (offline)') : '';
+    this.syncNote();
   }
 
   bindPreviewGestures() {
@@ -1296,41 +1695,54 @@ class Editor {
   ppf() {
     return this.pps / M.fpsValue(this.fps);
   }
+  /** Where frame 0 sits in the timeline's content: after the track heads on iPad. */
+  x0() {
+    return this.wide ? HEAD_W + WIDE_PAD : PAD;
+  }
   xOf(frame) {
-    return PAD + frame * this.ppf();
+    return this.x0() + frame * this.ppf();
   }
   frameAt(x) {
-    return Math.round((x - PAD) / this.ppf());
+    return Math.round((x - this.x0()) / this.ppf());
   }
 
   renderTimeline(force = false) {
     const v = this.view();
     if (!v || this.disposed) return;
     // Rebuilt only when what it shows changed: a redraw under a finger would drop focus and the gesture.
-    const key = `${this.sig()}|${this.tool}|${this.pps}|${this.sel.clipId}|${this.sel.captionId}|${[...this.strips.values()].filter((x) => x.img).length}|${this.tlScroll.clientWidth}`;
+    const key = `${this.sig()}|${this.tool}|${this.pps}|${this.sel.clipId}|${this.sel.captionId}|${[...this.strips.values()].filter((x) => x.img).length}|${this.tlScroll.clientWidth}|${this.wide}|${this.phase}|${this.live}`;
     if (!force && key === this.tlKey) return this.placePlayhead();
     this.tlKey = key;
     const total = Math.max(1, M.durationFrames(v));
     const vw = this.tlScroll.clientWidth || 360;
     const ppf = this.ppf();
-    const width = PAD * 2 + total * ppf + vw * 0.4;
+    const width = this.x0() + PAD + total * ppf + vw * 0.4;
     this.tlContent.style.setProperty('--w', `${width}px`);
+    this.tlContent.style.setProperty('--head', `${this.wide ? HEAD_W : 0}px`);
     const kids = [this.ruler(total, ppf)];
     const lanes = [];
     const main = M.mainTrack(v);
-    for (const t of M.pictureTracks(v)) {
-      const clips = M.clipsOn(v, t.id);
-      if (!clips.length && t !== main) continue;
-      lanes.push(this.lane(v, t, clips, t === main ? 'main' : 'overlay'));
+    if (this.wide) {
+      // Every track, top layer first, each with its head (lock · show · sound), as on the desktop.
+      for (const t of [...M.pictureTracks(v)].reverse()) lanes.push(this.lane(v, t, M.clipsOn(v, t.id), t === main ? 'main' : 'overlay'));
+      for (const t of M.audioTracks(v)) lanes.push(this.lane(v, t, M.clipsOn(v, t.id), 'audio'));
+      for (const t of M.captionTracks(v)) lanes.push(this.captionLane(v, t));
+    } else {
+      for (const t of M.pictureTracks(v)) {
+        const clips = M.clipsOn(v, t.id);
+        if (!clips.length && t !== main) continue;
+        lanes.push(this.lane(v, t, clips, t === main ? 'main' : 'overlay'));
+      }
+      if (this.tool === 'captions') for (const t of M.captionTracks(v)) lanes.push(this.captionLane(v, t));
+      if (this.tool === 'audio') for (const t of M.audioTracks(v)) if (M.clipsOn(v, t.id).length) lanes.push(this.lane(v, t, M.clipsOn(v, t.id), 'audio'));
     }
-    if (this.tool === 'captions') for (const t of M.captionTracks(v)) lanes.push(this.captionLane(v, t));
-    if (this.tool === 'audio') for (const t of M.audioTracks(v)) if (M.clipsOn(v, t.id).length) lanes.push(this.lane(v, t, M.clipsOn(v, t.id), 'audio'));
     kids.push(h('div', { class: 'ed-lanes' }, lanes));
     this.playheadEl = h('div', { class: 'ed-playhead', 'aria-hidden': 'true' }, h('span', { class: 'ed-ph-label tabular' }));
     this.snapEl = h('div', { class: 'ed-snap', hidden: true, 'aria-hidden': 'true' });
     kids.push(this.playheadEl, this.snapEl);
     this.tlContent.replaceChildren(...kids);
     this.placePlayhead();
+    this.refreshChrome(v);
   }
 
   ruler(total, ppf) {
@@ -1342,15 +1754,40 @@ class Editor {
     const end = M.framesToSeconds(total, this.fps) + 2;
     for (let s = 0, i = 0; s <= end && i < 2000; s = ++i * minor) {
       const isMajor = i % 5 === 0;
-      const x = PAD + s * pps;
+      const x = this.x0() + s * pps;
       ticks.push(h('span', { class: `tick${isMajor ? ' major' : ''}`, vars: { '--x': `${x}px` } }, isMajor ? h('i', { text: M.timecode(M.secondsToFrames(s, this.fps), this.fps).replace(/\.\d+$/, '') }) : null));
     }
     void ppf;
-    return h('div', { class: 'ed-ruler', 'data-zone': 'ruler' }, ticks);
+    return h('div', { class: 'ed-ruler', 'data-zone': 'ruler' }, this.wide ? h('span', { class: 'ed-ruler-head', 'aria-hidden': 'true' }) : null, ticks);
+  }
+
+  /** A track's head (iPad): lock, show/hide, sound, then its icon, name and V1/A1 label. */
+  trackHead(t) {
+    const name = t.kind === 'caption' ? 'Captions' : t.name || t.label;
+    const off = !this.editable();
+    const tog = (patch, label) => this.submit([{ type: 'track.update', trackId: t.id, ...patch }], label);
+    const btn = (ic, label, pressed, onclick) => h('button', { class: 'ed-th-btn', type: 'button', 'aria-label': `${label} ${name}`, title: label, 'aria-pressed': pressed ? 'true' : 'false', disabled: off || null, onclick }, icon(ic, { size: 15 }));
+    return h(
+      'div',
+      { class: 'ed-th' },
+      h(
+        'div',
+        { class: 'ed-th-ctl' },
+        btn(t.locked ? 'lock' : 'unlock', t.locked ? 'Unlock' : 'Lock', t.locked, () => tog({ locked: !t.locked }, t.locked ? `Unlock ${t.label}` : `Lock ${t.label}`)),
+        t.kind !== 'audio' ? btn(t.hidden ? 'eyeOff' : 'eye', t.hidden ? 'Show' : 'Hide', t.hidden, () => tog({ hidden: !t.hidden }, t.hidden ? `Show ${t.label}` : `Hide ${t.label}`)) : null,
+        t.kind !== 'caption' ? btn(t.muted ? 'mute' : 'volume', t.muted ? 'Unmute' : 'Mute', t.muted, () => tog({ muted: !t.muted }, t.muted ? `Unmute ${t.label}` : `Mute ${t.label}`)) : null,
+      ),
+      h('div', { class: 'ed-th-title', title: `${t.label} · ${name}` }, icon(LANE_ICON[t.kind] ?? 'clip', { size: 15 }), h('span', { class: 'ed-th-name ellipsis', text: name }), t.kind !== 'caption' ? h('span', { class: 'ed-th-id', text: t.label }) : null),
+    );
   }
 
   lane(v, track, clips, kind) {
-    const lane = h('div', { class: `ed-lane ${kind}`, 'data-track': track.id }, kind === 'main' ? null : h('span', { class: 'ed-lane-label', text: track.label }));
+    const wide = this.wide;
+    const lane = h(
+      'div',
+      { class: `ed-lane ${kind}${wide ? ` k-${track.kind}${clips.length ? '' : ' empty'}${track.locked ? ' locked' : ''}${track.hidden || track.muted ? ' dimmed' : ''}` : ''}`, 'data-track': track.id },
+      wide ? this.trackHead(track) : kind === 'main' ? null : h('span', { class: 'ed-lane-label', text: track.label }),
+    );
     for (const c of clips) {
       const sel = c.id === this.sel.clipId;
       const asset = M.assetOf(v, c.assetId);
@@ -1366,7 +1803,7 @@ class Editor {
           vars: { '--x': `${this.xOf(c.start)}px`, '--cw': `${c.duration * this.ppf()}px` },
           onkeydown: (e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), this.selectClip(c.id)),
         },
-        kind === 'audio' || asset?.kind === 'audio' ? h('span', { class: 'ed-clip-name ellipsis', text: asset?.filename ?? '' }) : this.filmstrip(c, asset, kind === 'main' ? 52 : 32),
+        wide ? this.clipFace(c, asset, kind) : kind === 'audio' || asset?.kind === 'audio' ? h('span', { class: 'ed-clip-name ellipsis', text: asset?.filename ?? '' }) : this.filmstrip(c, asset, kind === 'main' ? 52 : 32),
         sel && !track.locked ? [h('span', { class: 'ed-handle l', 'data-edge': 'start', 'aria-hidden': 'true' }), h('span', { class: 'ed-handle r', 'data-edge': 'end', 'aria-hidden': 'true' })] : null,
         sel ? h('span', { class: 'sr', text: 'selected' }) : null,
       );
@@ -1375,12 +1812,24 @@ class Editor {
     return lane;
   }
 
-  /** Thumbnails along the clip: each one shows the source at that point in time. */
-  filmstrip(c, asset, height) {
+  /** iPad clip: thumbnails on the left, name and range beside them (the desktop's clip). */
+  clipFace(c, asset, kind) {
+    const w = c.duration * this.ppf();
+    const audio = kind === 'audio' || asset?.kind === 'audio';
+    const roomy = w > 150;
+    const range = `${M.timecode(c.start, this.fps)} – ${M.timecode(M.clipEnd(c), this.fps)}`;
+    return [
+      audio ? null : this.filmstrip(c, asset, kind === 'main' ? 50 : 38, roomy ? Math.min(160, w * 0.42) : null),
+      w > 44 || audio ? h('span', { class: 'ed-clip-text' }, h('span', { class: 'ed-clip-label ellipsis', text: asset?.filename ?? 'Clip' }), w > 110 ? h('span', { class: 'ed-clip-range tabular ellipsis', text: range }) : null) : null,
+    ];
+  }
+
+  /** Thumbnails along the clip (or its first `maxW` px): each one shows the source at that point in time. */
+  filmstrip(c, asset, height, maxW = null) {
     const strip = asset ? this.strip(asset) : null;
-    const w = Math.max(1, Math.round(c.duration * this.ppf()));
+    const w = Math.max(1, Math.round(maxW ?? c.duration * this.ppf()));
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const cv = h('canvas', { class: 'ed-strip', width: Math.min(4096, Math.round(w * dpr)), height: Math.round(height * dpr), 'aria-hidden': 'true' });
+    const cv = h('canvas', { class: `ed-strip${maxW ? ' part' : ''}`, width: Math.min(4096, Math.round(w * dpr)), height: Math.round(height * dpr), 'aria-hidden': 'true', vars: maxW ? { '--sw': `${w}px` } : {} });
     if (!strip) return cv;
     const ctx = cv.getContext('2d');
     const tw0 = strip.img.naturalWidth / strip.count;
@@ -1397,8 +1846,14 @@ class Editor {
   }
 
   captionLane(v, track) {
-    const lane = h('div', { class: 'ed-lane captions', 'data-track': track.id }, h('span', { class: 'ed-lane-label', text: 'CC' }));
-    for (const c of M.captionsOn(v, track.id)) {
+    const caps = M.captionsOn(v, track.id);
+    const wide = this.wide;
+    const lane = h(
+      'div',
+      { class: `ed-lane captions${wide ? ` k-caption${caps.length ? '' : ' empty'}${track.locked ? ' locked' : ''}${track.hidden ? ' dimmed' : ''}` : ''}`, 'data-track': track.id },
+      wide ? this.trackHead(track) : h('span', { class: 'ed-lane-label', text: 'CC' }),
+    );
+    for (const c of caps) {
       const sel = c.id === this.sel.captionId;
       lane.append(
         h(
@@ -1421,6 +1876,9 @@ class Editor {
   }
 
   placePlayhead() {
+    const total = this.model ? M.durationFrames(this.view()) : 0;
+    this.scrubFill.style.setProperty('--p', `${total ? Math.min(100, (this.playhead / total) * 100) : 0}%`);
+    this.scrubEl.setAttribute('aria-valuetext', M.timecode(this.playhead, this.fps));
     if (!this.playheadEl) return;
     this.playheadEl.style.setProperty('--x', `${this.xOf(this.playhead)}px`);
     this.playheadEl.firstChild.textContent = M.timecode(this.playhead, this.fps).replace(/\.\d+$/, '');
@@ -1429,7 +1887,9 @@ class Editor {
   follow() {
     const x = this.xOf(this.playhead);
     const s = this.tlScroll;
-    if (x < s.scrollLeft + 24 || x > s.scrollLeft + s.clientWidth - 24) s.scrollLeft = x - s.clientWidth * 0.35;
+    // On iPad the track heads cover the left of the scroller: what's under them isn't in view.
+    const head = this.wide ? HEAD_W : 0;
+    if (x < s.scrollLeft + head + 24 || x > s.scrollLeft + s.clientWidth - 24) s.scrollLeft = x - head - (s.clientWidth - head) * 0.35;
   }
 
   selectClip(id, { seek = false } = {}) {
@@ -1468,6 +1928,8 @@ class Editor {
     };
 
     el.addEventListener('pointerdown', (e) => {
+      // Track heads are plain buttons; capturing the pointer here would swallow their click.
+      if (e.target.closest('.ed-th, .ed-ruler-head')) return;
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (pts.size === 2) {
         // Pinch takes over whatever the first finger started (a trim in progress is abandoned, not applied).
@@ -1491,7 +1953,7 @@ class Editor {
         this.scrubbing = true;
         this.seek(this.frameAt(contentX(e.clientX)));
       } else {
-        g = { mode: 'tap', x0: e.clientX, y0: e.clientY, scroll0: el.scrollLeft, target: e.target, id: e.pointerId, t: performance.now(), v: 0, lastX: e.clientX, lastT: performance.now() };
+        g = { mode: 'tap', x0: e.clientX, y0: e.clientY, scroll0: el.scrollLeft, scrollTop0: el.scrollTop, target: e.target, id: e.pointerId, t: performance.now(), v: 0, lastX: e.clientX, lastT: performance.now() };
       }
       e.preventDefault();
     });
@@ -1511,9 +1973,12 @@ class Editor {
       if (g.mode === 'seek') return this.seek(this.frameAt(contentX(e.clientX)));
       if (g.mode === 'tap' || g.mode === 'pan') {
         const dx = e.clientX - g.x0;
-        if (g.mode === 'tap' && Math.abs(dx) > 8) g.mode = 'pan';
+        const dy = e.clientY - g.y0;
+        if (g.mode === 'tap' && (Math.abs(dx) > 8 || (this.wide && Math.abs(dy) > 8))) g.mode = 'pan';
         if (g.mode === 'pan') {
           el.scrollLeft = g.scroll0 - dx;
+          // iPad: all tracks are shown, so the timeline can be taller than its panel.
+          if (this.wide) el.scrollTop = g.scrollTop0 - dy;
           const now = performance.now();
           g.v = (e.clientX - g.lastX) / Math.max(1, now - g.lastT);
           g.lastX = e.clientX;
@@ -1553,8 +2018,18 @@ class Editor {
       if (g.mode === 'tap' && e.type === 'pointerup') {
         const clipEl = g.target.closest?.('[data-clip]');
         const capEl = g.target.closest?.('[data-caption]');
-        if (capEl) this.selectCaption(capEl.dataset.caption);
-        else if (clipEl) this.selectClip(clipEl.dataset.clip);
+        // iPad shows every track: the inspector follows what was tapped, as on the desktop.
+        if (capEl) {
+          if (this.wide && this.tool !== 'captions') this.tool = 'captions';
+          this.selectCaption(capEl.dataset.caption);
+        } else if (clipEl) {
+          if (this.wide) {
+            const a = M.assetOf(this.view(), M.clipById(this.view(), clipEl.dataset.clip)?.assetId);
+            if (a?.kind === 'audio' && (this.tool === 'frame' || this.tool === 'style' || this.tool === 'captions')) this.tool = 'audio';
+            else if (this.tool === 'captions') this.tool = 'clip';
+          }
+          this.selectClip(clipEl.dataset.clip);
+        }
         else this.seek(this.frameAt(contentX(e.clientX)));
       }
       if (g.mode === 'pan' && Math.abs(g.v) > 0.3 && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -1656,7 +2131,7 @@ class Editor {
   }
 
   renderPanel() {
-    if (this.disposed) return;
+    if (this.disposed || this.panelPressed) return;
     // Never rebuild under a finger typing.
     if (this.panel.contains(document.activeElement) && document.activeElement.matches('input, textarea, select')) return this.updatePanelValues?.();
     const v = this.view();
@@ -1669,6 +2144,11 @@ class Editor {
     else if (this.tool === 'frame') body = this.framePanel(v);
     else if (this.tool === 'captions') body = this.captionsPanel(v);
     else if (this.tool === 'audio') body = this.audioPanel(v);
+    else if (this.tool === 'fx') body = S.fxPanel(this, v, KIT);
+    else if (this.tool === 'media') body = S.mediaPanel(this, v);
+    else if (this.tool === 'templates') body = S.templatesPanel(this, v, KIT);
+    else if (this.tool === 'director') body = S.directorPanel(this, v);
+    else if (this.tool === 'settings') body = S.settingsPanel(this, v);
     else body = this.stylePanel(v);
     this.updatePanelValues = null;
     this.panel.replaceChildren(...[body].flat(Infinity).filter(Boolean));
@@ -1680,6 +2160,33 @@ class Editor {
 
   selectedClip(v) {
     return M.clipById(v, this.sel.clipId);
+  }
+
+  /** The desktop inspector's folding section; stays open or shut across the panel's frequent rebuilds. */
+  section(id, title, summary, children, defaultOpen = false) {
+    this.openSections ??= new Map();
+    const open = this.openSections.get(id) ?? defaultOpen;
+    const d = h(
+      'details',
+      { class: 'ed-acc', open: open || null },
+      h('summary', {}, h('span', { class: 'grow', text: title }), summary ? h('span', { class: 'ed-scope', text: summary }) : null, icon('chevronDown', { size: 16 })),
+      h('div', { class: 'ed-acc-body' }, children),
+    );
+    d.addEventListener('toggle', () => this.openSections.set(id, d.open));
+    return d;
+  }
+
+  /** A clip setting in seconds, stepped a tenth at a time (fades, dissolves). */
+  secondsStepper(c, key, label, maxFrames, disabled) {
+    const fps = this.fps;
+    const set = (f) => this.draft(`${key}:${c.id}`, [{ type: 'clip.update', clipId: c.id, props: { [key]: clamp(f, 0, maxFrames) } }], label);
+    return stepper({
+      label,
+      value: `${M.framesToSeconds(c.props[key], fps).toFixed(1)} s`,
+      disabled,
+      onStep: (d) => set(c.props[key] + d * Math.max(1, Math.round(M.fpsValue(fps) / 10))),
+      onCommit: (t) => numberCommit(t, (n) => set(M.secondsToFrames(n, fps))),
+    });
   }
 
   clipPanel(v) {
@@ -1697,6 +2204,20 @@ class Editor {
       this.draft(`trim:${c.id}:${edge}`, [{ type: 'clip.trim', clipId: c.id, edge, frame: f }], 'Trim clip');
     };
     const locked = track?.locked;
+    const off = locked || !this.editable();
+    const audio = track?.kind === 'audio';
+    const p = c.props;
+    const prev = siblings.find((x) => M.clipEnd(x) === c.start) ?? null;
+    const fxCount = fxCountOf(c);
+    const changed = fxCount > 0 || Object.entries(M.DEFAULT_CLIP_PROPS).some(([k, d]) => p[k] !== d);
+    const word = audio ? 'Crossfade' : 'Dissolve';
+    const effective = (M.planSegments(v, c.trackId).find((s) => s.id === c.id)?.inH ?? 0) * 2;
+    const transitionHint = !prev
+      ? `${word} needs a clip ending exactly where this one starts on ${track.label}.`
+      : p.transitionIn > 0 && effective < p.transitionIn
+        ? `Only ${M.framesToSeconds(effective, fps).toFixed(2)} s plays: the media has no more frames beyond the cut (handles).`
+        : `${audio ? 'Crossfades' : 'Dissolves'} from “${M.assetOf(v, prev.assetId)?.filename ?? 'previous clip'}”, centred on the cut.`;
+    const fadeSummary = ['fadeIn', 'fadeOut', 'transitionIn'].filter((k) => p[k] > 0).length ? 'On' : '';
     return [
       h('div', { class: 'ed-head' }, h('h2', { class: 'ed-h', text: 'Trim clip' }), h('span', { class: 'ed-meta tabular', text: `Duration: ${M.timecode(c.duration, fps)}` })),
 
@@ -1716,6 +2237,13 @@ class Editor {
       !canSplit ? h('p', { class: 'ed-hint', text: 'Split needs the playhead inside the selected clip.' }) : null,
       siblings.length > 1 ? button('Reorder clips', { iconName: 'list', full: true, small: true, disabled: locked || !this.editable(), onclick: () => this.reorderSheet(v, c.trackId) }) : null,
       locked ? h('p', { class: 'ed-hint warn', text: `${track.label} is locked on the Mac.` }) : null,
+      this.section('fades', audio ? 'Fades & crossfade' : 'Fades & transition', fadeSummary || null, [
+        h('div', { class: 'ed-grid2' }, this.secondsStepper(c, 'fadeIn', 'Fade in', c.duration, off), this.secondsStepper(c, 'fadeOut', 'Fade out', c.duration, off)),
+        this.secondsStepper(c, 'transitionIn', audio ? 'Crossfade' : 'Dissolve', prev ? Math.min(c.duration, 2 * prev.duration) : 0, off || !prev),
+        h('p', { class: 'ed-hint', text: transitionHint }),
+      ], true),
+      button('Reset clip', { iconName: 'reset', full: true, small: true, disabled: off || !changed, onclick: () => this.submit([{ type: 'clip.update', clipId: c.id, props: { ...M.DEFAULT_CLIP_PROPS, ...(fxCount ? { aiEffects: [] } : {}) } }], 'Reset clip') }),
+      h('p', { class: 'ed-hint', text: `Reset puts every setting of this clip back: framing, motion, fades, look${fxCount ? ', AI effects' : ''} and volume. Undo brings them back.` }),
     ];
   }
 
@@ -1791,6 +2319,11 @@ class Editor {
     const scaleIn = h('input', { class: 'ed-range', type: 'range', min: Math.min(25, scalePct), max: Math.max(400, scalePct), step: 1, value: scalePct, 'aria-label': 'Scale, percent', disabled: off || null });
     scaleIn.addEventListener('input', () => set({ scale: Number(scaleIn.value) / 100 }));
     const pct = (x) => `${x > 0 ? '+' : ''}${Math.round(x * 100)}`;
+    // One draft per property, so moving two controls in quick succession sends both.
+    const prop = (key, label, { min, max, k = 100, suffix = '%', step = 1, limit = [min, max] }) =>
+      slider({ label, value: round2((p[key] ?? 0) * k), min, max, step, suffix, limit, disabled: off, onChange: (n) => set({ [key]: round4(clamp(n, limit[0], limit[1]) / k) }, label, `frame:${key}`) });
+    const cropCount = ['cropLeft', 'cropRight', 'cropTop', 'cropBottom'].filter((k) => p[k] > 0).length;
+    const motion = M.motionPresetOf(p);
     return [
       h('div', { class: 'ed-head' }, h('h2', { class: 'ed-h', text: 'Framing' }), h('span', { class: 'ed-meta', text: 'Drag to move · Pinch to scale' })),
       h(
@@ -1806,9 +2339,46 @@ class Editor {
         stepper({ label: 'Position X, percent of the frame width', compact: true, value: pct(p.x), disabled: off, onStep: (d) => set({ x: round2(clamp(p.x + d / 100, -2, 2)) }), onCommit: (t) => numberCommit(t, (n) => set({ x: round2(clamp(n / 100, -2, 2)) })) }),
         h('span', { class: 'ed-label', text: 'Y' }),
         stepper({ label: 'Position Y, percent of the frame height', compact: true, value: pct(p.y), disabled: off, onStep: (d) => set({ y: round2(clamp(p.y + d / 100, -2, 2)) }), onCommit: (t) => numberCommit(t, (n) => set({ y: round2(clamp(n / 100, -2, 2)) })) }),
-        button('Reset', { small: true, iconName: 'reset', disabled: off, onclick: () => this.submit([{ type: 'clip.update', clipId: c.id, props: { fit: 'cover', scale: 1, x: 0, y: 0, cropLeft: 0, cropTop: 0, cropRight: 0, cropBottom: 0 } }], 'Reset framing') }),
+        button('Reset', { small: true, iconName: 'reset', disabled: off, onclick: () => this.submit([{ type: 'clip.update', clipId: c.id, props: { fit: 'cover', scale: 1, x: 0, y: 0, rotation: 0, opacity: 1, cropLeft: 0, cropTop: 0, cropRight: 0, cropBottom: 0 } }], 'Reset framing') }),
       ),
       h('p', { class: 'ed-hint', text: 'X / Y: % of the frame, identical on every screen and in the export. Reset changes framing only.' }),
+      prop('rotation', 'Rotation', { min: -180, max: 180, k: 1, suffix: '°', limit: [-360, 360] }),
+      prop('opacity', 'Opacity', { min: 0, max: 100 }),
+      this.section(
+        'crop',
+        'Crop',
+        cropCount ? `${cropCount} edge${cropCount === 1 ? '' : 's'}` : null,
+        [
+          prop('cropLeft', 'Left', { min: 0, max: 45 }),
+          prop('cropRight', 'Right', { min: 0, max: 45 }),
+          prop('cropTop', 'Top', { min: 0, max: 45 }),
+          prop('cropBottom', 'Bottom', { min: 0, max: 45 }),
+        ],
+      ),
+      this.section('motion', 'Motion', motion && motion !== 'none' ? M.MOTION_PRESETS.find((m) => m.key === motion).label : motion === null ? 'Custom' : null, [
+        h(
+          'div',
+          { class: 'ed-mchips', role: 'radiogroup', 'aria-label': 'Motion preset' },
+          M.MOTION_PRESETS.map((m) =>
+            h(
+              'button',
+              { class: `ed-mchip${motion === m.key ? ' on' : ''}`, type: 'button', role: 'radio', 'aria-checked': motion === m.key ? 'true' : 'false', disabled: off || null, onclick: () => motion !== m.key && this.submit([{ type: 'clip.update', clipId: c.id, props: { ...m.motion } }], m.key === 'none' ? 'Remove motion' : m.label) },
+              h('span', { class: 'ed-mchip-t', text: m.label }),
+              h('span', { class: 'ed-mchip-h', text: m.hint }),
+            ),
+          ),
+        ),
+        motion === null ? h('p', { class: 'ed-hint', text: 'Custom motion. Pick a preset to replace it.' }) : null,
+        h(
+          'div',
+          { class: 'ed-row' },
+          h('span', { class: 'ed-label grow', text: 'Animate scale across the clip' }),
+          toggle(p.scaleEnd !== null, 'Animate scale across the clip', off, () => this.submit([{ type: 'clip.update', clipId: c.id, props: { scaleEnd: p.scaleEnd !== null ? null : round4(Math.min(10, p.scale * 1.2)) } }], 'Zoom')),
+        ),
+        p.scaleEnd !== null ? prop('scaleEnd', 'Zoom to', { min: 5, max: 400, limit: [5, 1000] }) : null,
+        p.xEnd !== null ? prop('xEnd', 'Pan to X', { min: -100, max: 100, limit: [-200, 200] }) : null,
+        p.yEnd !== null ? prop('yEnd', 'Pan to Y', { min: -100, max: 100, limit: [-200, 200] }) : null,
+      ]),
       animated
         ? h(
             'div',
@@ -1817,13 +2387,17 @@ class Editor {
             button('Use static framing', { small: true, disabled: off, onclick: () => this.submit([{ type: 'clip.update', clipId: c.id, props: { scaleEnd: null, xEnd: null, yEnd: null } }], 'Static framing') }),
           )
         : null,
-      c.aiEffects ? h('p', { class: 'ed-hint', text: `${c.aiEffects} AI effect${c.aiEffects === 1 ? '' : 's'} on this clip show in the rendered preview, not the live one.` }) : null,
+      fxCountOf(c) ? h('p', { class: 'ed-hint', text: `${fxCountOf(c)} AI effect${fxCountOf(c) === 1 ? '' : 's'} on this clip show in the rendered preview, not the live one (AI FX).` }) : null,
     ];
   }
 
   captionsPanel(v) {
     const caps = [...v.captions].sort(M.byStart);
-    if (!caps.length) return [h('h2', { class: 'ed-h', text: 'Edit caption' }), h('p', { class: 'muted', text: 'This project has no captions. Generate them on the Mac (Captions), then fix them here.' })];
+    const capTrack = v.tracks.find((t) => t.kind === 'caption');
+    const addBtn = () => button('Add caption at the playhead', { iconName: 'plus', full: true, small: true, disabled: !this.editable() || !capTrack || capTrack.locked, onclick: () => S.addCaptionAtPlayhead(this) });
+    const genOpen = !caps.length || this.capGen?.state === 'transcribing' || this.capGen?.state === 'working';
+    const generate = this.section('capgen', caps.length ? 'Regenerate from speech' : 'Generate from speech', this.capGen?.state === 'transcribing' ? 'Transcribing…' : null, S.generateBlock(this, v, KIT), genOpen);
+    if (!caps.length) return [h('h2', { class: 'ed-h', text: 'Captions' }), h('p', { class: 'muted', text: 'No captions yet. Generate them from the speech (transcribed on your Mac), or add one at the playhead.' }), generate, addBtn()];
     const c = M.captionById(v, this.sel.captionId) ?? caps[0];
     const i = caps.findIndex((x) => x.id === c.id);
     const track = M.trackOf(v, c.trackId);
@@ -1852,6 +2426,13 @@ class Editor {
       this.textTimer = setTimeout(() => this.commitText(c.id, area.value), TEXT_MS);
     });
     area.addEventListener('blur', () => this.commitText(c.id, area.value));
+    if (this.focusCaptionText === c.id) {
+      this.focusCaptionText = null;
+      requestAnimationFrame(() => {
+        area.focus();
+        area.select();
+      });
+    }
     const styleNow = (patch, label) => this.submit([{ type: 'track.update', trackId: track.id, captionStyle: patch }], label);
     const preset = Object.entries(M.CAPTION_PRESETS).find(([, s]) => s.font === style.font && s.stroke === style.stroke && (s.box ?? null) === (style.box ?? null))?.[0] ?? null;
     const base = preset ? M.CAPTION_PRESETS[preset].size : style.size;
@@ -1859,6 +2440,21 @@ class Editor {
     const pos = M.positionOf(style.y);
     const posSel = h('select', { class: 'ed-select', 'aria-label': 'Caption position', disabled: off || null }, M.CAPTION_POSITIONS.map((p) => h('option', { value: p.id, selected: p.id === pos.id || null, text: p.label })));
     posSel.addEventListener('change', () => styleNow({ y: M.CAPTION_POSITIONS.find((p) => p.id === posSel.value).y }, 'Caption position'));
+    const fontSel = h('select', { class: 'ed-select', 'aria-label': 'Caption font', disabled: off || null }, Object.keys(M.CAPTION_FONTS).map((f) => h('option', { value: f, selected: f === style.font || null, text: f })));
+    fontSel.addEventListener('change', () => styleNow({ font: fontSel.value }, 'Caption font'));
+    // Engine ranges (schema.ts CaptionStyleSchema); the desktop's slider ranges, in % like the desktop shows them.
+    const CAP_LIMIT = { size: [1.5, 20], y: [5, 95], maxWidth: [30, 100], stroke: [0, 30] };
+    const capSlider = (key, label, min, max, step) =>
+      slider({
+        label,
+        value: round2(style[key] * 100),
+        min,
+        max,
+        step,
+        limit: CAP_LIMIT[key],
+        disabled: off,
+        onChange: (n) => this.draft(`capstyle:${track.id}:${key}`, [{ type: 'track.update', trackId: track.id, captionStyle: { [key]: round4(clamp(n, ...CAP_LIMIT[key]) / 100) } }], `Caption ${label.toLowerCase()}`),
+      });
     this.updatePanelValues = () => {
       if (document.activeElement !== area && area.value !== (this.textDrafts[c.id] ?? c.text)) area.value = this.textDrafts[c.id] ?? c.text;
     };
@@ -1877,6 +2473,7 @@ class Editor {
         iconButton('chevronRight', 'Next caption', () => this.selectCaption(caps[i + 1].id), { disabled: i === caps.length - 1, cls: 'ed-ic boxed' }),
       ),
       h('div', { class: 'ed-textwrap' }, area, h('button', { class: 'ed-textdone', type: 'button', onclick: () => (area.blur(), this.commitText(c.id, area.value)) }, 'Done')),
+      h('div', { class: 'ed-grid2' }, addBtn(), button('Delete caption', { iconName: 'trash', small: true, full: true, disabled: off, onclick: () => S.deleteCaption(this, c) })),
       h('div', { class: 'ed-subhead' }, h('span', { text: 'Style' }), h('span', { class: 'ed-scope', text: `All captions on ${track.label}` })),
       h(
         'div',
@@ -1904,6 +2501,24 @@ class Editor {
         stepper({ label: 'Start', value: M.timecode(c.start, fps), disabled: off, onStep: (d) => timing(c.start + d, c.start + c.duration), onCommit: (t) => commitTime(t, fps, (f) => timing(f, c.start + c.duration)) }),
         stepper({ label: 'End', value: M.timecode(c.start + c.duration, fps), disabled: off, onStep: (d) => timing(c.start, c.start + c.duration + d), onCommit: (t) => commitTime(t, fps, (f) => timing(c.start, f)) }),
       ),
+      this.section('capstyle', 'More style', `${style.font}${style.uppercase ? ' · caps' : ''}`, [
+        h('div', { class: 'ed-row' }, h('span', { class: 'ed-label wide', text: 'Font' }), fontSel),
+        capSlider('size', 'Size', 1.5, 12, 0.1),
+        capSlider('y', 'Position', 5, 95, 1),
+        capSlider('maxWidth', 'Width', 30, 100, 1),
+        capSlider('stroke', 'Outline', 0, 30, 1),
+        h(
+          'div',
+          { class: 'ed-colors' },
+          colorField({ label: 'Text', value: style.color, disabled: off, onChange: (c2) => c2 && styleNow({ color: c2 }, 'Caption colour') }),
+          colorField({ label: 'Highlight', value: style.highlight, optional: true, fallback: '#00d5ed', disabled: off, onChange: (c2) => styleNow({ highlight: c2 }, c2 ? 'Highlight colour' : 'Highlight off') }),
+          colorField({ label: 'Outline', value: style.strokeColor, disabled: off, onChange: (c2) => c2 && styleNow({ strokeColor: c2 }, 'Outline colour') }),
+          colorField({ label: 'Box', value: style.box, optional: true, fallback: '#000000', disabled: off, onChange: (c2) => styleNow({ box: c2 ? `${c2.slice(0, 7)}b3` : null }, c2 ? 'Caption box' : 'No caption box') }),
+        ),
+        h('div', { class: 'ed-row' }, h('span', { class: 'ed-label grow', text: 'Uppercase' }), toggle(style.uppercase, 'Uppercase captions', off, () => styleNow({ uppercase: !style.uppercase }, style.uppercase ? 'Normal case' : 'Uppercase'))),
+        h('div', { class: 'ed-row' }, h('span', { class: 'ed-label grow', text: 'Shadow' }), toggle(style.shadow, 'Caption shadow', off, () => styleNow({ shadow: !style.shadow }, style.shadow ? 'No shadow' : 'Shadow'))),
+      ]),
+      generate,
       h('p', { class: 'ed-hint', text: 'Text and timing change this caption only; it stops at its neighbours (no overlaps). The Mac styles captions per track, so style, size and position change all of them. Lines wrap to the caption width; positions stay inside the safe area.' }),
     ];
   }
@@ -1967,6 +2582,11 @@ class Editor {
         h('div', { class: 'ed-row' }, h('span', { class: 'ed-label grow', text: `Mute ${track.label}` }), toggle(track.muted, `Mute all sound on ${track.label}`, off || track.locked, () => this.submit([{ type: 'track.update', trackId: track.id, muted: !track.muted }], track.muted ? `Unmute ${track.label}` : `Mute ${track.label}`))),
         h('p', { class: 'ed-hint', text: `Mute is per track: it silences every clip on ${track.label}. Volume and fades are this clip’s.` }),
       );
+      // The same media sounding at the same moment on another unmuted track plays twice (desktop inspector).
+      const twin = track.muted
+        ? null
+        : v.clips.find((x) => x.id !== c.id && x.assetId === c.assetId && x.trackId !== c.trackId && x.start < M.clipEnd(c) && c.start < M.clipEnd(x) && !M.trackOf(v, x.trackId)?.muted);
+      if (twin) out.push(h('p', { class: 'ed-hint warn', text: `Heard twice: the same media also plays on ${M.trackOf(v, twin.trackId)?.label ?? 'another track'} at the same time. Delete the copy or mute one of the tracks.` }));
     } else out.push(h('p', { class: 'muted', text: c ? 'The selected clip has no sound.' : 'Select a clip to change its sound.' }));
     const music = M.audioTracks(v).filter((t) => M.clipsOn(v, t.id).length);
     if (music.length) {
@@ -1988,26 +2608,62 @@ class Editor {
   }
 
   stylePanel(v) {
-    const c = this.selectedClip(v);
-    const a = c ? M.assetOf(v, c.assetId) : null;
-    if (!c || a?.kind === 'audio') return [h('h2', { class: 'ed-h', text: 'Look' }), h('p', { class: 'muted', text: 'Select a video or image clip.' })];
-    const off = !this.editable() || M.trackOf(v, c.trackId)?.locked;
+    const visual = (c) => c && M.assetOf(v, c.assetId)?.kind !== 'audio';
+    const sel = this.selectedClip(v);
+    const all = this.lookScope === 'all';
+    const free = (c) => !M.trackOf(v, c.trackId)?.locked;
+    const targets = all ? v.clips.filter((c) => visual(c) && free(c)) : visual(sel) && free(sel) ? [sel] : [];
+    const shown = visual(sel) ? sel : targets[0] ?? null;
+    const scope = h(
+      'div',
+      { class: 'ed-seg small lk-scope', role: 'radiogroup', 'aria-label': 'Apply the look to' },
+      [['clip', 'This clip'], ['all', 'All clips']].map(([id, label]) => {
+        const on = (this.lookScope ?? 'clip') === id;
+        return h('button', { class: `ed-seg-btn${on ? ' on' : ''}`, type: 'button', role: 'radio', 'aria-checked': on ? 'true' : 'false', onclick: () => ((this.lookScope = id), (this.panelKey = null), this.renderPanel()) }, label);
+      }),
+    );
+    const head = h('div', { class: 'ed-head' }, h('h2', { class: 'ed-h', text: 'Look' }), scope);
+    if (!shown) return [head, h('p', { class: 'muted', text: all ? 'No video or image clips to change.' : 'Select a video or image clip.' })];
+    const off = !this.editable() || !targets.length;
+    const apply = (props, label) => this.submit(targets.map((c) => ({ type: 'clip.update', clipId: c.id, props })), label);
+    const current = PRESETS.find(([, , props]) => LOOKS.every(([k]) => Math.abs((shown.props[k] ?? 0) - (props[k] ?? 0)) < 0.005))?.[0] ?? null;
+    const swatches = h(
+      'div',
+      { class: 'lk-row', role: 'radiogroup', 'aria-label': 'Looks' },
+      PRESETS.map(([id, label, props]) => {
+        const sw = this.swatch(id);
+        const on = current === id;
+        return h('button', { class: `lk${on ? ' on' : ''}`, type: 'button', role: 'radio', 'aria-checked': on ? 'true' : 'false', disabled: off || null, onclick: () => apply(Object.fromEntries(LOOKS.map(([k]) => [k, props[k] ?? 0])), `Look: ${label}`) }, sw, h('span', { text: label }));
+      }),
+    );
     const rows = LOOKS.map(([key, label, hint, live]) => {
-      const r = h('input', { class: 'ed-range', type: 'range', min: 0, max: 100, step: 1, value: Math.round(c.props[key] * 100), 'aria-label': `${label}, percent`, disabled: off || null });
-      r.addEventListener('input', () => this.draft(`look:${c.id}:${key}`, [{ type: 'clip.update', clipId: c.id, props: { [key]: Number(r.value) / 100 } }], label));
-      return h('div', { class: 'ed-row' }, h('span', { class: 'ed-label wide', text: label, title: hint }), r, h('span', { class: 'ed-val tabular', text: `${Math.round(c.props[key] * 100)}%${live ? '' : ' ≈'}` }));
+      const r = h('input', { class: 'ed-range', type: 'range', min: 0, max: 100, step: 1, value: Math.round((shown.props[key] ?? 0) * 100), 'aria-label': `${label}, percent`, disabled: off || null });
+      r.style.setProperty('--p', `${Math.round((shown.props[key] ?? 0) * 100)}%`);
+      r.addEventListener('input', () => {
+        r.style.setProperty('--p', `${r.value}%`);
+        this.draft(`look:${all ? 'all' : shown.id}:${key}`, targets.map((c) => ({ type: 'clip.update', clipId: c.id, props: { [key]: Number(r.value) / 100 } })), label);
+      });
+      return h('div', { class: 'ed-row lk-adj' }, h('span', { class: 'ed-label wide', title: hint }, label, live ? null : h('span', { class: 'lk-tag', text: 'in export' })), r, h('span', { class: 'ed-val tabular', text: `${Math.round((shown.props[key] ?? 0) * 100)}%` }));
     });
     return [
-      h('div', { class: 'ed-head' }, h('h2', { class: 'ed-h', text: 'Look' }), button('Reset', { small: true, iconName: 'reset', disabled: off, onclick: () => this.submit([{ type: 'clip.update', clipId: c.id, props: Object.fromEntries(LOOKS.map(([k]) => [k, 0])) }], 'Reset look') })),
+      head,
+      swatches,
       rows,
-      h('p', { class: 'ed-hint', text: '≈ Sharpen and grain show only in the rendered preview and the export.' }),
-      h('div', { class: 'ed-subhead' }, h('span', { text: 'Exposure, contrast, saturation' })),
-      h('p', { class: 'ed-hint', text: 'Not available yet: the export engine has no exposure, contrast or saturation control, so the phone doesn’t offer sliders that wouldn’t change the video.' }),
+      all ? h('p', { class: 'ed-hint', text: `Changes go to all ${targets.length} video and image clips.` }) : null,
+      h('p', { class: 'ed-hint', text: 'Sharpen and grain show only in the rendered preview and the export. Exposure, contrast and saturation aren’t in the export engine yet, so they aren’t offered.' }),
     ];
+  }
+
+  /** A look swatch: the project's poster (an unfiltered still) with the look as a CSS filter on top. */
+  swatch(id) {
+    const url = live.posters.get(this.projectId)?.url;
+    return h('span', { class: `lk-sw lk-${id}`, 'aria-hidden': 'true' }, url ? h('img', { src: url, alt: '' }) : null);
   }
 }
 
 // ── controls ────────────────────────────────────────────────────────────────
+// The studio panels (edit-studio.js) build with the same controls.
+const KIT = { stepper: (o) => stepper(o), slider: (o) => slider(o), toggle: (...a) => toggle(...a), colorField: (o) => colorField(o), numberCommit: (...a) => numberCommit(...a) };
 /** ‹ value › with a typeable value; taps are steps of one (frame, percent, …). */
 function stepper({ label, value, onStep, onCommit, disabled, compact = false }) {
   const input = h('input', { class: 'ed-num tabular', type: 'text', inputmode: 'decimal', value, 'aria-label': label, enterkeyhint: 'done', disabled: disabled || null, spellcheck: 'false', autocomplete: 'off' });
@@ -2032,6 +2688,41 @@ function numberField({ value, suffix, label, min, max, onCommit, disabled }) {
   input.addEventListener('keydown', (e) => e.key === 'Enter' && input.blur());
   input.addEventListener('change', () => numberCommit(input.value, (n) => onCommit(clamp(n, min, max))));
   return h('span', { class: 'ed-numwrap' }, input, h('span', { class: 'muted', text: suffix }));
+}
+
+/**
+ * The desktop inspector's slider + number pair, in display units (%, °, s). The track widens to include a
+ * value set on the Mac, so touching it never jumps; typed values are clamped to the engine's own range.
+ */
+function slider({ label, value, min, max, step = 1, suffix = '%', disabled, onChange, limit = [min, max] }) {
+  const lo = Math.min(min, value);
+  const hi = Math.max(max, value);
+  const show = (n) => (step < 1 ? n.toFixed(step < 0.1 ? 2 : 1) : String(Math.round(n)));
+  const r = h('input', { class: 'ed-range', type: 'range', min: lo, max: hi, step, value, 'aria-label': `${label}${suffix ? `, ${suffix}` : ''}`, disabled: disabled || null });
+  const fill = (n) => r.style.setProperty('--p', `${((n - lo) / (hi - lo || 1)) * 100}%`);
+  fill(value);
+  const num = numberField({ value: show(value), suffix, label, min: limit[0], max: limit[1], disabled, onCommit: (n) => onChange(n) });
+  const input = num.querySelector('input');
+  r.addEventListener('input', () => {
+    const n = Number(r.value);
+    fill(n);
+    input.value = show(n);
+    onChange(n);
+  });
+  return h('div', { class: 'ed-row lk-adj' }, h('span', { class: 'ed-label wide', text: label }), r, num);
+}
+
+/** A colour swatch; `optional` ones (highlight, box) have a switch, off = null. */
+function colorField({ label, value, optional = false, fallback = '#00d5ed', disabled, onChange }) {
+  const input = h('input', { class: 'ed-color-in', type: 'color', value: (value ?? fallback).slice(0, 7), 'aria-label': `${label} colour`, disabled: disabled || value === null || null });
+  input.addEventListener('change', () => onChange(input.value));
+  return h(
+    'div',
+    { class: 'ed-color' },
+    h('span', { class: 'ed-label', text: label }),
+    input,
+    optional ? toggle(value !== null, `Use ${label.toLowerCase()}`, disabled, () => onChange(value === null ? fallback : null)) : null,
+  );
 }
 
 function toggle(on, label, disabled, onclick) {

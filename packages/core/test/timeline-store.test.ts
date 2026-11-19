@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { AssetStore, MIGRATIONS, migrate, openDatabase, ProjectStore, ReelForgeError, TimelineStore } from "../src/index.ts";
+import { AnalysisStore, AssetStore, JobStore, MIGRATIONS, migrate, openDatabase, ProjectStore, ReelForgeError, TimelineStore } from "../src/index.ts";
 import { fakeMedia, tempDir } from "./helpers.ts";
 
 function setup(t: Parameters<typeof tempDir>[0]) {
@@ -144,4 +144,42 @@ test("migration 2 gives pre-existing (M0) projects their default tracks", (t) =>
   migrate(db);
   const n = db.prepare("SELECT count(*) AS n FROM tracks WHERE project_id = '00000000-0000-4000-8000-000000000001'").get() as { n: number };
   assert.equal(n.n, 5);
+});
+
+test("delete removes the project and every row recorded about it; other projects stay", (t) => {
+  const s = setup(t);
+  const cc = s.timeline.get(s.project.id).tracks.find((x) => x.kind === "caption")!;
+  let tl = s.timeline.apply(s.project.id, { baseRevision: 2, operations: [{ type: "clip.add", trackId: s.video.id, assetId: s.asset.id, start: 0, duration: 90 }] }, "cli");
+  tl = s.timeline.apply(s.project.id, { baseRevision: tl.project.revision, operations: [{ type: "captions.replace", trackId: cc.id, captions: [{ start: 0, duration: 30, text: "Hello" }] }] }, "cli");
+  const jobs = new JobStore(s.db);
+  const job = jobs.create(s.project.id, "export", { width: 1080, height: 1920, useProxies: false, crf: 18, preset: "medium", audioBitrateK: 192 }, null);
+  jobs.cancel(job.id);
+  const other = s.projects.create({ name: "Other" }, "cli");
+
+  const gone = s.projects.delete(s.project.id);
+  assert.equal(gone.name, "Cafe");
+  assert.deepEqual(s.projects.list().map((p) => p.id), [other.id]);
+  assert.equal(code(() => s.projects.get(s.project.id)), "NOT_FOUND");
+  for (const table of ["edit_operations", "assets", "tracks", "clips", "captions", "render_jobs"]) {
+    const n = (s.db.prepare(`SELECT count(*) AS n FROM ${table} WHERE project_id = ?`).get(s.project.id) as { n: number }).n;
+    assert.equal(n, 0, `${table} rows left behind`);
+  }
+  assert.equal(s.timeline.get(other.id).tracks.length, 5, "the other project is untouched");
+  assert.equal(code(() => s.projects.delete(s.project.id)), "NOT_FOUND");
+});
+
+test("delete is refused while a render or an analysis is still working on the project", (t) => {
+  const s = setup(t);
+  s.timeline.apply(s.project.id, { baseRevision: 2, operations: [{ type: "clip.add", trackId: s.video.id, assetId: s.asset.id, start: 0, duration: 90 }] }, "cli");
+  const jobs = new JobStore(s.db);
+  const job = jobs.create(s.project.id, "preview", { width: 540, height: 960, useProxies: true, crf: 28, preset: "veryfast", audioBitrateK: 96 }, null);
+  assert.equal(code(() => s.projects.delete(s.project.id)), "BUSY");
+  jobs.cancel(job.id);
+  const analyses = new AnalysisStore(s.db);
+  analyses.enqueue(s.project.id, s.asset.id, ["transcript"]);
+  assert.equal(code(() => s.projects.delete(s.project.id)), "BUSY");
+  assert.equal(s.projects.get(s.project.id).name, "Cafe", "nothing was deleted");
+  s.db.prepare("UPDATE analyses SET state = 'failed'").run();
+  s.projects.delete(s.project.id);
+  assert.equal(s.projects.list().length, 0);
 });

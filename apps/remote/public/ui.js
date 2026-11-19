@@ -21,6 +21,7 @@ export function h(tag, props = {}, ...children) {
 // The desktop's stroke icon family (apps/desktop/src/icons.tsx: 24 px grid, 1.6 stroke, round caps), plus
 // the few the phone needs that the desktop doesn't, drawn the same way.
 const PATHS = {
+  home: 'M3.5 10.5L12 3.5l8.5 7M5.5 9v11h4.5v-6h4v6h4.5V9',
   projects: 'M3.5 7.5a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z',
   session: 'M4.5 7l4.5 5-4.5 5M11.5 17.5h8',
   exports: 'M12 4v11M7.5 10.5L12 15l4.5-4.5M4.5 19.5h15',
@@ -80,7 +81,27 @@ const PATHS = {
   arrowUp: 'M12 19V5M6 11l6-6 6 6',
   arrowDown: 'M12 5v14M6 13l6 6 6-6',
   ripple: 'M3 7h7v10H3zM14 7h7v10h-7zM10 12h4',
+  // the redesigned shell
+  spark: 'M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M6 18l2.5-2.5M15.5 8.5L18 6',
+  sort: 'M4 7h16M7 12h10M10 17h4',
+  laptop: 'M4 5h16v11H4zM2 19h20',
+  settings: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
+  split: 'M12 3v18M7 8l-3 4 3 4M17 8l3 4-3 4',
+  // timeline heads and transport, as on the desktop
+  video: 'M3.5 7h11v10h-11zM14.5 10.5l6-3.5v10l-6-3.5',
+  skipBack: 'M18 19l-9-7 9-7zM6 5v14',
+  skipForward: 'M6 5l9 7-9 7zM18 5v14',
+  fit: 'M3.5 8V5h3M17.5 5h3v3M20.5 16v3h-3M6.5 19h-3v-3M7.5 12h9M9.5 9.5L7 12l2.5 2.5M14.5 9.5L17 12l-2.5 2.5',
+  eye: 'M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
+  eyeOff: 'M3 3l18 18M10.6 5.6A9.6 9.6 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-3.1 3.9M6.6 6.6A16 16 0 0 0 2.5 12s3.5 6.5 9.5 6.5a9.4 9.4 0 0 0 4.4-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2',
+  lock: 'M6 11h12v9.5H6zM8.5 11V7.5a3.5 3.5 0 0 1 7 0V11',
+  unlock: 'M6 11h12v9.5H6zM8.5 11V7.5a3.5 3.5 0 0 1 6.8-1.2',
 };
+
+/** The ReelForge mark (film-strip modules round an orange play core, brand/reelforge-mark.svg); `state` (edit, render) makes it breathe while work runs. */
+export function mark(state = 'idle', size = 30) {
+  return h('span', { class: `mark is-${state}`, vars: { '--mk': `${size}px` }, 'aria-hidden': 'true' }, h('img', { src: '/mark.svg', alt: '', width: size, height: size, decoding: 'async' }));
+}
 
 export function icon(name, { size = 20, label } = {}) {
   const NS = 'http://www.w3.org/2000/svg';

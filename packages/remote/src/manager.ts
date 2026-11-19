@@ -8,21 +8,29 @@
 //   push.json      VAPID keys and the phones' notification subscriptions
 
 import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import {
   ACTIVE_JOB_STATES,
+  AnalysisStore,
   consentCovers,
+  FX_CATALOG,
+  FX_NUMERIC_OPTIONS,
   JobStore,
+  MOTION_TEMPLATES,
+  planCaptions,
   ProjectStore,
   ProposalStore,
   ReelForgeError,
   TimelineStore,
   type AIProposal,
+  type Analysis,
+  type AnalysisKind,
   type Asset,
   type Database,
+  type Project,
   type RenderJob,
 } from "@reelforge/core";
 import { RemoteDaemon, PIECE_BYTES, errText, type DaemonStatus, type QueuedInstruction, type RemoteCommand } from "./daemon.ts";
@@ -115,6 +123,8 @@ export interface RemoteVersion {
   changes: number;
   list: { kind: string; target: string; label: string; before: string | null; after: string | null }[];
   warnings: string[];
+  /** The agent's reason for each operation (same order as its operations), clipped. */
+  reasons: string[];
   provider: string;
   model: string;
   baseRevision: number;
@@ -249,6 +259,18 @@ export interface RemoteRender {
   retry(jobId: string): RenderJob;
 }
 
+/** From the engine's API server: the studio tools (same runners and queues as the desktop's). */
+export interface RemoteStudio {
+  analyze(projectId: string, assetId: string, kinds: AnalysisKind[], params: Record<string, unknown>): Analysis[];
+  fxStatus(projectId: string): { engine: { ok: boolean; reason?: string }; bakes: ({ key: string; state: string } & Record<string, unknown>)[] };
+  fxBake(projectId: string): { engine: { ok: boolean; reason?: string }; bakes: ({ key: string; state: string } & Record<string, unknown>)[] };
+  fxEngine(): { ok: boolean; reason?: string };
+  motionEngine(): { ok: boolean; reason?: string };
+  motionCreate(projectId: string, input: unknown, actor: "api"): { key: string; state: string } & Record<string, unknown>;
+  motionStatus(projectId: string, key: string): { key: string; state: string } & Record<string, unknown>;
+  deleteProject(projectId: string): Project;
+}
+
 export interface RemoteMedia {
   /** Imports a file the phone uploaded into the project's library. */
   importFile(projectId: string, path: string): Promise<{ assetId: string; filename: string }>;
@@ -266,6 +288,7 @@ export interface RemoteManagerOptions {
   render?: RemoteRender;
   media?: RemoteMedia;
   frames?: RemoteFrames;
+  studio?: RemoteStudio;
   /** How this engine runs, and whether the editor window is open (both for the phone's status line). */
   engine?: () => RemoteEngineInfo;
   editor?: () => EditorState;
@@ -296,6 +319,13 @@ const PAIRING_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_PREFS: PushPrefs = { exports: true, proposals: true, failures: true };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRANSFER_ID = /^[A-Za-z0-9_-]{16,64}$/;
+const CREATED_TTL_MS = 30 * 24 * 3600 * 1000;
+/** The formats the phone offers (the desktop's New project has the same sizes). */
+const PROJECT_FORMATS: Record<string, { width: number; height: number }> = {
+  "9:16": { width: 1080, height: 1920 },
+  "1:1": { width: 1080, height: 1080 },
+  "16:9": { width: 1920, height: 1080 },
+};
 
 interface Stored {
   url: string | null;
@@ -341,14 +371,17 @@ export class RemoteManager {
   readonly #opts: RemoteManagerOptions;
 
   /** Hands in what exists only once the API server runs (its render runner) or comes from elsewhere. */
-  attach(extra: Pick<RemoteManagerOptions, "render" | "media">): void {
+  attach(extra: Pick<RemoteManagerOptions, "render" | "media" | "studio">): void {
     if (extra.render) this.#opts.render = extra.render;
     if (extra.media) this.#opts.media = extra.media;
+    if (extra.studio) this.#opts.studio = extra.studio;
   }
   readonly #file: string;
   readonly #devicesFile: string;
   readonly #handledFile: string;
   readonly #pushFile: string;
+  /** Projects made from the phone, by the phone's request id: a retried create finds the first one. */
+  readonly #createdFile: string;
   #daemon: RemoteDaemon | undefined;
   #error: string | null = null;
   #notifier: ReturnType<typeof setInterval> | undefined;
@@ -377,6 +410,7 @@ export class RemoteManager {
     this.#devicesFile = join(opts.dir, "devices.json");
     this.#handledFile = join(opts.dir, "handled.json");
     this.#pushFile = join(opts.dir, "push.json");
+    this.#createdFile = join(opts.dir, "created.json");
     // A lease that lapses by itself is announced, so other phones stop showing "X is editing".
     this.#edits = new EditSessions(opts.db, { onExpire: () => this.#daemon?.sendSnapshot() });
   }
@@ -780,17 +814,7 @@ export class RemoteManager {
     for (const p of projectStore.list().slice(0, MAX_PROJECTS)) {
       const fps = Math.round((p.settings.fps.num / p.settings.fps.den) * 100) / 100;
       const proposals = proposalStore.list(p.id, 50);
-      projects.push({
-        id: p.id,
-        name: p.name,
-        revision: p.revision,
-        width: p.settings.width,
-        height: p.settings.height,
-        fps,
-        durationFrames: this.#duration(p.id, p.revision),
-        updatedAt: p.updatedAt,
-        pendingProposals: proposals.filter((x) => x.status === "pending").length,
-      });
+      projects.push(this.#remoteProject(p, proposals.filter((x) => x.status === "pending").length));
       let sizes: Map<string, { size: number; path: string }> | undefined;
       const versionOf = versionLookup(proposals);
       for (const j of jobStore.list(p.id, { limit: 20 })) {
@@ -836,6 +860,89 @@ export class RemoteManager {
     };
   }
 
+  #remoteProject(p: Project, pendingProposals: number): RemoteProject {
+    return {
+      id: p.id,
+      name: p.name,
+      revision: p.revision,
+      width: p.settings.width,
+      height: p.settings.height,
+      fps: Math.round((p.settings.fps.num / p.settings.fps.den) * 100) / 100,
+      durationFrames: this.#duration(p.id, p.revision),
+      updatedAt: p.updatedAt,
+      pendingProposals,
+    };
+  }
+
+  /**
+   * A new project from the phone, through the same ProjectStore.create the desktop's New project uses.
+   * `requestId` is chosen by the phone once per form and kept across retries: a create that already went
+   * through (its answer lost on the way back) answers with that project instead of making a second one.
+   */
+  createProject(deviceId: string, input: { requestId?: unknown; name?: unknown; format?: unknown }): { requestId: string; project: RemoteProject; existing: boolean } {
+    const requestId = typeof input.requestId === "string" && TRANSFER_ID.test(input.requestId) ? input.requestId : null;
+    if (!requestId) throw new ReelForgeError("VALIDATION_ERROR", "That request id isn't valid.");
+    const key = `${deviceId}:${requestId}`;
+    const now = Date.now();
+    const created = Object.fromEntries(Object.entries(this.#readJson<Record<string, { projectId: string; at: number }>>(this.#createdFile)).filter(([, v]) => v && typeof v.projectId === "string" && now - v.at < CREATED_TTL_MS));
+    const projects = new ProjectStore(this.#opts.db);
+    const seen = created[key];
+    if (seen) {
+      let p: Project;
+      try {
+        p = projects.get(seen.projectId);
+      } catch {
+        throw new ReelForgeError("NOT_FOUND", "The project made from this form was deleted on your Mac.");
+      }
+      return { requestId, project: this.#remoteProject(p, 0), existing: true };
+    }
+    const format = PROJECT_FORMATS[typeof input.format === "string" ? input.format : "9:16"];
+    if (!format) throw new ReelForgeError("VALIDATION_ERROR", "That video format isn't available.");
+    // Same rules as everywhere else (ProjectNameSchema: trimmed, 1–120 characters, no control characters).
+    const p = projects.create({ name: typeof input.name === "string" ? input.name : "", settings: { width: format.width, height: format.height, fps: { num: 30, den: 1 } } }, PHONE_ACTOR);
+    created[key] = { projectId: p.id, at: now };
+    this.#writeJson(this.#createdFile, created);
+    this.#opts.log?.(`project created from a phone: ${p.id}`);
+    return { requestId, project: this.#remoteProject(p, 0), existing: false };
+  }
+
+  /**
+   * Renames a project, through the same ProjectStore.rename the desktop uses. A name doesn't touch the timeline,
+   * so it goes on the current revision: an edit that landed while the phone typed isn't a reason to refuse it.
+   */
+  renameProject(input: { projectId?: unknown; name?: unknown }): RemoteProject {
+    const projectId = uuidOf(input.projectId, "project");
+    const projects = new ProjectStore(this.#opts.db);
+    const name = typeof input.name === "string" ? input.name : "";
+    let p: Project | undefined;
+    for (let attempt = 0; !p; attempt++) {
+      try {
+        p = projects.rename(projectId, { name, baseRevision: projects.get(projectId).revision }, PHONE_ACTOR);
+      } catch (e) {
+        // Another edit landed between reading the revision and writing: read it again (twice at most).
+        if (!(e instanceof ReelForgeError && e.code === "REVISION_CONFLICT") || attempt >= 2) throw e;
+      }
+    }
+    this.#opts.log?.(`project renamed from a phone: ${p.id}`);
+    return this.#remoteProject(p, new ProposalStore(this.#opts.db).list(p.id, 50).filter((x) => x.status === "pending").length);
+  }
+
+  /**
+   * Deletes a project for good (the API server's delete when attached: it also knows about motion renders).
+   * Refused while another phone edits it by hand or the AI Director works on it; this phone's own lease goes.
+   */
+  deleteProject(deviceId: string, input: { projectId?: unknown }): { id: string; name: string } {
+    const projectId = uuidOf(input.projectId, "project");
+    const lease = this.#edits.lease(projectId);
+    if (lease && lease.deviceId !== deviceId) throw new ReelForgeError("BUSY", `${lease.deviceName} is editing this project by hand. Delete it once they're done.`);
+    if (this.#asks.has(projectId)) throw new ReelForgeError("BUSY", "The AI Director is still working on this project. Cancel it or wait for it, then delete.");
+    const p = this.#opts.studio ? this.#opts.studio.deleteProject(projectId) : new ProjectStore(this.#opts.db).delete(projectId);
+    this.#edits.releaseProject(p.id);
+    this.#durations.delete(p.id);
+    this.#opts.log?.(`project deleted from a phone: ${p.id}`);
+    return { id: p.id, name: p.name };
+  }
+
   /** One project for the phone's Session and Review screens. */
   project(projectId: string): RemoteProjectDetail {
     const tl = new TimelineStore(this.#opts.db).get(projectId);
@@ -872,6 +979,7 @@ export class RemoteManager {
       changes: x.changes.length,
       list: x.changes.slice(0, MAX_LISTED_CHANGES).map((c) => ({ kind: c.kind, target: c.target, label: c.label, before: c.before, after: c.after })),
       warnings: [...new Set(x.warnings)],
+      reasons: (x.explanations ?? []).filter((r) => typeof r === "string" && r.trim()).slice(0, MAX_LISTED_CHANGES).map((r) => clip(r, 280)),
       provider: x.provider,
       model: x.model,
       baseRevision: x.baseRevision,
@@ -1098,8 +1206,23 @@ export class RemoteManager {
           return d.sendSnapshot();
         case "ping":
           return reply({ t: "pong", at: Date.now() });
+        case "project.create": {
+          const r = this.createProject(deviceId, { requestId: cmd.requestId, name: cmd.name, format: cmd.format });
+          if (!r.existing) d.sendSnapshot();
+          return reply({ t: "project.created", ...r });
+        }
         case "project.open":
           return reply({ t: "project", project: this.project(uuidOf(cmd.projectId, "project")) });
+        case "project.rename": {
+          const project = this.renameProject({ projectId: cmd.projectId, name: cmd.name });
+          d.sendSnapshot();
+          return reply({ t: "project.renamed", project });
+        }
+        case "project.delete": {
+          const project = this.deleteProject(deviceId, { projectId: cmd.projectId });
+          d.sendSnapshot();
+          return reply({ t: "project.deleted", project });
+        }
         case "poster": {
           const projectId = uuidOf(cmd.projectId, "project");
           const poster = await this.poster(projectId);
@@ -1135,6 +1258,36 @@ export class RemoteManager {
         case "edit.still":
         case "edit.strip":
           return reply(await this.#frame(deviceId, cmd));
+        case "studio.info":
+          return reply({ t: "studio", ...this.#studioInfo() });
+        case "fx.status":
+        case "fx.bake": {
+          const projectId = uuidOf(cmd.projectId, "project");
+          const st = cmd.type === "fx.bake" ? this.#studio().fxBake(projectId) : this.#studio().fxStatus(projectId);
+          return reply({ t: "fx", projectId, engine: st.engine, bakes: st.bakes.map(bakeOf) });
+        }
+        case "captions.plan":
+          return reply(this.#planCaptions(cmd));
+        case "media.thumb": {
+          const projectId = uuidOf(cmd.projectId, "project");
+          const assetId = uuidOf(cmd.assetId, "asset");
+          const asset = new TimelineStore(this.#opts.db).get(projectId).assets.find((a) => a.id === assetId);
+          if (!asset) throw new ReelForgeError("NOT_FOUND", "That media isn't in this project.");
+          if (!this.#opts.thumbnail || asset.status === "missing" || asset.kind === "audio") return reply({ t: "thumb", projectId, assetId, blob: null });
+          const thumb = await this.#opts.thumbnail(asset);
+          const blob = await this.#connected().putBlob(deviceId, { type: thumb.contentType, data: readFileSync(thumb.path).toString("base64") });
+          return reply({ t: "thumb", projectId, assetId, blob });
+        }
+        case "motion.create": {
+          const projectId = uuidOf(cmd.projectId, "project");
+          const m = this.#studio().motionCreate(projectId, { template: cmd.template, props: cmd.props, durationFrames: cmd.durationFrames }, "api");
+          return reply({ t: "motion", projectId, motion: motionOf(m) });
+        }
+        case "motion.status": {
+          const projectId = uuidOf(cmd.projectId, "project");
+          const key = typeof cmd.key === "string" ? cmd.key : "";
+          return reply({ t: "motion", projectId, motion: motionOf(this.#studio().motionStatus(projectId, key)) });
+        }
         case "export.options":
           return reply({ t: "export.options", ...this.exportOptions(uuidOf(cmd.projectId, "project")) });
         case "export.start": {
@@ -1240,6 +1393,65 @@ export class RemoteManager {
     throw new ReelForgeError("VALIDATION_ERROR", "unknown edit command");
   }
 
+  #studio(): RemoteStudio {
+    if (!this.#opts.studio) throw new ReelForgeError("UNAVAILABLE", "This Mac's ReelForge can't run studio tools for the phone. Update ReelForge on the Mac.");
+    return this.#opts.studio;
+  }
+
+  /** What the phone's Effects, Templates and Settings panels offer: catalogues and whether each engine is there. */
+  #studioInfo(): Record<string, unknown> {
+    const studio = this.#opts.studio;
+    return {
+      fx: {
+        engine: studio ? studio.fxEngine() : { ok: false, reason: "not available on this Mac" },
+        catalog: FX_CATALOG.map((f) => ({ fx: f.fx, label: f.label, about: f.about, options: f.options, keys: f.keys, images: f.images, camera: f.camera, numeric: FX_NUMERIC_OPTIONS[f.fx] ?? [] })),
+      },
+      motion: {
+        engine: studio ? studio.motionEngine() : { ok: false, reason: "not available on this Mac" },
+        templates: Object.entries(MOTION_TEMPLATES).map(([id, t]) => ({ id, label: t.label, description: t.description, defaultSeconds: t.defaultSeconds, defaults: t.defaults, fields: motionFields(t.schema, t.defaults) })),
+        maxSeconds: 60,
+      },
+      engine: this.#opts.engine?.() ?? null,
+      macName: this.macName(),
+      version: this.#opts.version,
+    };
+  }
+
+  /**
+   * Captions from speech, worked out on this Mac: transcripts that are missing are started (whisper.cpp) and
+   * reported with their progress; once all are there, the captions come back as one captions.replace operation
+   * that the phone sends through its own edit queue (so it's one undo step of its session, like any edit).
+   */
+  #planCaptions(cmd: RemoteCommand): Record<string, unknown> {
+    const projectId = uuidOf(cmd.projectId, "project");
+    const tl = new TimelineStore(this.#opts.db).get(projectId);
+    const trackId = typeof cmd.trackId === "string" ? uuidOf(cmd.trackId, "track") : undefined;
+    const sources = Array.isArray(cmd.sourceTrackIds) ? cmd.sourceTrackIds.slice(0, 20).map((x) => uuidOf(x, "track")) : undefined;
+    const maxWords = typeof cmd.maxWords === "number" && Number.isFinite(cmd.maxWords) ? Math.max(1, Math.min(12, Math.round(cmd.maxWords))) : undefined;
+    const language = typeof cmd.language === "string" && /^(auto|[a-z]{2,3})$/.test(cmd.language) ? cmd.language : undefined;
+    const plan = planCaptions(this.#opts.db, projectId, { ...(trackId ? { trackId } : {}), ...(sources ? { sourceTrackIds: sources } : {}), ...(maxWords ? { maxWords } : {}) });
+    if (plan.missing.length) {
+      const store = new AnalysisStore(this.#opts.db);
+      const missing = plan.missing.map((m) => {
+        let a: Analysis | null = store.latest(projectId, m.assetId, "transcript");
+        // A poll never restarts a failed transcript (the phone shows why); pressing Generate again does.
+        const restart = !a || a.stale || a.state === "completed" || (a.state === "failed" && cmd.poll !== true);
+        if (restart) a = this.#studio().analyze(projectId, m.assetId, ["transcript"], language ? { language } : {}).find((x) => x.kind === "transcript") ?? a;
+        return { assetId: m.assetId, filename: m.filename, state: a?.state ?? "queued", progress: a?.progress ?? 0, error: a?.state === "failed" ? (a.error ?? "transcription failed") : null };
+      });
+      return { t: "captions", projectId, state: missing.some((m) => m.state === "failed") && !missing.some((m) => m.state === "queued" || m.state === "running") ? "failed" : "transcribing", missing, revision: tl.project.revision };
+    }
+    return {
+      t: "captions",
+      projectId,
+      state: "ready",
+      trackId: plan.trackId,
+      count: plan.captions.length,
+      revision: tl.project.revision,
+      ops: [{ type: "captions.replace", trackId: plan.trackId, captions: plan.captions.map((c) => ({ captionId: randomUUID(), start: c.start, duration: c.duration, text: c.text, words: c.words })) }],
+    };
+  }
+
   /** A source still or filmstrip for the editor, as a sealed blob for the phone that asked. */
   async #frame(deviceId: string, cmd: RemoteCommand): Promise<Record<string, unknown>> {
     const frames = this.#opts.frames;
@@ -1260,7 +1472,7 @@ export class RemoteManager {
     const want = `${projectId}:${assetId}:${frame}`;
     this.#wantStill.set(deviceId, want);
     const path = await frames.still(asset, (frame * fps.den * 1_000_000) / fps.num, () => this.#wantStill.get(deviceId) === want);
-    const blob = await this.#connected().putBlob(deviceId, { type: "image/jpeg", data: readFileSync(path).toString("base64") });
+    const blob = await this.#connected().putBlob(deviceId, { type: path.endsWith(".png") ? "image/png" : "image/jpeg", data: readFileSync(path).toString("base64") });
     return { t: "still", projectId, assetId, sourceFrame: frame, blob };
   }
 
@@ -1618,6 +1830,35 @@ function versionLookup(proposals: AIProposal[]): (revision: number) => number | 
   return (revision) => byRevision.get(revision) ?? null;
 }
 
+/** An AI-effect bake as the phone sees it: state and progress, never cache paths. */
+function bakeOf(b: { key: string; state: string } & Record<string, unknown>): Record<string, unknown> {
+  return { key: b.key, state: b.state, progress: typeof b.progress === "number" ? b.progress : null, error: typeof b.error === "string" ? b.error.slice(0, 300) : null };
+}
+
+/** A motion-graphic render as the phone sees it: the imported asset by id and name, no file paths. */
+function motionOf(m: { key: string; state: string } & Record<string, unknown>): Record<string, unknown> {
+  const a = m.asset as Asset | undefined;
+  return {
+    key: m.key,
+    state: m.state,
+    progress: typeof m.progress === "number" ? m.progress : null,
+    error: typeof m.error === "string" ? m.error.slice(0, 300) : null,
+    asset: a ? { id: a.id, filename: a.filename, kind: a.kind, durationFrames: a.durationFrames } : null,
+  };
+}
+
+/** A template's editable props as form fields: colours, choices (zod enums) and text with its length limit. */
+function motionFields(schema: unknown, defaults: Record<string, unknown>): { key: string; kind: "color" | "choice" | "text"; options?: string[]; max?: number; required?: boolean }[] {
+  const shape = (schema as { shape?: Record<string, { options?: unknown; maxLength?: unknown; minLength?: unknown }> }).shape ?? {};
+  return Object.keys(defaults).map((key) => {
+    const f = shape[key];
+    const d = defaults[key];
+    if (Array.isArray(f?.options)) return { key, kind: "choice" as const, options: f.options.map(String) };
+    if (typeof d === "string" && /^#[0-9a-f]{6}$/i.test(d)) return { key, kind: "color" as const };
+    return { key, kind: "text" as const, ...(typeof f?.maxLength === "number" ? { max: f.maxLength } : {}), ...(typeof f?.minLength === "number" && f.minLength > 0 ? { required: true } : {}) };
+  });
+}
+
 function uuidOf(value: unknown, what: string): string {
   if (typeof value !== "string" || !UUID.test(value)) throw new ReelForgeError("VALIDATION_ERROR", `That ${what} id isn't valid.`);
   return value;
@@ -1633,7 +1874,7 @@ function detailsOf(e: unknown): Record<string, unknown> | null {
   const d = e instanceof EditError || e instanceof ReelForgeError ? e.details : null;
   if (!d) return null;
   const keep: Record<string, unknown> = {};
-  for (const k of ["currentRevision", "baseRevision", "deviceName", "expiresAt", "opIndex", "clipId", "captionId", "overlaps"]) if (k in d) keep[k] = d[k];
+  for (const k of ["currentRevision", "baseRevision", "deviceName", "expiresAt", "opIndex", "clipId", "captionId", "overlaps", "projectId", "assetId"]) if (k in d) keep[k] = d[k];
   return keep;
 }
 

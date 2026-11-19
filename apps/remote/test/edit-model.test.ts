@@ -12,6 +12,8 @@ import {
   CAPTION_PRESETS as CORE_PRESETS,
   DEFAULT_CLIP_PROPS as CORE_DEFAULTS,
   layoutCaption as coreLayout,
+  MOTION_PRESETS as CORE_MOTION,
+  motionPresetOf as coreMotionOf,
   placement as corePlacement,
   resolveClipProps,
   type EditState,
@@ -45,6 +47,7 @@ function core(clips: ReturnType<typeof clip>[], ops: TimelineOp[]) {
 
 function phone(clips: ReturnType<typeof clip>[], ops: TimelineOp[]) {
   const model = {
+    fps,
     tracks: [
       { id: V1, kind: "video", label: "V1", position: 1, muted: false, locked: false, hidden: false },
       { id: C1, kind: "caption", label: "C1", position: 0, muted: false, locked: false, hidden: false, stylePatch: {}, captionStyle: m.resolveCaptionStyle({}) },
@@ -65,6 +68,9 @@ test("edit-model: presets and defaults are the engine's", () => {
   assert.deepEqual({ ...m.CAPTION_FONTS }, CORE_FONTS);
   const { aiEffects: _ai, ...defaults } = CORE_DEFAULTS;
   assert.deepEqual({ ...m.DEFAULT_CLIP_PROPS }, defaults);
+  assert.deepEqual(JSON.parse(JSON.stringify(m.MOTION_PRESETS)), CORE_MOTION);
+  for (const p of CORE_MOTION) assert.equal(m.motionPresetOf({ ...m.DEFAULT_CLIP_PROPS, ...p.motion }), coreMotionOf(resolveClipProps(p.motion)));
+  assert.equal(m.motionPresetOf({ ...m.DEFAULT_CLIP_PROPS, scale: 1.3 }), coreMotionOf(resolveClipProps({ scale: 1.3 })));
 });
 
 test("edit-model: trims, splits, deletes and reorders land where the engine puts them", () => {
@@ -233,4 +239,58 @@ test("edit-model: timecodes are frame-exact both ways", () => {
   assert.equal(m.parseTimecode("3.2", fps), 96);
   assert.equal(m.parseTimecode("0:03,20", fps), 96);
   assert.equal(m.parseTimecode("abc", fps), null);
+});
+
+test("edit-model: adding clips and captions, deleting and replacing captions, AI effects land as the engine puts them", () => {
+  const base = [clip(ids(1), 0, 90), clip(ids(2), 120, 30, 40)];
+  const parse = (ops: unknown[]) => TimelineOpSchema.array().parse(ops) as TimelineOp[];
+  const clipCases = [
+    parse([{ type: "clip.add", trackId: V1, assetId: A, start: 90, clipId: ids(5), duration: 30 }]),
+    parse([{ type: "clip.add", trackId: V1, assetId: A, start: 150, clipId: ids(5), sourceIn: 100 }]),
+    parse([{ type: "clip.add", trackId: V1, assetId: A, start: 90, clipId: ids(5), duration: 30, props: { scale: 1.2 } }]),
+  ];
+  for (const ops of clipCases) assert.deepEqual(norm(phone(base, ops).clips), norm(core(base, ops).clips.values()), JSON.stringify(ops));
+  // Overlaps and media past its end: both refuse.
+  for (const ops of [
+    parse([{ type: "clip.add", trackId: V1, assetId: A, start: 60, clipId: ids(5), duration: 30 }]),
+    parse([{ type: "clip.add", trackId: V1, assetId: A, start: 150, clipId: ids(5), sourceIn: 290, duration: 20 }]),
+  ]) {
+    assert.throws(() => core(base, ops), JSON.stringify(ops));
+    assert.throws(() => phone(base, ops), m.EditRejected, JSON.stringify(ops));
+  }
+
+  const capsOf = (list: Iterable<{ id: string; start: number; duration: number; text: string; words: unknown[] }>) =>
+    [...list].map((c) => ({ id: c.id, start: c.start, duration: c.duration, text: c.text, words: c.words })).sort((a, b) => a.start - b.start);
+  const capCases = [
+    parse([{ type: "caption.add", trackId: C1, captionId: ids(6), start: 40, duration: 30, text: "  added at the playhead  " }]),
+    parse([{ type: "caption.delete", captionIds: [ids(9)] }]),
+    parse([
+      {
+        type: "captions.replace",
+        trackId: C1,
+        captions: [
+          { captionId: ids(6), start: 0, duration: 20, text: "first words", words: [{ text: "first", start: 0, end: 9 }, { text: "words", start: 9, end: 40 }] },
+          { captionId: ids(7), start: 20, duration: 25, text: "and more" },
+        ],
+      },
+    ]),
+  ];
+  for (const ops of capCases) assert.deepEqual(capsOf(phone(base, ops).captions), capsOf(core(base, ops).captions.values()), JSON.stringify(ops));
+  for (const ops of [parse([{ type: "caption.add", trackId: C1, captionId: ids(6), start: 10, duration: 30, text: "overlaps" }])]) {
+    assert.throws(() => core(base, ops));
+    assert.throws(() => phone(base, ops), m.EditRejected);
+  }
+
+  // AI effects: replaced whole on clip.update, kept by both halves of a split, cleared by Reset.
+  const fx = [{ fx: "lean-in", start: 10, end: 40, opts: { zoom: 1.6 } }, { fx: "spotlight", start: 50, end: 80, text: "focus", color: "#ff0000" }];
+  const fxCases = [
+    parse([{ type: "clip.update", clipId: ids(1), props: { aiEffects: fx } }]),
+    parse([{ type: "clip.update", clipId: ids(1), props: { aiEffects: fx } }, { type: "clip.split", clipId: ids(1), frame: 45, newClipId: ids(5) }]),
+    parse([{ type: "clip.update", clipId: ids(1), props: { aiEffects: fx } }, { type: "clip.update", clipId: ids(1), props: { ...m.DEFAULT_CLIP_PROPS, aiEffects: [] } }]),
+  ];
+  for (const ops of fxCases) {
+    const want = [...core(base, ops).clips.values()].map((c) => ({ id: c.id, fx: resolveClipProps(c.props).aiEffects })).sort((a, b) => a.id.localeCompare(b.id));
+    const got = phone(base, ops).clips.map((c: { id: string; aiEffects?: unknown[] }) => ({ id: c.id, fx: c.aiEffects ?? [] })).sort((a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id));
+    assert.deepEqual(got, want, JSON.stringify(ops));
+  }
 });

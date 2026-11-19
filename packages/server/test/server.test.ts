@@ -63,6 +63,21 @@ test("project CRUD over REST with revision conflicts", async (t) => {
   assert.deepEqual(history.operations.map((o: any) => o.actor), ["desktop", "api"]);
 });
 
+test("DELETE removes a project; a second delete is 404, and CORS lets the desktop send it", async (t) => {
+  const srv = await boot(t);
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Old" } })).json()) as any;
+  const { project: keep } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Keep" } })).json()) as any;
+  const pre = await call(srv, "OPTIONS", `/v1/projects/${project.id}`, { auth: false, headers: { origin: "http://localhost:5173", "access-control-request-method": "DELETE" } });
+  assert.match(pre.headers.get("access-control-allow-methods") ?? "", /DELETE/);
+  const del = await call(srv, "DELETE", `/v1/projects/${project.id}`);
+  assert.equal(del.status, 200);
+  assert.equal(((await del.json()) as any).deleted.name, "Old");
+  const list = (await (await call(srv, "GET", "/v1/projects")).json()) as any;
+  assert.deepEqual(list.projects.map((p: any) => p.id), [keep.id]);
+  assert.equal((await call(srv, "DELETE", `/v1/projects/${project.id}`)).status, 404);
+  assert.equal((await call(srv, "GET", `/v1/projects/${project.id}/timeline`)).status, 404);
+});
+
 test("validation and not-found map to 400/404", async (t) => {
   const srv = await boot(t);
   assert.equal((await call(srv, "POST", "/v1/projects", { body: { name: "" } })).status, 400);
