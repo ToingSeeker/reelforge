@@ -641,6 +641,7 @@ export function App() {
               onRun={setAiRun}
               onOpen={() => openRail("director")}
               onCommand={apply}
+              playhead={playhead}
             />
           </section>
           <Preview

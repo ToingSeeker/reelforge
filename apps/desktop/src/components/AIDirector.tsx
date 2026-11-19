@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AIProposal, Timeline, TimelineOp } from "@reelforge/core/schema";
-import { isSlashCommand, parseSlash, planSlash, slashSuggestions, type SlashCommandInfo } from "@reelforge/core/slash";
+import { completeSlash, isSlashCommand, parseSlash, planSlash, slashSuggestions, slashWord, type SlashCommandInfo } from "@reelforge/core/slash";
 import type { ProjectContext } from "@reelforge/core/context";
 import { ApiError, type AIProviderInfo, type Client } from "../api.ts";
 import type { Notify } from "../editor.ts";
@@ -25,9 +25,13 @@ interface Props {
   onOpen: () => void;
   /** Apply a slash command's edits directly, as one undo step. */
   onCommand: (label: string, ops: TimelineOp[]) => void;
+  /** Timeline frame of the playhead: /fx places its effect here. */
+  playhead: number;
 }
 
 const MODEL_KEY = "rf.aiModel";
+
+const slashId = (c: SlashCommandInfo) => `rf-slash-${c.name.replace(/\s+/g, "-")}`;
 const SUGGESTIONS = [
   "Tambahkan fade in 0,5 detik di awal dan fade out di akhir",
   "Potong klip video mengikuti beat musik",
@@ -195,7 +199,7 @@ export function AIDirector(p: Props) {
     if (!p.timeline) return;
     const parsed = parseSlash(input);
     if (!parsed.ok) return p.notify("error", parsed.error);
-    const plan = planSlash(p.timeline, p.selection, parsed.command);
+    const plan = planSlash(p.timeline, p.selection, parsed.command, { playhead: p.playhead });
     if (!plan.ok) return p.notify("error", plan.error);
     p.onCommand(plan.label, plan.ops);
     setText("");
@@ -207,8 +211,13 @@ export function AIDirector(p: Props) {
   const slash = isSlashCommand(text);
   const suggestions = menuOff ? [] : slashSuggestions(text);
   const pick = suggestions[Math.min(active, suggestions.length - 1)];
+  // Keep the highlighted suggestion visible when the arrows move past the menu's edge (/fx lists 45).
+  const pickId = pick ? slashId(pick) : null;
+  useEffect(() => {
+    if (pickId) document.getElementById(pickId)?.scrollIntoView({ block: "nearest" });
+  }, [pickId]);
   const complete = (c: SlashCommandInfo) => {
-    setText(`/${c.name}${c.usage.includes(" ") ? " " : ""}`);
+    setText(completeSlash(text, c));
     setActive(0);
   };
   const submit = () => {
@@ -302,7 +311,7 @@ export function AIDirector(p: Props) {
               Apply, and every applied proposal can be undone.
             </p>
             <p className="rf-hint">
-              Shortcut: type <kbd>/</kbd> to change the selected clips instantly, e.g. <code>/bw</code>, <code>/zoom in</code> or <code>/fade 0.5</code>.
+              Shortcut: type <kbd>/</kbd> to change the selected clips instantly, e.g. <code>/bw</code>, <code>/noir</code>, <code>/fx spotlight</code>, or several at once: <code>/vintage; /fade in 1</code>.
             </p>
             <div className="rf-suggestions">
               {SUGGESTIONS.map((s) => (
@@ -360,7 +369,7 @@ export function AIDirector(p: Props) {
                 key={c.name}
                 type="button"
                 role="option"
-                id={`rf-slash-${c.name}`}
+                id={slashId(c)}
                 aria-selected={c === pick}
                 className={`rf-menu-item${c === pick ? " is-active" : ""}`}
                 onMouseDown={(e) => e.preventDefault()}
@@ -379,7 +388,7 @@ export function AIDirector(p: Props) {
           role="combobox"
           aria-expanded={suggestions.length > 0}
           aria-controls="rf-slash-list"
-          aria-activedescendant={pick ? `rf-slash-${pick.name}` : undefined}
+          aria-activedescendant={pick ? slashId(pick) : undefined}
           value={text}
           maxLength={4000}
           disabled={!!pending || !projectId}
@@ -390,7 +399,7 @@ export function AIDirector(p: Props) {
           }}
           onKeyDown={(e) => {
             if (!suggestions.length || e.nativeEvent.isComposing) return;
-            const word = text.trim().slice(1).toLowerCase();
+            const word = slashWord(text);
             if (e.key === "ArrowDown" || e.key === "ArrowUp") {
               e.preventDefault();
               const step = e.key === "ArrowDown" ? 1 : -1;

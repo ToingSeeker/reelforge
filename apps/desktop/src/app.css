@@ -2764,6 +2764,7 @@ select.rf-input {
   right: 0;
   bottom: calc(100% + 6px);
   min-width: 0;
+  max-height: min(360px, 50vh);
 }
 .rf-slash-menu .rf-menu-item.is-active {
   background: var(--surface-hover);
