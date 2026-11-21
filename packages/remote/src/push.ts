@@ -4,6 +4,8 @@
 // Only node:crypto, no web-push dependency.
 
 import { createCipheriv, createECDH, createHmac, createPrivateKey, generateKeyPairSync, randomBytes, sign, type webcrypto } from "node:crypto";
+import { request } from "node:https";
+import { publicOnlyLookup } from "@reelforge/core";
 
 type JsonWebKey = webcrypto.JsonWebKey;
 
@@ -69,29 +71,49 @@ export interface PushResult {
   gone: boolean;
 }
 
-export async function sendPush(sub: PushSubscription, message: unknown, vapid: VapidKeys, subject: string, fetchImpl: typeof fetch = fetch): Promise<PushResult> {
+const publicPushHost = publicOnlyLookup((hostname) => new Error(`${hostname} is not a public push service`));
+
+/**
+ * POSTs to the push service over https. The phone chose the endpoint, so the address is checked
+ * when the connection is made: a name that resolves to this Mac or its network is refused.
+ */
+function postPublic(url: string, headers: Record<string, string>, body: Buffer): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { method: "POST", headers: { ...headers, "content-length": String(body.length) }, lookup: publicPushHost, timeout: 15_000 }, (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    });
+    req.on("timeout", () => req.destroy(new Error("the push service timed out")));
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+/** `fetchImpl` is for tests (a stand-in push service); without it the address check above applies. */
+export async function sendPush(sub: PushSubscription, message: unknown, vapid: VapidKeys, subject: string, fetchImpl?: typeof fetch): Promise<PushResult> {
   const payload = Buffer.from(JSON.stringify(message));
   if (payload.length > MAX_PUSH_PAYLOAD) throw new Error("notification too large");
-  const res = await fetchImpl(sub.endpoint, {
-    method: "POST",
-    headers: {
-      authorization: vapidAuthorization(sub.endpoint, vapid, subject),
-      "content-encoding": "aes128gcm",
-      "content-type": "application/octet-stream",
-      ttl: String(24 * 3600),
-      urgency: "normal",
-    },
-    body: encryptPayload(sub, payload),
-    redirect: "error",
-    signal: AbortSignal.timeout(15_000),
-  });
-  await res.body?.cancel();
-  return { status: res.status, gone: res.status === 404 || res.status === 410 };
+  const headers = {
+    authorization: vapidAuthorization(sub.endpoint, vapid, subject),
+    "content-encoding": "aes128gcm",
+    "content-type": "application/octet-stream",
+    ttl: String(24 * 3600),
+    urgency: "normal",
+  };
+  const body = encryptPayload(sub, payload);
+  let status: number;
+  if (fetchImpl) {
+    const res = await fetchImpl(sub.endpoint, { method: "POST", headers, body, redirect: "error", signal: AbortSignal.timeout(15_000) });
+    await res.body?.cancel();
+    status = res.status;
+  } else status = await postPublic(checkEndpoint(sub.endpoint), headers, body);
+  return { status, gone: status === 404 || status === 410 };
 }
 
 /**
  * A phone hands us its push endpoint and this Mac then POSTs to it, so only https URLs on public
- * hostnames are accepted: never this machine, the LAN, or a bare IP address.
+ * hostnames and the standard port are accepted: never this machine, the LAN, or a bare IP address.
+ * The name's resolved address is checked again when sendPush connects.
  */
 export function checkEndpoint(endpoint: unknown, allowHttpLocal = false): string {
   if (typeof endpoint !== "string" || endpoint.length > 2048) throw new Error("bad push endpoint");
@@ -101,10 +123,12 @@ export function checkEndpoint(endpoint: unknown, allowHttpLocal = false): string
   } catch {
     throw new Error("bad push endpoint");
   }
-  const host = u.hostname;
-  if (allowHttpLocal && u.protocol === "http:" && host === "127.0.0.1") return u.href;
+  if (allowHttpLocal && u.protocol === "http:" && u.hostname === "127.0.0.1") return u.href;
+  // 'localhost.' is 'localhost': drop the root dot before looking at the name.
+  const host = u.hostname.replace(/\.+$/, "");
   const ipLiteral = /^[\d.]+$/.test(host) || host.startsWith("[");
-  if (u.protocol !== "https:" || u.username || u.password || ipLiteral || !host.includes(".") || /(^|\.)(localhost|local|internal|lan|home)$/i.test(host)) {
+  // Push services listen on 443; any other port is a way to knock on something else.
+  if (u.protocol !== "https:" || u.port !== "" || u.username || u.password || ipLiteral || !host.includes(".") || /(^|\.)(localhost|local|internal|lan|home)$/i.test(host)) {
     throw new Error("push endpoints must be https addresses of a push service");
   }
   return u.href;

@@ -235,7 +235,9 @@ export function startNgrok(port: number, domain: string | undefined, log?: (line
   const bin = ngrokBinary();
   if (!bin) return Promise.reject(new ReelForgeError("UNAVAILABLE", "ngrok isn't installed: `brew install ngrok`, then `ngrok config add-authtoken <token>` (free account at ngrok.com)"));
   return new Promise((done, fail) => {
-    const args = ["http", `127.0.0.1:${port}`, "--log", "stdout", "--log-format", "json", ...(domain ? ["--url", domain] : [])];
+    // --inspect=false: ngrok's local inspector (127.0.0.1:4040) would otherwise keep every request,
+    // access key, OAuth token and owner cookie included, readable by anything on this Mac.
+    const args = ["http", `127.0.0.1:${port}`, "--inspect=false", "--log", "stdout", "--log-format", "json", ...(domain ? ["--url", domain] : [])];
     const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
     let buf = "";
     let lastError = "";

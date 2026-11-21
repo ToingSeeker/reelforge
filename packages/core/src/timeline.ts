@@ -243,21 +243,29 @@ export class TimelineStore {
     const upsertTrack = this.#db.prepare(
       `INSERT INTO tracks (id, project_id, kind, name, position, muted, locked, hidden, props) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, name = excluded.name, position = excluded.position,
-         muted = excluded.muted, locked = excluded.locked, hidden = excluded.hidden, props = excluded.props`,
+         muted = excluded.muted, locked = excluded.locked, hidden = excluded.hidden, props = excluded.props
+       WHERE tracks.project_id = excluded.project_id`,
     );
     const upsertCaption = this.#db.prepare(
       `INSERT INTO captions (id, project_id, track_id, start, duration, text, words) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET track_id = excluded.track_id, start = excluded.start, duration = excluded.duration,
-         text = excluded.text, words = excluded.words`,
+         text = excluded.text, words = excluded.words
+       WHERE captions.project_id = excluded.project_id`,
     );
     const upsertClip = this.#db.prepare(
       `INSERT INTO clips (id, project_id, track_id, asset_id, start, duration, source_in, props) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET track_id = excluded.track_id, asset_id = excluded.asset_id,
-         start = excluded.start, duration = excluded.duration, source_in = excluded.source_in, props = excluded.props`,
+         start = excluded.start, duration = excluded.duration, source_in = excluded.source_in, props = excluded.props
+       WHERE clips.project_id = excluded.project_id`,
     );
+    // Row ids are global keys. An id another project already uses must fail the whole edit,
+    // never rewrite that project's row behind its lease, revision and history.
+    const wrote = (kind: string, id: string, r: { changes: number | bigint }) => {
+      if (Number(r.changes) !== 1) throw new ReelForgeError("VALIDATION_ERROR", `${kind} id ${id} is already used by another project`, { projectId, id });
+    };
     for (const ch of diff.tracks) {
       const t = ch[side];
-      if (t) upsertTrack.run(t.id, projectId, t.kind, t.name, t.position, +t.muted, +t.locked, +t.hidden, JSON.stringify(t.captionStyle ? { captionStyle: t.captionStyle } : {}));
+      if (t) wrote("track", t.id, upsertTrack.run(t.id, projectId, t.kind, t.name, t.position, +t.muted, +t.locked, +t.hidden, JSON.stringify(t.captionStyle ? { captionStyle: t.captionStyle } : {})));
     }
     for (const ch of diff.clips) {
       if (!ch[side]) this.#db.prepare("DELETE FROM clips WHERE id = ? AND project_id = ?").run(ch.id, projectId);
@@ -265,14 +273,14 @@ export class TimelineStore {
     for (const ch of diff.clips) {
       const c = ch[side];
       // Diffs recorded before clip props existed have none.
-      if (c) upsertClip.run(c.id, projectId, c.trackId, c.assetId, c.start, c.duration, c.sourceIn, JSON.stringify(c.props ?? {}));
+      if (c) wrote("clip", c.id, upsertClip.run(c.id, projectId, c.trackId, c.assetId, c.start, c.duration, c.sourceIn, JSON.stringify(c.props ?? {})));
     }
     for (const ch of diff.captions ?? []) {
       if (!ch[side]) this.#db.prepare("DELETE FROM captions WHERE id = ? AND project_id = ?").run(ch.id, projectId);
     }
     for (const ch of diff.captions ?? []) {
       const c = ch[side];
-      if (c) upsertCaption.run(c.id, projectId, c.trackId, c.start, c.duration, c.text, JSON.stringify(c.words));
+      if (c) wrote("caption", c.id, upsertCaption.run(c.id, projectId, c.trackId, c.start, c.duration, c.text, JSON.stringify(c.words)));
     }
     for (const ch of diff.tracks) {
       if (!ch[side]) this.#db.prepare("DELETE FROM tracks WHERE id = ? AND project_id = ?").run(ch.id, projectId);

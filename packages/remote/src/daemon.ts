@@ -11,6 +11,9 @@ import { seal, sealBytes, unseal, unsealBytes } from "./keys.ts";
 
 /** A command older or newer than this (by the Mac's clock) is refused, as is any id seen before. */
 export const COMMAND_MAX_AGE_MS = 5 * 60 * 1000;
+/** A queued instruction lives a day on the phone (QUEUE_TTL_MS in core.js); a little slack for clocks. */
+const QUEUE_MAX_TTL_MS = 24 * 3600 * 1000 + 10 * 60 * 1000;
+const QUEUE_CLOCK_SKEW_MS = 10 * 60 * 1000;
 /** Raw bytes per file piece (sealed and base64'd it stays well under the relay's 4 MB body limit). */
 export const PIECE_BYTES = 1024 * 1024;
 const OUTBOX_MAX = 500;
@@ -343,19 +346,27 @@ export class RemoteDaemon {
       if (!res.ok) return; // someone else took it, or the phone cancelled it just now
       const deviceId = String(item.deviceId);
       const key = this.#opts.keys.deviceKey(deviceId);
-      const expiresAt = Number(item.expiresAt);
       let body: Record<string, unknown> | null = null;
       try {
         if (key && typeof item.c === "string") body = unseal(key, item.c, `queue:${id}`) as Record<string, unknown>;
       } catch {
         body = null;
       }
-      // Recorded before it runs: at most once, even if this process dies halfway.
+      // Only the sealed times count: the relay can rewrite the envelope to revive a cancelled,
+      // expired or already-run instruction. Missing or implausible times read as expired.
+      const createdAt = Number(body?.createdAt);
+      const sealedExpiry = Number(body?.expiresAt);
+      const plausible =
+        Number.isFinite(createdAt) && Number.isFinite(sealedExpiry) && sealedExpiry > createdAt &&
+        sealedExpiry - createdAt <= QUEUE_MAX_TTL_MS && createdAt <= Date.now() + QUEUE_CLOCK_SKEW_MS;
+      const expiresAt = plausible ? sealedExpiry : 0;
+      // Recorded before it runs: at most once, even if this process dies halfway. It is kept a day
+      // past the sealed expiry, so the record can't lapse while the instruction could still run.
       this.#opts.handled.add(id, Math.max(expiresAt, Date.now()) + 24 * 3600 * 1000);
       if (!body || body.id !== id || body.projectId !== item.projectId) {
         this.#opts.log?.("dropped a queued instruction that didn't open with its phone's key");
       } else {
-        await this.#opts.onQueued({ id, deviceId, projectId: String(item.projectId), createdAt: Number(item.createdAt), expiresAt, body });
+        await this.#opts.onQueued({ id, deviceId, projectId: String(item.projectId), createdAt: plausible ? createdAt : 0, expiresAt, body });
       }
       await this.#post("/agent/queue/done", { id }).catch(() => {});
     } catch (e) {

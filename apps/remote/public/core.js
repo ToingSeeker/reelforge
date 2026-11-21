@@ -821,7 +821,8 @@ export function addInstruction(projectId, text, { about = null } = {}) {
 function sealedBody(item) {
   return seal(
     keys.key,
-    { id: item.id, projectId: item.projectId, type: 'ai.ask', instruction: item.instruction, provider: item.provider, model: item.model, baseRevision: item.baseRevision, about: item.about },
+    // The times are sealed too: the Mac trusts only these, never the relay's copy beside them.
+    { id: item.id, projectId: item.projectId, type: 'ai.ask', createdAt: item.createdAt, expiresAt: item.expiresAt, instruction: item.instruction, provider: item.provider, model: item.model, baseRevision: item.baseRevision, about: item.about },
     `queue:${item.id}`,
   );
 }

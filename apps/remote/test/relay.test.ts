@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import net from "node:net";
 import { deriveDeviceKeys, deriveKeys } from "../../../packages/remote/src/keys.ts";
 
 const { createRelay } = (await import(new URL("../server.mjs", import.meta.url).href)) as {
@@ -176,6 +177,43 @@ test('relay: file pieces are taken once, a request waits for a piece still on it
   assert.equal((await put('api', { id: 'piece-test-3', n: 0, c: big })).status, 200);
   assert.equal((await take('api', 'piece-test-2', 0)).status, 200);
   assert.equal((await put('agent', { id: 'piece-test-2', n, c: big })).status, 200, 'room again once the phone has taken a piece');
+});
+
+test("relay: a request target the URL parser refuses gets a 400, and the relay stays up", async (t: { after: (fn: () => unknown) => void }) => {
+  const { url } = await withPhone(t);
+  const { port } = new URL(url);
+  const raw = (target: string) =>
+    new Promise<string>((resolve) => {
+      const sock = net.connect(Number(port), "127.0.0.1", () => sock.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`));
+      let out = "";
+      sock.on("data", (d) => (out += d));
+      sock.on("close", () => resolve(out));
+      sock.on("error", () => resolve(out));
+    });
+  for (const target of ["//a:b/", "//a:99999/", "//[/", "http://x:99999/"]) {
+    assert.match(await raw(target), /^HTTP\/1\.1 400/, target);
+    assert.equal((await fetch(`${url}/healthz`)).status, 200, `still up after ${target}`);
+  }
+});
+
+test("relay: withdrawing a phone that stopped reading cuts it off without crashing the relay", async (t: { after: (fn: () => unknown) => void }) => {
+  const { url, agent, dev, publish } = await withPhone(t);
+  assert.equal((await publish()).status, 200);
+  // More log than the socket buffers hold, so a graceful end() could never finish.
+  for (let i = 0; i < 3; i++) {
+    const r = await fetch(`${url}/agent/events`, { method: "POST", headers: agent, body: JSON.stringify({ events: [{ c: "x".repeat(3_000_000) }] }) });
+    assert.equal(r.status, 200);
+  }
+  const { port } = new URL(url);
+  const sock = net.connect(Number(port), "127.0.0.1", () => sock.write(`GET /api/stream?since=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${dev.token}\r\n\r\n`));
+  const closed = new Promise<void>((resolve) => (sock.on("close", () => resolve()), sock.on("error", () => resolve())));
+  await new Promise<void>((resolve) => sock.once("data", () => (sock.pause(), resolve())));
+  // Withdraw it, then post another event and wait past what the heartbeat would need.
+  assert.equal((await fetch(`${url}/agent/devices`, { method: "POST", headers: agent, body: JSON.stringify({ devices: [] }) })).status, 200);
+  assert.equal((await fetch(`${url}/agent/events`, { method: "POST", headers: agent, body: JSON.stringify({ events: [{ c: "after" }] }) })).status, 200);
+  sock.resume();
+  await closed;
+  assert.equal((await fetch(`${url}/healthz`)).status, 200);
 });
 
 test("relay: the phone app is served with a strict CSP, and nothing outside public/ is", async (t: { after: (fn: () => unknown) => void }) => {
