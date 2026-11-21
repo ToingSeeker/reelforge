@@ -189,12 +189,18 @@ export class ConnectorAuth {
     });
     const name = typeof b.client_name === "string" && b.client_name.trim() ? b.client_name.trim().slice(0, 80) : "An MCP client";
     const client: ClientRecord = { clientId: `rf_${token(16)}`, clientName: name, redirectUris: uris, createdAt: Date.now() };
-    this.#state.clients.push(client);
-    // Keep the newest clients; one that never finished authorizing doesn't hold a slot forever.
-    if (this.#state.clients.length > MAX_CLIENTS) {
-      const drop = this.#state.clients.splice(0, this.#state.clients.length - MAX_CLIENTS).map((c) => c.clientId);
-      this.#state.tokens = this.#state.tokens.filter((t) => !drop.includes(t.clientId));
+    // Registration needs no credential, so it may only ever free the slot of a client that never
+    // finished authorizing (no live token, no pending code). A connected AI app is never evicted.
+    if (this.#state.clients.length >= MAX_CLIENTS) {
+      const now = Date.now();
+      const busy = new Set(this.#state.tokens.filter((t) => t.exp > now).map((t) => t.clientId));
+      for (const c of this.#codes.values()) if (c.exp > now) busy.add(c.clientId);
+      const idle = this.#state.clients.findIndex((c) => !busy.has(c.clientId));
+      if (idle === -1) throw new OAuthError("temporarily_unavailable", "Too many connected apps. Disconnect one in ReelForge Settings, then try again.", 429);
+      const [dropped] = this.#state.clients.splice(idle, 1);
+      this.#state.tokens = this.#state.tokens.filter((t) => t.clientId !== dropped!.clientId);
     }
+    this.#state.clients.push(client);
     this.#save();
     return { ...client, tokenEndpointAuthMethod: "none" };
   }

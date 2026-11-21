@@ -108,7 +108,8 @@ function phone(url: string, creds: PairPayload) {
   };
   const enqueue = (id: string, projectId: string, body: Record<string, unknown>, ttl = 3600_000) => {
     const createdAt = Date.now();
-    const c = seal(key, { id, projectId, type: "ai.ask", ...body }, `queue:${id}`);
+    // The phone seals the times; a test may pass different sealed times in body.
+    const c = seal(key, { id, projectId, type: "ai.ask", createdAt, expiresAt: createdAt + ttl, ...body }, `queue:${id}`);
     return fetch(`${url}/api/queue`, { method: "POST", headers: auth, body: JSON.stringify({ id, projectId, createdAt, expiresAt: createdAt + ttl, c }) });
   };
   return {
@@ -310,7 +311,7 @@ test("queue: instructions wait on the relay while the Mac is away, run once, can
   const list = (await (await fetch(`${url}/api/queue`, { headers: p.auth })).json()) as { items: { id: string; status: string }[] };
   assert.deepEqual(list.items.map((i) => [i.id, i.status]).sort(), [[a, "queued"], [b, "queued"]].sort());
   // Edit a: new sealed text under the same id.
-  const edited = seal(p.key, { id: a, projectId: project.id, type: "ai.ask", instruction: "tighten the intro to 3s", provider: "ollama", model: "q", baseRevision: rev }, `queue:${a}`);
+  const edited = seal(p.key, { id: a, projectId: project.id, type: "ai.ask", createdAt: Date.now(), expiresAt: Date.now() + 3600_000, instruction: "tighten the intro to 3s", provider: "ollama", model: "q", baseRevision: rev }, `queue:${a}`);
   assert.equal((await fetch(`${url}/api/queue/${a}`, { method: "PUT", headers: p.auth, body: JSON.stringify({ c: edited }) })).status, 200);
   assert.equal((await fetch(`${url}/api/queue/${b}`, { method: "DELETE", headers: p.auth })).status, 200);
 
@@ -336,6 +337,17 @@ test("queue: instructions wait on the relay while the Mac is away, run once, can
   const held = await until("needs review", () => p.events.find((e) => e.t === "queue" && e.id === c));
   assert.equal(held.state, "needs_review");
   assert.equal(held.currentRevision, new ProjectStore(db).get(project.id).revision);
+  assert.equal(asked.length, 1);
+
+  // The relay can rewrite the envelope's expiry, but the Mac reads only the sealed one: an
+  // instruction the phone let expire a day ago stays expired, however fresh the envelope looks.
+  const stale = crypto.randomUUID();
+  await p.enqueue(stale, project.id, { instruction: "revived", provider: "ollama", model: "q", createdAt: Date.now() - 48 * 3600_000, expiresAt: Date.now() - 24 * 3600_000 });
+  assert.equal((await until("stale expired", () => p.events.find((e) => e.t === "queue" && e.id === stale))).state, "expired");
+  // Sealed by an old phone without times: treated as expired too.
+  const untimed = crypto.randomUUID();
+  await p.enqueue(untimed, project.id, { instruction: "untimed", provider: "ollama", model: "q", createdAt: undefined, expiresAt: undefined });
+  assert.equal((await until("untimed expired", () => p.events.find((e) => e.t === "queue" && e.id === untimed))).state, "expired");
   assert.equal(asked.length, 1);
 
   // Expired before the Mac saw it: dropped.

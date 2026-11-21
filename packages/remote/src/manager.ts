@@ -310,7 +310,7 @@ export interface RemoteManagerOptions {
 /** How the phone's decisions are recorded: the engine's actor list has no "phone", the channel says it. */
 const PHONE_ACTOR = "api";
 const PHONE_CHANNEL = "phone-remote:apply";
-const MAX_LISTED_CHANGES = 20;
+const MAX_LISTED_CHANGES = 40;
 const MAX_PROJECTS = 50;
 const MAX_PHONES = 10;
 const MAX_DEVICES = 20;
@@ -1105,7 +1105,12 @@ export class RemoteManager {
   }
 
   applyProposal(proposalId: string): { projectId: string; revision: number } {
-    this.#notEditing(new ProposalStore(this.#opts.db).get(proposalId).projectId);
+    const proposal = new ProposalStore(this.#opts.db).get(proposalId);
+    // The phone lists at most MAX_LISTED_CHANGES; approving there must never cover changes it didn't show.
+    if (proposal.changes.length > MAX_LISTED_CHANGES) {
+      throw new ReelForgeError("VALIDATION_ERROR", `This version has ${proposal.changes.length} changes, more than the phone can show. Review and apply it on your Mac.`);
+    }
+    this.#notEditing(proposal.projectId);
     const r = new ProposalStore(this.#opts.db).apply(proposalId, { by: PHONE_ACTOR, channel: PHONE_CHANNEL });
     return { projectId: r.proposal.projectId, revision: r.timeline.project.revision };
   }
@@ -1710,8 +1715,9 @@ export class RemoteManager {
         if (r.gone) gone.push(sub.endpoint);
         else if (r.status >= 400) this.#opts.log?.(`push service answered HTTP ${r.status}`);
       } catch (e) {
-        if (only) throw e;
         this.#opts.log?.(`couldn't send a notification: ${e instanceof Error ? e.message : e}`);
+        // The phone hears only that it failed, never how: the cause would tell it what listens where.
+        if (only) throw new Error("Couldn't reach the push service. Try turning notifications off and on.");
       }
     }
     if (gone.length) {

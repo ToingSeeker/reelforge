@@ -9,6 +9,7 @@ export { AssetStore } from "./assets.ts";
 export { TimelineStore } from "./timeline.ts";
 export { applyOperations, canPlace, clipEnd, diffStates, type EditState, type TimelineDiff } from "./timeline-ops.ts";
 export { parse } from "./validate.ts";
+export { isPrivateAddress, publicOnlyLookup } from "./net.ts";
 export { JobStore } from "./jobs.ts";
 export * from "./render-plan.ts";
 export { AnalysisStore } from "./analyses.ts";

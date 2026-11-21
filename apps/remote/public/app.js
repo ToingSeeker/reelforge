@@ -1515,6 +1515,7 @@ function reviewScreen(r) {
   if (v.stale) cannot = 'The timeline changed since this version was made, so it can’t be applied. Ask the agent again.';
   else if (v.status === 'rejected') cannot = 'This version was dismissed.';
   else if (v.status === 'applied' && !appliedCurrent) cannot = `The timeline changed after this version was applied (now revision ${p.revision}). Export the latest version instead.`;
+  else if (pending && v.changes > v.list.length) cannot = `This version has ${v.changes} changes, more than fit here. Review and apply it on your Mac.`;
   else if (!isLive()) cannot = 'Approving and exporting run on your Mac, so it needs to be online.';
 
   const res = opts?.resolutions?.find((x) => x.id === exportChoice.resolution) ?? opts?.resolutions?.[0];
@@ -1610,7 +1611,7 @@ function reviewScreen(r) {
 
 /** "Adjust edit": fix the agent's result by hand. A pending version is applied first (with the user's OK). */
 function adjustButton(p, v, pending, appliedCurrent) {
-  const why = !isLive() ? 'Editing needs your Mac online.' : v.stale ? 'This version is out of date.' : v.status === 'rejected' ? 'This version was dismissed.' : !pending && !appliedCurrent ? 'The timeline changed after this version; edit the latest instead.' : null;
+  const why = !isLive() ? 'Editing needs your Mac online.' : v.stale ? 'This version is out of date.' : v.status === 'rejected' ? 'This version was dismissed.' : !pending && !appliedCurrent ? 'The timeline changed after this version; edit the latest instead.' : pending && v.changes > v.list.length ? 'This version has more changes than fit here. Apply it on your Mac.' : null;
   const go2 = () => {
     if (appliedCurrent) return openEditor(p.id, p.revision);
     sheet(

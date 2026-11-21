@@ -84,7 +84,11 @@ export function describeChanges(before: Timeline, diff: TimelineDiff): ProposalC
       x ? [`“${x.name}”`, x.muted && "muted", x.hidden && "hidden", x.locked && "locked", x.captionStyle && `style ${JSON.stringify(x.captionStyle)}`].filter(Boolean).join(", ") : null;
     out.push({ kind: kindOf(ch.before, ch.after), target: "track", id: ch.id, label: `${labels.get(t.id) ?? ""} ${t.name}`.trim(), before: fmt(ch.before), after: fmt(ch.after) });
   }
-  return out;
+  // Approval screens may show only the start of this list, so the changes with the most reach
+  // come first: edits to existing tracks (hide, mute, lock, restyle), then removals, then
+  // changes, then additions. Filler additions can never push a track change out of sight.
+  const rank = (c: ProposalChange) => (c.target === "track" && c.kind !== "added" ? 0 : c.kind === "removed" ? 1 : c.kind === "changed" ? 2 : 3);
+  return out.map((c, i) => ({ c, i })).sort((x, y) => rank(x.c) - rank(y.c) || x.i - y.i).map((x) => x.c);
 }
 
 /**

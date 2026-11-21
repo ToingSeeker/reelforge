@@ -248,12 +248,24 @@ export function createRelay({ authHash, trustProxy = false, maxTracked = MAX_TRA
 
   function openStream(res) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+    // A stream error (a peer that vanished mid-write) must never take the whole relay down.
+    res.on('error', () => {});
     res.write(':ok\n\n');
     // A comment line now and then keeps proxies from closing a quiet connection.
-    const beat = setInterval(() => res.write(':\n\n'), 20_000);
+    const beat = setInterval(() => write(res, ':\n\n'), 20_000);
     res.on('close', () => clearInterval(beat));
   }
-  const send = (res, event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  // Writing to a stream that was ended or cut off is a no-op, not an 'error' event.
+  const write = (res, text) => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(text);
+  };
+  // Cuts a stream off at once. end() would wait for a peer that stopped reading to
+  // drain everything queued to it, and the stream would stay live meanwhile.
+  const cutOff = (res) => {
+    if (!res.destroyed) res.destroy();
+  };
+  const send = (res, event, data) => write(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   const toPhones = (ch, event, data) => {
     for (const phone of ch.phones) send(phone.res, event, data);
   };
@@ -361,7 +373,7 @@ export function createRelay({ authHash, trustProxy = false, maxTracked = MAX_TRA
 
   async function agentRoute(req, res, ch, pathname, searchParams) {
     if (req.method === 'GET' && pathname === '/agent/stream') {
-      ch.agent?.end(); // a newer connection from the Mac replaces the old one
+      if (ch.agent) cutOff(ch.agent); // a newer connection from the Mac replaces the old one
       openStream(res);
       ch.agent = res;
       ch.lastSeen = Date.now();
@@ -392,7 +404,11 @@ export function createRelay({ authHash, trustProxy = false, maxTracked = MAX_TRA
       ch.devices = new Map(list.map((d) => [d.id, d.tokenHash]));
       rebuildDeviceIndex();
       // A revoked phone is cut off now, not at its next request.
-      for (const phone of ch.phones) if (!ch.devices.has(phone.deviceId)) phone.res.end();
+      for (const phone of [...ch.phones]) {
+        if (ch.devices.has(phone.deviceId)) continue;
+        ch.phones.delete(phone);
+        cutOff(phone.res);
+      }
       return json(res, 200, { ok: true, devices: ch.devices.size });
     }
     if (pathname === '/agent/pairing') {
@@ -546,8 +562,15 @@ export function createRelay({ authHash, trustProxy = false, maxTracked = MAX_TRA
     return json(res, 404, { error: 'not found' });
   }
 
-  return http.createServer(async (req, res) => {
-    const { pathname, searchParams } = new URL(req.url, 'http://relay');
+  async function handle(req, res) {
+    let url;
+    try {
+      url = new URL(req.url, 'http://relay');
+    } catch {
+      // Node's HTTP parser accepts some targets ('//a:b/') that the URL parser refuses.
+      return json(res, 400, { error: 'bad request' });
+    }
+    const { pathname, searchParams } = url;
     try {
       if (pathname === '/healthz') return json(res, 200, { ok: true });
       if (pathname.startsWith('/pair/')) return await pair(req, res, pathname, searchParams);
@@ -567,6 +590,18 @@ export function createRelay({ authHash, trustProxy = false, maxTracked = MAX_TRA
     } catch (err) {
       return json(res, 400, { error: err.message });
     }
+  }
+
+  return http.createServer((req, res) => {
+    // Nothing one request does may end the process every Mac and phone shares.
+    handle(req, res).catch(() => {
+      try {
+        if (!res.headersSent) json(res, 500, { error: 'server error' });
+        else cutOff(res);
+      } catch {
+        /* the socket is already gone */
+      }
+    });
   });
 }
 

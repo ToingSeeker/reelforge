@@ -9,6 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { openDatabase } from "@reelforge/core";
 import { startRemoteConnector } from "@reelforge/mcp";
 import { isPrivateAddress } from "../src/remote/fetch.ts";
+import { ConnectorAuth, OAuthError } from "../src/remote/auth.ts";
 import { fixtures } from "../../media/test/fixtures.ts";
 
 const PAIRING = "ABCD2345";
@@ -186,4 +187,39 @@ test("connector: upload → propose → the user approves on the page → render
 test("private address check", () => {
   for (const a of ["127.0.0.1", "10.0.0.5", "192.168.1.1", "172.20.0.1", "169.254.169.254", "::1", "fe80::1", "fd00::1", "::ffff:127.0.0.1", "100.100.1.1", "0.0.0.0"]) assert.equal(isPrivateAddress(a), true, a);
   for (const a of ["8.8.8.8", "1.1.1.1", "2606:4700::1111"]) assert.equal(isPrivateAddress(a), false, a);
+});
+
+test("connector: open registration never evicts an app that finished authorizing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rf-auth-"));
+  try {
+    const auth = new ConnectorAuth(join(dir, "auth.json"));
+    const reg = () => auth.register({ redirect_uris: ["https://attacker.example/cb"], client_name: "x" });
+    const connect = () => {
+      const c = auth.register({ redirect_uris: ["https://claude.ai/cb"], client_name: "Claude" });
+      const verifier = randomBytes(32).toString("base64url");
+      const code = auth.issueCode(c.clientId, "https://claude.ai/cb", createHash("sha256").update(verifier).digest("base64url"));
+      return { id: c.clientId, ...auth.exchange(new URLSearchParams({ grant_type: "authorization_code", client_id: c.clientId, code, code_verifier: verifier })) };
+    };
+    const a = connect();
+    const b = connect();
+    // Fill the table, then keep registering: only never-authorized clients make room.
+    for (let i = 0; i < 48; i++) reg();
+    for (let i = 0; i < 60; i++) reg();
+    assert.ok(auth.verifyAccessToken(a.access_token), "A still connected");
+    assert.ok(auth.verifyAccessToken(b.access_token), "B still connected");
+    assert.ok(auth.exchange(new URLSearchParams({ grant_type: "refresh_token", client_id: b.id, refresh_token: b.refresh_token })).access_token);
+    // A table full of connected apps refuses new registrations instead of dropping one.
+    const full = new ConnectorAuth(join(dir, "full.json"));
+    const keep: string[] = [];
+    for (let i = 0; i < 50; i++) {
+      const c = full.register({ redirect_uris: ["https://claude.ai/cb"] });
+      const verifier = randomBytes(32).toString("base64url");
+      const code = full.issueCode(c.clientId, "https://claude.ai/cb", createHash("sha256").update(verifier).digest("base64url"));
+      keep.push(full.exchange(new URLSearchParams({ grant_type: "authorization_code", client_id: c.clientId, code, code_verifier: verifier })).access_token);
+    }
+    assert.throws(() => full.register({ redirect_uris: ["https://attacker.example/cb"] }), (e: unknown) => e instanceof OAuthError && e.status === 429);
+    assert.ok(keep.every((tok) => full.verifyAccessToken(tok)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

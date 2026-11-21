@@ -575,11 +575,10 @@ export async function startRemoteConnector(opts: RemoteConnectorOptions): Promis
       }
     }
     const project = projects.get(p.projectId).name;
+    // Every change is listed: Apply covers all of them.
     const changes = p.changes
-      .slice(0, 60)
       .map((c) => `<li><span class="k">${esc(c.kind)}</span> ${esc(c.label)}${c.before ? `<div class="b">− ${esc(c.before)}</div>` : ""}${c.after ? `<div class="a">+ ${esc(c.after)}</div>` : ""}</li>`)
       .join("");
-    const more = p.changes.length > 60 ? `<li>…and ${p.changes.length - 60} more</li>` : "";
     const actions =
       p.status === "pending" && p.operations.length
         ? `<form method="post" action="${esc(url.pathname + url.search)}">
@@ -592,7 +591,7 @@ export async function startRemoteConnector(opts: RemoteConnectorOptions): Promis
       <p>Project <strong>${esc(project)}</strong></p>
       <p class="sum">${esc(p.summary)} <span class="hint">(written by the AI)</span></p>
       ${p.warnings.length ? `<ul class="warn">${p.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
-      <ul class="changes">${changes}${more}</ul>
+      <ul class="changes">${changes}</ul>
       ${notice}
       ${actions}`;
     sendHtml(res, 200, page("Review edit", body));

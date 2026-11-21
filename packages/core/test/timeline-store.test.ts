@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { AnalysisStore, AssetStore, JobStore, MIGRATIONS, migrate, openDatabase, ProjectStore, ReelForgeError, TimelineStore } from "../src/index.ts";
+import { AnalysisStore, AssetStore, JobStore, MIGRATIONS, migrate, openDatabase, ProjectStore, ProposalStore, ReelForgeError, TimelineStore } from "../src/index.ts";
 import { fakeMedia, tempDir } from "./helpers.ts";
 
 function setup(t: Parameters<typeof tempDir>[0]) {
@@ -182,4 +182,49 @@ test("delete is refused while a render or an analysis is still working on the pr
   s.db.prepare("UPDATE analyses SET state = 'failed'").run();
   s.projects.delete(s.project.id);
   assert.equal(s.projects.list().length, 0);
+});
+
+test("an id another project already uses fails the edit and leaves both projects untouched", (t) => {
+  const s = setup(t);
+  // Project B, with a clip and a caption whose ids project A's edits will try to reuse.
+  const b = s.projects.create({ name: "Other" }, "cli");
+  const bMedia = fakeMedia(s.dir, "B.mp4");
+  const { asset: bAsset } = s.assets.add(b.id, bMedia.file, bMedia.probe, "cli");
+  const bTracks = s.timeline.get(b.id).tracks;
+  const bVideo = bTracks.find((x) => x.kind === "video")!;
+  const bCaps = bTracks.find((x) => x.kind === "caption")!;
+  const clipId = "11111111-1111-4111-8111-111111111111";
+  const captionId = "22222222-2222-4222-8222-222222222222";
+  const bRev = s.timeline.get(b.id).project.revision;
+  s.timeline.apply(b.id, { baseRevision: bRev, operations: [
+    { type: "clip.add", clipId, trackId: bVideo.id, assetId: bAsset.id, start: 0, duration: 60 },
+    { type: "caption.add", captionId, trackId: bCaps.id, start: 0, duration: 30, text: "B's line" },
+  ] }, "cli");
+  const before = s.timeline.get(b.id);
+  const aCaps = s.timeline.get(s.project.id).tracks.find((x) => x.kind === "caption")!;
+  const aRev = s.timeline.get(s.project.id).project.revision;
+  for (const op of [
+    { type: "clip.add", clipId, trackId: s.video.id, assetId: s.asset.id, start: 500, duration: 40 },
+    { type: "caption.add", captionId, trackId: aCaps.id, start: 0, duration: 30, text: "INJECTED" },
+  ] as const) {
+    assert.equal(code(() => s.timeline.apply(s.project.id, { baseRevision: aRev, operations: [op] }, "cli")), "VALIDATION_ERROR", op.type);
+  }
+  assert.deepEqual(s.timeline.get(b.id), before, "B unchanged");
+  assert.equal(s.timeline.get(s.project.id).project.revision, aRev, "A unchanged");
+  assert.equal(s.timeline.get(s.project.id).clips.length, 0);
+});
+
+test("proposal changes list track hide/mute first, so filler additions can't push them past a cut-off list", (t) => {
+  const s = setup(t);
+  const tracks = s.timeline.get(s.project.id).tracks;
+  const caps = tracks.find((x) => x.kind === "caption")!;
+  const voice = tracks.find((x) => x.name === "Voice")!;
+  const filler = Array.from({ length: 14 }, (_, i) => ({ type: "caption.add" as const, trackId: caps.id, start: i * 30, duration: 30, text: `line ${i}` }));
+  const p = new ProposalStore(s.db).create(s.project.id, {
+    instruction: "x", requestedBy: "mcp", selection: [], provider: "mcp", model: "client", summary: "adds captions", explanations: [], warnings: [],
+    operations: [...filler.slice(0, 7), { type: "track.update", trackId: s.video.id, hidden: true }, { type: "track.update", trackId: voice.id, muted: true }, ...filler.slice(7)],
+  });
+  assert.equal(p.changes.length, 16);
+  assert.deepEqual(p.changes.slice(0, 2).map((c) => c.target), ["track", "track"]);
+  assert.ok(p.changes.slice(2).every((c) => c.target === "caption" && c.kind === "added"));
 });
