@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, ProposalStore, TimelineStore, WorkflowRunStore } from "@reelforge/core";
-import { globImportSteps, parseWorkflow, runWorkflow } from "../src/index.ts";
+import { globImportSteps, parseWorkflow, quoteUntrusted, runWorkflow } from "../src/index.ts";
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-wf-")));
 process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
@@ -205,3 +205,16 @@ test("a glob stops past the import limit, and failures are listed by name only u
   assert.equal((failed.error!.match(/f\d+\.mp4:/g) ?? []).length, 10);
 });
 
+
+test("quoteUntrusted leaves no live Markdown or HTML in an approval prompt", () => {
+  const hostile = "clip <!-- hide --> ![x](http://198.51.100.1/w.png) **safe** `code` [link](http://x) my_clip.mp4 \\";
+  const q = quoteUntrusted(hostile, 200);
+  assert.doesNotMatch(q, /[<>]/, "no tag or comment can open");
+  // every Markdown metacharacter is preceded by a backslash
+  for (const m of q.matchAll(/[`*_[\]~&]/g)) assert.equal(q[m.index! - 1], "\\", `unescaped ${m[0]} at ${m.index} in ${q}`);
+  assert.match(q, /my\\_clip\.mp4/);
+  // the cut happens before escaping, so a long text never ends in a dangling backslash
+  const cut = quoteUntrusted("a".repeat(10) + "*".repeat(20), 12);
+  assert.equal(cut, "“aaaaaaaaaa\\*…”");
+  assert.equal(quoteUntrusted("line\nbreak\u202eflip"), "“line break flip”");
+});

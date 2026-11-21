@@ -2,21 +2,48 @@
 //   render.mjs     the render process, bundled (core + zod inlined; @remotion/renderer external)
 //   bundle/        the compositions, prebuilt by @remotion/bundler, so the app ships no webpack
 //   node_modules/  @remotion/renderer and its runtime deps, incl. the native compositor
-//   chrome/        Chrome Headless Shell (SHA-256 verified), which Remotion drives to draw frames
+//   chrome/        Chrome Headless Shell (every file SHA-256 verified), which Remotion drives to draw frames
 // Then renders one frame-short graphic with the shipped Node to prove the layout works.
 // Usage: node scripts/release/build-motion.mjs <engine dir> [<node binary>]   (build-engine.mjs calls it)
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { arch } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Chrome Headless Shell that @remotion/renderer 4.0.539 downloads (157.0.8080.0-remotion-v3).
-// The hash is of the executable itself: Remotion fetches and unzips it, we verify the result.
-const CHROME_SHA256 = { arm64: "a6516527d27e69244beafc04f347fc90ef363c23598b951ae05fc96c999b7f54" };
+// Remotion fetches and unzips it with no checksum, so we verify the whole unpacked tree, not just the
+// executable: the dylibs, helpers and loader manifests next to it are native code the app ships and loads.
+// The digest is chromeTreeDigest() of the folder; recorded 2026-11-21 from two independent downloads that
+// matched (4559 files; the executable alone is a6516527d27e69244beafc04f347fc90ef363c23598b951ae05fc96c999b7f54).
+const CHROME_TREE_SHA256 = { arm64: "c735c56eda668cf684ff8989a2c1f7a0c2a465bbdaaf63f42089ba54c09b682f" };
+
+/** Finder litter, never part of the download and never shipped. */
+const isLitter = (name) => name === ".DS_Store";
+
+/**
+ * SHA-256 over every file in the tree: one "path NUL x|- NUL sha256(content)" line per file, sorted. Any
+ * added, removed, renamed or changed file, or a changed executable bit, changes it. Symlinks are refused.
+ */
+export function chromeTreeDigest(root) {
+  const lines = [];
+  const walk = (dir) => {
+    for (const name of readdirSync(dir).sort()) {
+      if (isLitter(name)) continue;
+      const p = join(dir, name);
+      const st = lstatSync(p);
+      if (st.isSymbolicLink()) throw new Error(`unexpected symlink in Chrome Headless Shell: ${relative(root, p)}`);
+      if (st.isDirectory()) walk(p);
+      else lines.push(`${relative(root, p)}\0${st.mode & 0o111 ? "x" : "-"}\0${createHash("sha256").update(readFileSync(p)).digest("hex")}`);
+    }
+  };
+  walk(root);
+  lines.sort();
+  return { files: lines.length, sha256: createHash("sha256").update(lines.join("\n")).digest("hex") };
+}
 
 export async function buildMotion(root, engineOut, nodeBin = process.execPath) {
   const pkgDir = join(root, "packages/motion");
@@ -56,7 +83,7 @@ export async function buildMotion(root, engineOut, nodeBin = process.execPath) {
   rmSync(join(out, "node_modules/.bin"), { recursive: true, force: true });
 
   // 4. Chrome Headless Shell, downloaded once per Remotion version into the release cache.
-  if (!CHROME_SHA256[a]) throw new Error(`no pinned Chrome checksum for ${a}`);
+  if (!CHROME_TREE_SHA256[a]) throw new Error(`no pinned Chrome checksum for ${a}`);
   const chromeCache = join(cache, "chrome");
   if (!existsSync(join(chromeCache, "chrome-headless-shell"))) {
     rmSync(cache, { recursive: true, force: true });
@@ -65,12 +92,12 @@ export async function buildMotion(root, engineOut, nodeBin = process.execPath) {
     cpSync(join(out, `node_modules/.remotion/chrome-headless-shell/mac-${a}/chrome-headless-shell-mac-${a}`), chromeCache, { recursive: true });
     rmSync(join(out, "node_modules/.remotion"), { recursive: true, force: true });
   }
-  const sha = createHash("sha256").update(readFileSync(join(chromeCache, "chrome-headless-shell"))).digest("hex");
-  if (sha !== CHROME_SHA256[a]) {
+  const tree = chromeTreeDigest(chromeCache);
+  if (tree.sha256 !== CHROME_TREE_SHA256[a]) {
     rmSync(cache, { recursive: true, force: true });
-    throw new Error(`Chrome Headless Shell checksum mismatch: ${sha}`);
+    throw new Error(`Chrome Headless Shell checksum mismatch (${tree.files} files): ${tree.sha256}`);
   }
-  cpSync(chromeCache, join(out, "chrome"), { recursive: true });
+  cpSync(chromeCache, join(out, "chrome"), { recursive: true, filter: (src) => !isLitter(basename(src)) });
   // Vulkan's debug validation layer (23 MB) is for GPU driver development; rendering never loads it.
   rmSync(join(out, "chrome/libVkLayer_khronos_validation.dylib"), { force: true });
   chmodSync(join(out, "chrome/chrome-headless-shell"), 0o755);

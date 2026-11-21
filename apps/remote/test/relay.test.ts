@@ -44,6 +44,13 @@ test('relay: a right token always gets in; wrong ones are locked out per address
   await proxied.publish();
   for (let i = 0; i < 12; i++) assert.equal(await attempt(proxied.url, i), 401);
 
+  // Railway's shape: "<caller>, <internal hop>", the hop different every time. The caller is still counted.
+  const railway = await withPhone(t, { trustProxy: true });
+  await railway.publish();
+  const viaRailway = (hop: number) => fetch(`${railway.url}/api/command`, { method: 'POST', headers: { authorization: `Bearer ${'f'.repeat(64)}`, 'x-forwarded-for': `198.51.100.7, 100.64.0.${hop}` }, body: '{}' }).then((r) => r.status);
+  for (let hop = 0; hop < 10; hop++) assert.equal(await viaRailway(hop), 401);
+  assert.equal(await viaRailway(10), 429, 'keyed on the caller, not on the hop that changes per request');
+
   // A full table never drops a live record; addresses that do not fit are counted as one.
   const small = await withPhone(t, { trustProxy: true, maxTracked: 3 });
   await small.publish();

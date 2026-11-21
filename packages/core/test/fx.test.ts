@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AiFxSchema, ClipPropsPatchSchema, FX_CATALOG, FX_NUMERIC_OPTIONS, FX_ENGINE_VERSION, fxBakeSize, fxInfo, planClipFx, sparseClipProps, stableHash } from "../src/index.ts";
+import { AiFxSchema, ClipPropsPatchSchema, FX_CATALOG, FX_NUMERIC_OPTIONS, FX_ENGINE_VERSION, clampFxOpts, fxBakeSize, fxInfo, fxOptionRange, planClipFx, sparseClipProps, stableHash } from "../src/index.ts";
 
 const fps = { num: 30, den: 1 };
 const asset = { id: "a1", sourcePath: "/m/talk.mp4", sizeBytes: 1000, durationFrames: 900, width: 1080, height: 1920 };
@@ -23,6 +23,32 @@ test("the catalogue lists exactly the effects fx.py defines", () => {
   assert.equal(fxInfo("glitter")?.fx, "spotlight");
   assert.equal(fxInfo("/stamp")?.fx, "reject-stamp");
   assert.match(FX_ENGINE_VERSION, /c97d01b/);
+});
+
+test("every numeric option has a range, and fx.py's own default sits inside it", () => {
+  const src = readFileSync(new URL("../../fx-engine/scripts/fx.py", import.meta.url), "utf8");
+  const parts = src.split(/\n@effect\('([^']+)'/);
+  for (let i = 1; i < parts.length; i += 2) {
+    const fx = parts[i]!;
+    for (const k of FX_NUMERIC_OPTIONS[fx] ?? []) {
+      const r = fxOptionRange(fx, k);
+      assert.ok(r && r[0] < r[1], `${fx}.${k} has a range`);
+      const d = parts[i + 1]!.match(new RegExp(`e\\.o\\.get\\('${k}',\\s*'?(-?[0-9.]+)`));
+      if (d) assert.ok(Number(d[1]) >= r![0] && Number(d[1]) <= r![1], `${fx}.${k} default ${d[1]} inside ${r}`);
+    }
+  }
+});
+
+test("out-of-range numeric options are refused on save and clamped in the bake plan", () => {
+  for (const opts of [{ size: 30 }, { count: 1e15 }, { count: 0 }, { speed: 100 }]) {
+    assert.equal(AiFxSchema.safeParse({ fx: "orbit", start: 0, end: 30, opts }).success, false, JSON.stringify(opts));
+  }
+  assert.equal(AiFxSchema.safeParse({ fx: "headline-wall", start: 0, end: 30, opts: { count: 1e12 } }).success, false);
+  assert.equal(AiFxSchema.safeParse({ fx: "lean-in", start: 0, end: 30, opts: { speed: 0 } }).success, false);
+  assert.ok(AiFxSchema.safeParse({ fx: "orbit", start: 0, end: 30, opts: { size: 0.3, count: 8 } }).success);
+  assert.ok(AiFxSchema.safeParse({ fx: "profile-wall", start: 0, end: 30, opts: { count: 197000 } }).success);
+  // a text option is not touched by the range check
+  assert.deepEqual(clampFxOpts("orbit", { size: 30, count: 1e15, speed: 1.9, label: "x" }), { size: 1, count: 60, speed: 1.9, label: "x" });
 });
 
 test("AI effects validate: known effect, end after start, no reserved or unbounded options", () => {

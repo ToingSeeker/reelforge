@@ -4,6 +4,7 @@
 // purely from the timeline, which stretches need baking and under what cache
 // key, so the engine, the compiler and the preview all agree on it.
 
+import { clampFxOpts } from "./fx-catalog.ts";
 import type { AiFx, Asset } from "./schema.ts";
 import type { Rational } from "./timebase.ts";
 
@@ -107,7 +108,7 @@ export function planClipFx(
         ...(e.text !== undefined ? { text: e.text } : {}),
         ...(e.color !== undefined ? { color: e.color } : {}),
         ...(e.images?.length ? { images: e.images.map(mediaPath).filter((x): x is string => !!x) } : {}),
-        ...(e.opts && Object.keys(e.opts).length ? { opts: e.opts } : {}),
+        ...(e.opts && Object.keys(e.opts).length ? { opts: clampFxOpts(e.fx, e.opts) } : {}),
       }));
     const body = { assetId: asset.id, sourcePath: asset.sourcePath, sourceFrom: srcFrom, sourceTo: srcTo, fps, shortSide, ...fxBakeSize(asset.width, asset.height, shortSide), effects };
     const key = stableHash(JSON.stringify({ v: FX_ENGINE_VERSION, size: asset.sizeBytes, ...body }));

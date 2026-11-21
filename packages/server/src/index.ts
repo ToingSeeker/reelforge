@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { createReadStream, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import {
@@ -167,6 +167,11 @@ function send(res: ServerResponse, status: number, body: unknown) {
 
 function sendError(res: ServerResponse, err: ReelForgeError) {
   send(res, STATUS[err.code], { error: err.toJSON() });
+}
+
+/** HMAC-SHA256(token, "reelforge-engine-proof:" + nonce) as lowercase hex: the engine's answer to /v1/engine/proof. */
+export function engineProof(token: string, nonce: string): string {
+  return createHmac("sha256", token).update(`reelforge-engine-proof:${nonce}`).digest("hex");
 }
 
 function sameToken(given: string, token: string): boolean {
@@ -847,6 +852,14 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
 
       if (req.method === "GET" && path === "/v1/health") {
         return send(res, 200, { ok: true, name: "reelforge", api: "v1" });
+      }
+      // Lets a client check it reached the engine that holds its token BEFORE sending the token (or a
+      // Keychain key): a stale engine.json can name a port another local process has taken since.
+      // The proof binds a fresh client nonce, so it can't be replayed, and reveals nothing about the token.
+      if (req.method === "GET" && path === "/v1/engine/proof") {
+        const nonce = url.searchParams.get("nonce") ?? "";
+        if (!/^[0-9a-f]{32,128}$/.test(nonce)) return send(res, 400, { error: { code: "VALIDATION_ERROR", message: "nonce must be 32-128 lowercase hex characters" } });
+        return send(res, 200, { proof: engineProof(opts.token, nonce) });
       }
       // <video>, <audio> and <img> can't send headers, so media GETs may carry the token as ?token=.
       // Only those routes accept it; the access log never records query strings.

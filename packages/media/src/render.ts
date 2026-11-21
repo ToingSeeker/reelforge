@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { chmodSync, closeSync, constants, createReadStream, createWriteStream, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import { AssetStore, JobStore, ReelForgeError, type Database, type JobKind, type RenderJob } from "@reelforge/core";
 import { compileRender, exportSettings, previewSettings } from "./compile.ts";
@@ -41,6 +42,46 @@ function existsNoFollow(path: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** The cache folder renders are written in before publishing: owned by us, mode 0700. */
+function privateRenderDir(cacheDir: string): string {
+  const dir = join(cacheDir, "renders");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  return dir;
+}
+
+/**
+ * Publish a finished render at `final` without ever overwriting or following what is there: a hard link
+ * when the cache and the target share a volume, else a copy into a file we create exclusively
+ * (O_CREAT|O_EXCL|O_NOFOLLOW: an existing file or a planted link makes it fail, never get written through).
+ */
+export async function publishRender(tmp: string, final: string, opts: { copy?: boolean } = {}): Promise<void> {
+  const appeared = () => new ReelForgeError("VALIDATION_ERROR", "a file appeared at the export path during rendering; not overwriting it");
+  if (!opts.copy) {
+    try {
+      linkSync(tmp, final);
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") throw appeared();
+      if (code !== "EXDEV" && code !== "EPERM" && code !== "ENOTSUP") throw e;
+    }
+  }
+  let fd: number;
+  try {
+    fd = openSync(final, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST" || (e as NodeJS.ErrnoException).code === "ELOOP") throw appeared();
+    throw e;
+  }
+  try {
+    await pipeline(createReadStream(tmp), createWriteStream("", { fd, autoClose: true }));
+  } catch (e) {
+    rmSync(final, { force: true });
+    throw e;
   }
 }
 
@@ -197,9 +238,10 @@ export class RenderRunner {
 
       const final = job.kind === "export" ? job.outputPath! : join(this.#cacheDir, "previews", job.projectId, `${jobId}.mp4`);
       mkdirSync(dirname(final), { recursive: true });
-      // Unguessable name, created exclusively before FFmpeg opens it: nothing can be planted there first,
-      // even when exporting into a folder other users can write to.
-      const partial = join(dirname(final), `.${basename(final, ".mp4")}.partial-${randomBytes(12).toString("hex")}.mp4`);
+      // FFmpeg writes into our own 0700 folder in the cache, never into the export folder: FFmpeg opens its
+      // output by name (truncating, following links), and anyone who can delete entries in the export folder
+      // could otherwise swap the partial for a link to one of the user's files before FFmpeg opens it.
+      const partial = join(privateRenderDir(this.#cacheDir), `${jobId}-${randomBytes(12).toString("hex")}.mp4`);
       closeSync(openSync(partial, "wx", 0o600));
       tmp = partial; // only ours to clean up once we created it
 
@@ -224,12 +266,7 @@ export class RenderRunner {
       if (probe.frames !== plan.totalFrames || probe.width !== job.settings.width || probe.height !== job.settings.height) {
         throw new ReelForgeError("INTERNAL", `render verification failed: got ${probe.frames} frames at ${probe.width}×${probe.height}, expected ${plan.totalFrames} at ${job.settings.width}×${job.settings.height}`);
       }
-      try {
-        linkSync(tmp, final); // fails instead of overwriting if something appeared at the target meanwhile
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new ReelForgeError("VALIDATION_ERROR", "a file appeared at the export path during rendering; not overwriting it");
-        throw e;
-      }
+      await publishRender(tmp, final);
       unlinkSync(tmp);
       tmp = null;
       this.#jobs.complete(jobId, { path: final, sizeBytes: statSync(final).size, ...probe });

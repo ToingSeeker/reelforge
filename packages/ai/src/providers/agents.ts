@@ -2,6 +2,8 @@
 // Each uses the sign-in the user already has in that CLI (no API key in ReelForge),
 // runs with no tools in an empty scratch folder, and returns the same JSON a
 // direct API provider would. Context still leaves the machine, so both need consent.
+// "No tools" is enforced by CLI flags, never by asking the model: the prompt carries
+// text from filenames, transcripts and phone instructions.
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -50,11 +52,35 @@ function flatten(req: CompletionRequest): string {
   return req.turns.map((t) => `<${t.role}>\n${t.content}\n</${t.role}>`).join("\n\n") + "\n\nReply to the last <user> message.";
 }
 
-function run(bin: string, args: string[], input: string, cwd: string, signal: AbortSignal | undefined, label: string): Promise<string> {
+/**
+ * Codex settings that take away every tool the agent would otherwise get in `codex exec`. `-s read-only` only
+ * stops writes: without these the model is offered exec_command (shell, which can read any file the user can),
+ * view_image, web_search and more. Checked against codex-cli 0.171.0 by capturing the request it sends: with
+ * these the only tool left is request_user_input, which reads nothing. Settings an older or newer Codex does not
+ * know are ignored with a warning, so the list can name every tool feature.
+ */
+export const CODEX_NO_TOOLS: readonly string[] = [
+  "features.shell_tool=false",
+  "features.unified_exec=false",
+  "features.view_image=false",
+  "features.multi_agent=false",
+  "features.goals=false",
+  "features.apps=false",
+  "features.plugins=false",
+  "features.browser_use=false",
+  "features.computer_use=false",
+  "features.image_generation=false",
+  'web_search="disabled"',
+].flatMap((kv) => ["-c", kv]);
+
+/** What Codex needs from the environment: where it lives, its sign-in, proxies. Nothing else of the engine's. */
+const CODEX_ENV = /^(PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_[A-Z_]+|TERM|CODEX_HOME|OPENAI_API_KEY|OPENAI_BASE_URL|OPENAI_ORG_ID|OPENAI_PROJECT_ID|HTTPS?_PROXY|https?_proxy|ALL_PROXY|NO_PROXY|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS)$/;
+
+function run(bin: string, args: string[], input: string, cwd: string, signal: AbortSignal | undefined, label: string, envFilter?: RegExp): Promise<string> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new ReelForgeError("UNAVAILABLE", `${label} request was cancelled`));
     // Drop variables that would make a nested Claude Code think it runs inside another session.
-    const env = { ...process.env };
+    const env = envFilter ? Object.fromEntries(Object.entries(process.env).filter(([k]) => envFilter.test(k))) : { ...process.env };
     delete env.CLAUDECODE;
     delete env.CLAUDE_CODE_ENTRYPOINT;
     const child = spawn(bin, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -170,6 +196,7 @@ export class CodexProvider implements PlannerProvider {
         "--ignore-user-config",
         "--ignore-rules",
         "-s", "read-only",
+        ...CODEX_NO_TOOLS,
         "-m", req.model,
         "--output-schema", schemaFile,
         "-o", outFile,
@@ -178,7 +205,7 @@ export class CodexProvider implements PlannerProvider {
       ];
       // Codex has no separate system prompt in exec mode, so the instructions lead the message.
       const prompt = `${req.system}\n\nDo not run commands or read files: everything you need is below. Reply with only the JSON object.\n\n${flatten(req)}`;
-      await run(bin, args, prompt, dir, req.signal, "Codex");
+      await run(bin, args, prompt, dir, req.signal, "Codex", CODEX_ENV);
       if (!existsSync(outFile)) throw new ReelForgeError("INTERNAL", "Codex finished without a reply");
       return readFileSync(outFile, "utf8");
     });

@@ -6,7 +6,7 @@
 // the cache under the spec's key.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
@@ -78,26 +78,21 @@ export async function bakeFx(spec: FxBakeSpec, opts: BakeOptions): Promise<strin
       throw new Error(`could not prepare the clip for effects: ${ffmpegReason(e, spec.sourcePath)}`);
     }
 
-    // 2. The engine's plan. Pictures come from project media, linked into a folder per effect.
-    const plan = spec.effects.map((e, i) => {
+    // 2. The engine's plan. Pictures come from project media, each turned into a PNG still by our FFmpeg
+    // (forced demuxer, local files only) so the engine's own parsers (OpenCV, Pillow) never open user media.
+    const plan: Record<string, string | number>[] = [];
+    for (const [i, e] of spec.effects.entries()) {
       const step: Record<string, string | number> = { ...(e.opts ?? {}), fx: e.fx, start: e.start, end: e.end };
       if (e.text !== undefined) step.text = e.text;
       if (e.color !== undefined) step.color = e.color;
       if (e.images?.length) {
         const folder = join(work, `images-${i}`);
         mkdirSync(folder);
-        e.images.forEach((p, k) => {
-          const link = join(folder, `${String(k).padStart(3, "0")}${extname(p).toLowerCase()}`);
-          try {
-            symlinkSync(p, link);
-          } catch {
-            copyFileSync(p, link);
-          }
-        });
+        for (const [k, p] of e.images.entries()) await cardStill(p, join(folder, `${String(k).padStart(3, "0")}.png`));
         step.images = folder;
       }
-      return step;
-    });
+      plan.push(step);
+    }
     const planFile = join(work, "plan.json");
     writeFileSync(planFile, JSON.stringify({ effects: plan }));
 
@@ -117,6 +112,27 @@ export async function bakeFx(spec: FxBakeSpec, opts: BakeOptions): Promise<strin
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+/** Longest side of a card picture; the engine draws cards far smaller than this. */
+const CARD_MAX_SIDE = 2048;
+
+/**
+ * One card picture as a PNG still: a frame at 1 s for video (what the engine used to pick itself), falling
+ * back to the first frame for shorter clips. A picture FFmpeg can't read is left out, as the engine did.
+ */
+async function cardStill(src: string, out: string): Promise<void> {
+  const video = [".mp4", ".mov"].includes(extname(src).toLowerCase());
+  const fit = `scale='min(${CARD_MAX_SIDE},iw)':'min(${CARD_MAX_SIDE},ih)':force_original_aspect_ratio=decrease`;
+  for (const seek of video ? [["-ss", "1"], []] : [[]]) {
+    try {
+      await run(ffmpegBin(), ["-hide_banner", "-nostdin", "-loglevel", "error", "-y", ...sourceInputArgs(src, seek), "-frames:v", "1", "-vf", fit, "-c:v", "png", "-f", "image2", out], { timeoutMs: 60_000 });
+      if (existsSync(out) && statSync(out).size > 0) return;
+    } catch {
+      // try the next seek, or leave the picture out
+    }
+  }
+  rmSync(out, { force: true });
 }
 
 /**

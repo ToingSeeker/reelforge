@@ -273,7 +273,8 @@ test("workflows_run: glob imports need approval and never list non-media entries
     const project = (await call("projects_create", { name: "G2" })).data.project;
     assert.equal((await call("workflows_run", { workflow: globWorkflow(project.id) })).data.status, "not_approved");
     assert.match(asked[0]!, /Searches your files for media/);
-    assert.ok(asked[0]!.includes(`${tree}/**`));
+    // shown with Markdown metacharacters escaped (quoteUntrusted), so a pattern can't turn into formatting
+    assert.ok(asked[0]!.includes(`${tree}/**`.replace(/[\\`*_[\]~&]/g, "\\$&")), asked[0]!);
     answer = "accept";
     const ran = (await call("workflows_run", { workflow: globWorkflow(project.id) })).data;
     // Nothing in the tree is media: the run fails, naming the pattern only.

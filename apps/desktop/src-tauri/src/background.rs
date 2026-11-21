@@ -62,12 +62,59 @@ pub fn parse_engine_file(text: &str) -> Option<EngineFile> {
     (f.background && f.token.len() >= 32 && port_of(&f.url).is_some()).then_some(f)
 }
 
-/// A background engine that answers with its token (so it really is ours, not whatever took the port).
+/// The background engine named by engine.json, if it really is ours: it must first prove it holds the
+/// file's token (`proves`), and only then is the token sent. engine.json outlives a crashed engine, and its
+/// port is free for any local process to take; that process must get neither the token nor a Keychain key.
 pub fn running_engine() -> Option<EngineFile> {
     let text = std::fs::read_to_string(reelforge_home().join("engine.json")).ok()?;
-    let f = parse_engine_file(&text)?;
+    probe(parse_engine_file(&text)?)
+}
+
+fn probe(f: EngineFile) -> Option<EngineFile> {
+    if !proves(&f.url, &f.token) {
+        return None;
+    }
     let (status, _) = http(&f.url, "GET", "/v1/engine", Some(&f.token), None).ok()?;
     (status == 200).then_some(f)
+}
+
+/// Asks whatever listens at `url` for HMAC-SHA256(token, "reelforge-engine-proof:" + nonce) over a fresh
+/// random nonce, sending no secret. Only the engine that holds `token` can answer it.
+pub fn proves(url: &str, token: &str) -> bool {
+    let Some(nonce) = random_hex(16) else { return false };
+    let Ok((200, body)) = http(url, "GET", &format!("/v1/engine/proof?nonce={nonce}"), None, None) else { return false };
+    let Some(given) = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| v.get("proof")?.as_str().map(str::to_owned)) else { return false };
+    let want = engine_proof(token, &nonce);
+    // Same length, every byte compared: no early exit on the first difference.
+    given.len() == want.len() && given.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+/// The proof the engine computes (packages/server engineProof), as lowercase hex.
+pub fn engine_proof(token: &str, nonce: &str) -> String {
+    hex(&hmac_sha256(token.as_bytes(), format!("reelforge-engine-proof:{nonce}").as_bytes()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn random_hex(n: usize) -> Option<String> {
+    let mut buf = vec![0u8; n];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).ok()?;
+    Some(hex(&buf))
+}
+
+// HMAC from CommonCrypto, part of macOS's libSystem: no crypto crate needed.
+const K_CC_HMAC_ALG_SHA256: u32 = 2;
+extern "C" {
+    fn CCHmac(algorithm: u32, key: *const u8, key_length: usize, data: *const u8, data_length: usize, mac_out: *mut u8);
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    // SAFETY: pointers and lengths come from live slices; CCHmac writes exactly 32 bytes for SHA-256.
+    unsafe { CCHmac(K_CC_HMAC_ALG_SHA256, key.as_ptr(), key.len(), data.as_ptr(), data.len(), out.as_mut_ptr()) };
+    out
 }
 
 pub fn wait_for_engine(timeout: Duration) -> Option<EngineFile> {
@@ -283,5 +330,63 @@ mod tests {
         let chunked = b"HTTP/1.1 202 Accepted\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n2\r\n1}\r\n0\r\n\r\n";
         assert_eq!(parse_response(chunked).unwrap(), (202, "{\"a\":1}".to_string()));
         assert!(parse_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn proof_matches_the_engine() {
+        // Same vector as packages/server/test/server.test.ts.
+        assert_eq!(engine_proof(&"t".repeat(48), &"0123456789abcdef".repeat(2)), "83c6871b5a83307ece2133512764426463758c7d191278f4d9e1310654f8a64f");
+        assert_eq!(random_hex(16).unwrap().len(), 32);
+        assert_ne!(random_hex(16), random_hex(16));
+    }
+
+    /// A listener that answers 200 to everything and records what it was sent.
+    fn impostor(answer: impl Fn(&str) -> String + Send + 'static) -> (String, std::sync::mpsc::Receiver<String>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut buf = [0u8; 4096];
+                let n = c.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = answer(&req);
+                let _ = tx.send(req);
+                let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        (url, rx)
+    }
+
+    #[test]
+    fn a_process_on_a_stale_port_gets_no_token() {
+        let token = "0".repeat(32);
+        let (url, rx) = impostor(|_| "{}".into());
+        let f = EngineFile { pid: 1, url: url.clone(), token: token.clone(), background: true };
+        assert!(probe(f).is_none(), "a listener that can't prove the token is not our engine");
+        let seen: Vec<String> = rx.try_iter().collect();
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|r| !r.contains(&token) && !r.to_ascii_lowercase().contains("authorization")), "{seen:?}");
+        // A wrong proof is refused the same way.
+        let (url, _rx) = impostor(|_| r#"{"proof":"00"}"#.into());
+        assert!(!proves(&url, &token));
+    }
+
+    #[test]
+    fn the_engine_that_holds_the_token_is_accepted() {
+        let token = "k".repeat(40);
+        let t = token.clone();
+        let (url, rx) = impostor(move |req| {
+            match req.split_once("nonce=").map(|(_, r)| r.split(' ').next().unwrap_or("").to_string()) {
+                Some(n) => format!(r#"{{"proof":"{}"}}"#, engine_proof(&t, &n)),
+                None => "{}".into(),
+            }
+        });
+        let f = EngineFile { pid: 1, url, token: token.clone(), background: true };
+        assert!(probe(f).is_some());
+        let seen: Vec<String> = rx.try_iter().collect();
+        assert!(!seen[0].contains(&token), "the token is only sent after the proof");
+        assert!(seen[1].contains(&format!("Bearer {token}")));
     }
 }

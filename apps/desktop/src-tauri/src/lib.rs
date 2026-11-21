@@ -96,6 +96,12 @@ impl Engine {
     /// One request to whichever engine is current.
     fn call(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), String> {
         let info = self.info().ok_or("the engine isn't running")?;
+        // A background engine can die and its port be taken by another process: re-check before every
+        // request that the listener is still the engine holding this token, so the token (and any key we
+        // push) never goes to it.
+        if self.attached.load(Ordering::SeqCst) && !background::proves(&info.url, &info.token) {
+            return Err("the background engine is no longer at its address".into());
+        }
         background::http(&info.url, method, path, Some(&info.token), body)
     }
 }

@@ -34,6 +34,18 @@ function call(srv: RunningServer, method: string, path: string, opts: { body?: u
   });
 }
 
+test("the engine proves it holds the token without anyone sending it", async (t) => {
+  const srv = await boot(t);
+  const nonce = "0123456789abcdef".repeat(2);
+  const res = await call(srv, "GET", `/v1/engine/proof?nonce=${nonce}`, { auth: false });
+  assert.equal(res.status, 200);
+  // Same vector as the desktop shell's Rust test (background.rs): both sides must compute the same proof.
+  assert.deepEqual(await res.json(), { proof: "83c6871b5a83307ece2133512764426463758c7d191278f4d9e1310654f8a64f" });
+  for (const bad of ["", "abc", "Z".repeat(32), "0".repeat(130)]) {
+    assert.equal((await call(srv, "GET", `/v1/engine/proof?nonce=${bad}`, { auth: false })).status, 400, bad);
+  }
+});
+
 test("health is public, everything else needs the token", async (t) => {
   const srv = await boot(t);
   assert.equal((await call(srv, "GET", "/v1/health", { auth: false })).status, 200);

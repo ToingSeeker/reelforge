@@ -82,12 +82,16 @@ export function parseWorkflow(input: unknown): WorkflowSpec {
 const stepKind = (s: WorkflowStep) => Object.keys(s)[0]!;
 
 /**
- * Text from an untrusted author (an AI client) made safe to show inside an approval prompt: no control
- * characters or line breaks (which could fake prompt lines), whitespace collapsed, length capped.
+ * Text from an untrusted author (an AI client, a media filename, a transcript) made safe to show inside an
+ * approval prompt: no control characters or line breaks (which could fake prompt lines), whitespace
+ * collapsed, length capped, and no live markup. Clients may render the prompt as Markdown or HTML, so `<`/`>`
+ * become ‹ › (no tags, no `<!--` hiding the lines after it) and Markdown metacharacters are backslash-escaped
+ * (no links or images: `[` is escaped, so `](…)` never closes one; no emphasis, strikethrough, code spans or entities). Escaping runs after the cut, so it never leaves half an escape.
  */
 export function quoteUntrusted(text: unknown, max = 80): string {
   const flat = String(text ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069]+/g, " ").replace(/\s+/g, " ").trim();
-  return `“${flat.length > max ? `${flat.slice(0, max - 1)}…` : flat}”`;
+  const cut = flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+  return `“${cut.replace(/</g, "‹").replace(/>/g, "›").replace(/[\\`*_[\]~&]/g, "\\$&")}”`;
 }
 
 /** What a timeline-changing step will do, in words a person can check before approving. */
