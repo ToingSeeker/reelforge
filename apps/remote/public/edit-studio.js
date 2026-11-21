@@ -5,6 +5,7 @@
 // checked by the same rules, and never written behind the phone's back.
 import * as core from './core.js';
 import * as M from './edit-model.js';
+import { completeSlash, isSlashCommand, slashSuggestions } from './slash.js';
 import { button, h, icon, iconButton } from './ui.js';
 
 const { live } = core;
@@ -44,9 +45,9 @@ export async function studioInfo(ed) {
   const macId = core.activePairing()?.macId;
   const hit = infoCache.get(macId);
   if (hit && Date.now() - hit.at < 5 * 60_000) return hit.info;
-  if (ed.studioLoading) return hit?.info ?? null;
-  ed.studioLoading = true;
-  try {
+  // One request at a time; whoever asks meanwhile waits for the same answer.
+  if (ed.studioLoading) return ed.studioLoading;
+  ed.studioLoading = (async () => {
     const r = await core.command('studio.info', {}, { timeout: 15_000 });
     if (r?.t !== 'studio') {
       ed.studioError = /Unknown command/.test(r?.message ?? '') ? 'update ReelForge on your Mac to use this from the phone' : (r?.message ?? 'Your Mac didn’t answer.');
@@ -55,9 +56,10 @@ export async function studioInfo(ed) {
     ed.studioError = null;
     infoCache.set(macId, { at: Date.now(), info: r });
     return r;
-  } finally {
-    ed.studioLoading = false;
-  }
+  })().finally(() => {
+    ed.studioLoading = null;
+  });
+  return ed.studioLoading;
 }
 function info(ed) {
   const i = infoCache.get(core.activePairing()?.macId)?.info ?? null;
@@ -679,31 +681,143 @@ async function renderTemplate(ed, t, props, seconds) {
 }
 
 // ── AI Director ─────────────────────────────────────────────────────────────
+// Typing "/" turns the box into slash commands (the desktop's: /bw, /noir, /zoom in, /fx spotlight, chains
+// with ";"). They edit the selected clip at once, as one undo step of this session, and need no AI model.
 export function directorPanel(ed, v) {
   const p = ed.project();
-  const area = h('textarea', { class: 'ed-text', rows: 3, placeholder: 'Tell the agent what to change…', 'aria-label': 'Instruction for the agent', enterkeyhint: 'send', autocapitalize: 'sentences' });
+  const st = (ed.slashState ??= { error: null, busy: false });
+  const area = h('textarea', { class: 'ed-text', rows: 3, placeholder: 'Tell the agent what to change, or type / for commands…', 'aria-label': 'Instruction for the agent, or a slash command', enterkeyhint: 'send', autocapitalize: 'sentences', autocomplete: 'off' });
   area.value = ed.askDraft ?? '';
-  area.addEventListener('input', () => (ed.askDraft = area.value));
-  const send = () => {
+  const slashList = h('ul', { class: 'slash-list', role: 'listbox', 'aria-label': 'Slash commands' });
+  const err = h('p', { class: 'ed-hint warn', role: 'alert' });
+  const sendBtn = h('div', { class: 'slash-send' });
+  const c = ed.selectedClip(v);
+  const target = h('p', { class: 'ed-hint' });
+  const paint = () => {
+    const text = area.value;
+    const slash = isSlashCommand(text);
+    area.setAttribute('autocapitalize', slash ? 'none' : 'sentences');
+    const items = slash ? slashSuggestions(info(ed)?.slash, text) : [];
+    slashList.hidden = !items.length;
+    slashList.replaceChildren(
+      ...items.map((s) =>
+        h(
+          'li',
+          {},
+          h('button', { class: 'slash-item', type: 'button', role: 'option', onclick: () => {
+            area.value = completeSlash(area.value, s);
+            ed.askDraft = area.value;
+            st.error = null;
+            paint();
+            area.focus();
+          } }, h('b', { class: 'slash-usage', text: s.usage }), h('span', { class: 'slash-hint', text: s.hint })),
+        ),
+      ),
+    );
+    err.hidden = !st.error;
+    err.textContent = st.error ?? '';
+    target.hidden = !slash;
+    target.textContent = c ? `Applies to the selected clip (${M.assetOf(v, c.assetId)?.filename ?? 'clip'}) right away, as one Undo step. No AI model.` : 'Select a clip in the timeline first: commands change the selected clip.';
+    if (slash && !info(ed)?.slash) target.textContent += ed.studioError ? ` Command list: ${ed.studioError}.` : '';
+    sendBtn.replaceChildren(
+      slash
+        ? button(st.busy ? 'Working it out on your Mac…' : 'Run command', { kind: 'mint', iconName: 'spark', full: true, disabled: st.busy || !ed.live || !c || !text.trim(), onclick: run })
+        : button(ed.live ? 'Send to the agent' : 'Queue for the agent', { kind: 'mint', iconName: 'send', full: true, disabled: ed.phase === 'ending', onclick: run }),
+    );
+  };
+  const run = () => {
     const text = area.value.trim();
     if (!text) return area.focus();
+    if (isSlashCommand(text)) {
+      // The panel isn't rebuilt while the box has focus, so this one clears itself.
+      const done = runSlash(ed, text).then((ok) => {
+        if (ok) area.value = '';
+        paint();
+      });
+      paint();
+      return void done;
+    }
     void ed.askAgent(text);
   };
+  area.addEventListener('input', () => {
+    ed.askDraft = area.value;
+    st.error = null;
+    paint();
+  });
+  area.addEventListener('keydown', (e) => {
+    // Enter runs a command (a one-liner); an instruction for the agent keeps Enter for new lines.
+    if (e.key === 'Enter' && !e.shiftKey && isSlashCommand(area.value)) {
+      e.preventDefault();
+      run();
+    }
+  });
   const suggestions = ['Tighten the pacing and cut the pauses', 'Add captions for the speech', 'Make it punchier for Reels', 'Add a title card at the start'];
+  const quick = ['/cinematic', '/noir', '/vintage', '/zoom in', '/fade'];
   const pending = p?.pendingProposals ?? 0;
+  paint();
+  // The panel isn't rebuilt while the box has focus, so it fills in the command list itself once it arrives.
+  if (!info(ed)?.slash && ed.live) void studioInfo(ed).then(() => !ed.disposed && paint());
   return [
     h('div', { class: 'ed-head' }, h('h2', { class: 'ed-h', text: 'AI Director' }), h('span', { class: 'ed-meta', text: ed.modelLabel?.() ?? '' })),
     h('p', { class: 'ed-hint', text: 'The agent plans changes on your Mac and proposes them as a new version; nothing changes until you apply it. Sending ends this hand-editing session (your edits are saved first) and opens the conversation.' }),
     area,
+    slashList,
+    err,
+    target,
     h('div', { class: 'suggest' }, suggestions.map((s) => h('button', { class: 'chip', type: 'button', onclick: () => {
-      area.value = area.value.trim() ? `${area.value.trim()}\n${s}` : s;
+      area.value = area.value.trim() && !isSlashCommand(area.value) ? `${area.value.trim()}\n${s}` : s;
       ed.askDraft = area.value;
+      st.error = null;
+      paint();
       area.focus();
     } }, s))),
-    button(ed.live ? 'Send to the agent' : 'Queue for the agent', { kind: 'mint', iconName: 'send', full: true, disabled: ed.phase === 'ending', onclick: send }),
+    h('div', { class: 'suggest' }, quick.map((q) => h('button', { class: 'chip mono', type: 'button', 'aria-label': `Command ${q}`, onclick: () => {
+      area.value = q;
+      ed.askDraft = q;
+      st.error = null;
+      paint();
+      area.focus();
+    } }, q))),
+    sendBtn,
     pending ? button(`Review ${pending} waiting version${pending === 1 ? '' : 's'}`, { iconName: 'history', full: true, small: true, onclick: () => void ed.leaveTo(`#/session/${ed.projectId}`) }) : null,
     v.captions.length === 0 ? h('p', { class: 'ed-hint', text: 'Tip: captions from speech are quicker in Captions → Generate; the agent is for edits that need judgement.' }) : null,
   ];
+}
+
+/**
+ * Runs a slash command: everything queued reaches the Mac first, the Mac works the command out on that exact
+ * timeline (core slash.ts, the desktop's code), and the edit comes back through this session's queue.
+ */
+export async function runSlash(ed, text) {
+  const st = (ed.slashState ??= { error: null, busy: false });
+  const fail = (msg) => {
+    st.error = msg;
+    st.busy = false;
+    return false;
+  };
+  if (st.busy) return false;
+  if (!ed.editable()) return fail('Not editing right now.');
+  if (!ed.live) return fail('Commands are worked out on your Mac, so it needs to be online.');
+  const clipId = ed.sel.clipId;
+  if (!clipId) return fail('Select a clip on the timeline first.');
+  st.busy = true;
+  st.error = null;
+  if (!(await ed.settle())) return fail('Your edits haven’t all reached the Mac yet. Try again once they’re saved.');
+  const playhead = Math.max(0, Math.round(ed.playhead));
+  const r = await core.command('slash.plan', { projectId: ed.projectId, text, clipIds: [clipId], playhead }, { timeout: 15_000 });
+  if (ed.disposed) return false;
+  if (!r || r.timeout) return fail('Your Mac didn’t answer. Try again.');
+  if (r.t !== 'slash') return fail(/Unknown command/.test(r.message ?? '') ? 'Update ReelForge on your Mac to use commands from the phone.' : (r.message ?? 'Your Mac couldn’t run that.'));
+  if (!r.ok) return fail(r.error);
+  // Planned on the Mac's timeline; if that isn't the one shown here any more, the ops may not fit it.
+  if (ed.pending.length || r.revision !== ed.model?.revision) return fail('The timeline changed while that was worked out. Run it again.');
+  st.busy = false;
+  if (!ed.submit(r.ops, r.label)) return fail(`${r.label} couldn’t be applied here.`);
+  ed.askDraft = '';
+  const n = r.ops.length;
+  ed.say(`${r.label} on ${n} clip${n === 1 ? '' : 's'}${r.skipped ? ` (${r.skipped} skipped)` : ''}. Undo takes it back.`);
+  ed.repaint();
+  return true;
 }
 
 // ── Settings ────────────────────────────────────────────────────────────────
