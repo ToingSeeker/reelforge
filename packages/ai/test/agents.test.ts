@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MODEL_OUTPUT_SCHEMA, parseModelOutput, providerFor, strictSchema, stripNulls } from "../src/index.ts";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CODEX_NO_TOOLS, CodexProvider, MODEL_OUTPUT_SCHEMA, parseModelOutput, providerFor, strictSchema, stripNulls } from "../src/index.ts";
 
 type Schema = { type?: unknown; properties?: Record<string, Schema>; required?: string[]; anyOf?: Schema[]; items?: Schema; enum?: unknown[] };
 
@@ -68,6 +71,41 @@ test("consent is per recipient: an old Claude consent does not cover Codex (Open
     assert.equal(providerFor("claude-code").recipient, "anthropic");
     db.close();
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex runs with its tools switched off by flag and without the engine's environment", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rf-codex-stub-"));
+  const saved = { bin: process.env.REELFORGE_CODEX_BIN, secret: process.env.RF_TEST_ENGINE_SECRET, anthropic: process.env.ANTHROPIC_API_KEY };
+  try {
+    // A stand-in `codex`: records its argv and environment, then writes a reply where -o points.
+    const stub = join(dir, "codex");
+    writeFileSync(
+      stub,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > "${dir}/argv"\nenv > "${dir}/env"\nwhile [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then printf '{"summary":"ok","warnings":[],"operations":[]}' > "$2"; fi; shift; done\n`,
+    );
+    chmodSync(stub, 0o755);
+    process.env.REELFORGE_CODEX_BIN = stub;
+    process.env.RF_TEST_ENGINE_SECRET = "engine-only";
+    process.env.ANTHROPIC_API_KEY = "sk-not-for-openai";
+    const res = await new CodexProvider().complete({ model: "gpt-x", system: "plan", turns: [{ role: "user", content: "hi" }], schema: { type: "object" } });
+    assert.match(res.text, /"summary":"ok"/);
+    const argv = readFileSync(join(dir, "argv"), "utf8").trim().split("\n");
+    for (const kv of ["features.shell_tool=false", "features.unified_exec=false", "features.view_image=false", 'web_search="disabled"']) {
+      const i = argv.indexOf(kv);
+      assert.ok(i > 0 && argv[i - 1] === "-c", `missing -c ${kv}`);
+    }
+    assert.deepEqual(argv.filter((a, i) => argv[i - 1] === "-c"), CODEX_NO_TOOLS.filter((a) => a !== "-c"));
+    assert.ok(argv.indexOf("exec") < argv.indexOf("-c"), "settings come after the subcommand");
+    const env = readFileSync(join(dir, "env"), "utf8");
+    assert.doesNotMatch(env, /RF_TEST_ENGINE_SECRET|ANTHROPIC_API_KEY/);
+    assert.match(env, /^HOME=/m);
+  } finally {
+    for (const [k, v] of [["REELFORGE_CODEX_BIN", saved.bin], ["RF_TEST_ENGINE_SECRET", saved.secret], ["ANTHROPIC_API_KEY", saved.anthropic]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });

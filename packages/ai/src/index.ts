@@ -3,7 +3,7 @@ export { MODEL_OUTPUT_SCHEMA, parseModelOutput } from "./output-schema.ts";
 export { SYSTEM_PROMPT, OPERATIONS_GUIDE } from "./prompt.ts";
 export { AnthropicProvider, ANTHROPIC_DEFAULT_MODEL } from "./providers/anthropic.ts";
 export { OllamaProvider, listOllamaModels, ollamaUrl } from "./providers/ollama.ts";
-export { ClaudeCodeProvider, CodexProvider, CLAUDE_CODE_MODELS, claudeBinary, codexBinary, listCodexModels, strictSchema, stripNulls } from "./providers/agents.ts";
+export { ClaudeCodeProvider, CodexProvider, CLAUDE_CODE_MODELS, CODEX_NO_TOOLS, claudeBinary, codexBinary, listCodexModels, strictSchema, stripNulls } from "./providers/agents.ts";
 export { setCredential, getCredential, credentialSource } from "./credentials.ts";
 export type { PlannerProvider, CompletionRequest, CompletionResult, ChatTurn } from "./providers/types.ts";
 

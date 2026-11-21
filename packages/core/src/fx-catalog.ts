@@ -215,6 +215,61 @@ export const FX_NUMERIC_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   ]
 };
 
+/**
+ * Allowed range of every numeric option. fx.py uses these values as loop counts, list lengths, image sizes
+ * and divisors, so an unbounded one (orbit size 30, count 1e15) makes one bake allocate gigabytes and hold the
+ * shared bake worker. Defaults in fx.py sit well inside each range. Per-effect entries override the shared
+ * one (profile-wall's count is a number it displays, not a number of things it draws). A test checks every
+ * key in FX_NUMERIC_OPTIONS has a range.
+ */
+const FX_RANGE_BY_KEY: Readonly<Record<string, readonly [number, number]>> = {
+  count: [1, 60],
+  size: [0.02, 1],
+  speed: [-20, 20],
+  zoom: [0.5, 4],
+  push: [0, 4],
+  label_x: [0, 1],
+  angle: [-360, 360],
+  from: [1, 60],
+  ratio: [0.05, 0.95],
+  spin: [-360, 360],
+  dark: [0, 1],
+  height: [0.05, 1],
+  pick: [0, 1000],
+  cell: [0.005, 0.2],
+  gap: [0, 1],
+  turns: [-20, 20],
+  overlap: [-2, 2],
+  blur: [0, 0.05],
+  lines_y: [0, 1],
+  right_y: [0, 1],
+  y: [0, 1],
+};
+const FX_RANGE_BY_EFFECT: Readonly<Record<string, Readonly<Record<string, readonly [number, number]>>>> = {
+  "profile-wall": { count: [0, 1_000_000_000] },
+  // fx.py divides by it (ease_out(t / speed))
+  "lean-in": { speed: [0.02, 5] },
+};
+
+/** The [min, max] a numeric option must sit in, or undefined when the option is not numeric. */
+export function fxOptionRange(fx: string, key: string): readonly [number, number] | undefined {
+  if (!(FX_NUMERIC_OPTIONS[fx] ?? []).includes(key)) return undefined;
+  return FX_RANGE_BY_EFFECT[fx]?.[key] ?? FX_RANGE_BY_KEY[key];
+}
+
+/**
+ * opts with every numeric option pulled into its range. The schema refuses out-of-range values on save; this
+ * covers effects stored before that check existed, so the engine never gets an unbounded number.
+ */
+export function clampFxOpts(fx: string, opts: Readonly<Record<string, number | string>>): Record<string, number | string> {
+  const out: Record<string, number | string> = { ...opts };
+  for (const [k, v] of Object.entries(out)) {
+    const r = fxOptionRange(fx, k);
+    if (r && typeof v === "number") out[k] = Math.min(r[1], Math.max(r[0], v));
+  }
+  return out;
+}
+
 export function fxInfo(name: string): FxInfo | undefined {
   const n = name.toLowerCase().replace(/^\//, "");
   return FX_CATALOG.find((f) => f.fx === (FX_ALIASES[n] ?? n));

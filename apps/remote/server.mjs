@@ -164,7 +164,11 @@ export function createRelay({ authHash, trustProxy = false, maxTracked = MAX_TRA
 
   // ── who is calling ─────────────────────────────────────────────────────
   // x-forwarded-for is whatever the caller sent unless a proxy in front rewrites it, so it is believed
-  // only when told such a proxy exists (`trustProxy`). Railway's does: the first address is the caller.
+  // only when told such a proxy exists (`trustProxy`). Railway's edge does: observed on a Railway service
+  // (2026-09-14), a client-sent x-forwarded-for is dropped and the header becomes "<caller>, <internal hop>",
+  // where the hop changes on every request. So the FIRST entry is the caller and cannot be forged, and the
+  // last one must never be the key (each request would get a fresh lockout bucket). REELFORGE_TRUST_PROXY=1
+  // is only safe behind a proxy that also replaces the header rather than appending to it.
   const ipOf = (req) => (trustProxy && String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim()) || req.socket.remoteAddress || '?';
 
   function failureKey(req) {

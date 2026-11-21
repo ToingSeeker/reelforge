@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildRenderPlan, JobStore, openDatabase, ProjectStore, TimelineStore, type Database, type TimelineOp } from "@reelforge/core";
-import { bakePath, createRenderJob, fxAvailable, importMedia, RenderRunner, retryRenderJob, validateExportPath } from "../src/index.ts";
+import { bakePath, createRenderJob, fxAvailable, importMedia, publishRender, RenderRunner, retryRenderJob, validateExportPath } from "../src/index.ts";
 
 const ff = (args: string[]) => execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args]);
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-render-")));
@@ -325,22 +325,36 @@ test("burned-in captions: word highlight moves on the right frame, track style a
   assert.equal(readdirSync(join(s.home, "cache", "work")).length, 0, "caption frames cleaned up");
 });
 
-test("the partial render file has an unguessable name and is created exclusively", async (t) => {
+test("the render is written outside the export folder and published without following links", async (t) => {
   const s = await project(t, { width: 160, height: 288 });
   s.edit([{ type: "clip.add", trackId: s.track("Video"), assetId: s.ids.red, start: 0, duration: 10 }]);
-  const out = join(s.home, "named.mp4");
+  const exportDir = join(s.home, "exports");
+  mkdirSync(exportDir);
+  const out = join(exportDir, "named.mp4");
   const job = createRenderJob(s.db, s.projectId, "export", out);
-  // The old name was predictable from the job id: something planted there must not be followed or truncated.
-  const victim = join(s.home, "victim.txt");
-  writeFileSync(victim, "keep me");
-  symlinkSync(victim, join(s.home, `.named.partial-${job.id}.mp4`));
+  // Something that can rewrite the export folder only ever sees the finished file appear there.
+  const seen = new Set<string>();
+  const poll = setInterval(() => readdirSync(exportDir).forEach((n) => seen.add(n)), 2);
   s.runner.enqueue(job.id);
   const done = await s.runner.wait(job.id);
+  clearInterval(poll);
+  readdirSync(exportDir).forEach((n) => seen.add(n));
   assert.equal(done.state, "completed", JSON.stringify(done.error));
-  assert.equal(readFileSync(victim, "utf8"), "keep me");
-  assert.ok(existsSync(out));
-});
+  assert.deepEqual([...seen], ["named.mp4"]);
+  assert.equal(readdirSync(join(s.home, "cache", "renders")).length, 0, "the private partial is gone");
 
+  // Publishing by copy (another volume) refuses a planted link instead of writing through it.
+  const victim = join(s.home, "victim.txt");
+  writeFileSync(victim, "keep me");
+  const planted = join(exportDir, "planted.mp4");
+  symlinkSync(victim, planted);
+  await assert.rejects(publishRender(out, planted, { copy: true }), /appeared at the export path/);
+  await assert.rejects(publishRender(out, planted), /appeared at the export path/);
+  assert.equal(readFileSync(victim, "utf8"), "keep me");
+  const copied = join(exportDir, "copied.mp4");
+  await publishRender(out, copied, { copy: true });
+  assert.deepEqual(readFileSync(copied), readFileSync(out));
+});
 
 test("effects: colour looks, vignette, blur, grain and pan render as the preview computes them", async (t) => {
   const s = await project(t, { width: 160, height: 288 });

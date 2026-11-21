@@ -1,7 +1,7 @@
 // Wire contracts shared by the core, the REST server, the CLI and the desktop
 // UI. Browser-safe: no node: imports here.
 import { z } from "zod";
-import { FX_NAMES, FX_NUMERIC_OPTIONS } from "./fx-catalog.ts";
+import { FX_NAMES, FX_NUMERIC_OPTIONS, fxOptionRange } from "./fx-catalog.ts";
 
 export const PROJECT_SCHEMA_VERSION = 1;
 
@@ -184,7 +184,14 @@ export const AiFxSchema = z
   .refine((e) => e.end > e.start, "end must be after start")
   .superRefine((e, ctx) => {
     for (const k of FX_NUMERIC_OPTIONS[e.fx] ?? []) {
-      if (e.opts?.[k] !== undefined && typeof e.opts[k] !== "number") ctx.addIssue({ code: "custom", path: ["opts", k], message: `${e.fx} option "${k}" must be a number` });
+      const v = e.opts?.[k];
+      if (v === undefined) continue;
+      if (typeof v !== "number") {
+        ctx.addIssue({ code: "custom", path: ["opts", k], message: `${e.fx} option "${k}" must be a number` });
+        continue;
+      }
+      const r = fxOptionRange(e.fx, k);
+      if (r && (v < r[0] || v > r[1])) ctx.addIssue({ code: "custom", path: ["opts", k], message: `${e.fx} option "${k}" must be between ${r[0]} and ${r[1]}` });
     }
   });
 export type AiFx = z.infer<typeof AiFxSchema>;
