@@ -319,8 +319,9 @@ A recipe is a JSON file that runs the whole pipeline the same way every time, fr
 
 ```sh
 pnpm cli workflow validate recipe.json
-pnpm cli workflow run recipe.json                 # AI Director steps stay proposals…
+pnpm cli workflow run recipe.json                 # AI Director steps stay proposals: the run stops there…
 pnpm cli workflow run recipe.json --approve-ai    # …unless you approve them up front
+pnpm cli workflow run recipe.json --resume <run>  # after applying the proposal: run the remaining steps
 ```
 
 Paths are relative to the recipe file. More in [examples/workflows](examples/workflows/README.md).

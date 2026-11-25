@@ -9,7 +9,7 @@ import type { MotionTemplateId } from "@reelforge/core/motion-catalog";
 /** AI-effect bakes the timeline needs (GET/POST /v1/projects/:id/fx). */
 export interface FxStatus {
   engine: { ok: true } | { ok: false; reason: string };
-  bakes: ({ key: string; state: "done" | "missing" | "queued" } | { key: string; state: "running"; progress: number } | { key: string; state: "failed"; error: string })[];
+  bakes: ({ key: string; state: "done"; warning?: string } | { key: string; state: "missing" | "queued" } | { key: string; state: "running"; progress: number } | { key: string; state: "failed"; error: string })[];
 }
 
 /** A motion graphic being rendered (POST/GET /v1/projects/:id/motion). */
@@ -43,6 +43,22 @@ export class ApiError extends Error {
     this.code = code;
     this.details = details;
   }
+}
+
+/**
+ * The message to show for a failed request. Validation errors carry the engine's per-field issues;
+ * "invalid workflow" alone doesn't say what to fix, so they're listed after it.
+ */
+export function errorMessage(e: unknown): string {
+  if (!(e instanceof Error)) return String(e);
+  const issues = e instanceof ApiError && Array.isArray(e.details?.issues) ? (e.details.issues as { path?: unknown; message?: unknown }[]) : [];
+  const lines = issues
+    .filter((i) => typeof i?.message === "string")
+    .slice(0, 5)
+    .map((i) => (typeof i.path === "string" && i.path ? `${i.path}: ${i.message}` : String(i.message)));
+  // Engines that already spell the issues out in the message (newer workflow validation) need nothing added.
+  if (!lines.length || lines.every((l) => e.message.includes(l))) return e.message;
+  return `${e.message}: ${lines.join("; ")}${issues.length > lines.length ? ` (+${issues.length - lines.length} more)` : ""}`;
 }
 
 export const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -206,7 +222,7 @@ export interface RemoteStatus {
   /** A one-time pairing code (10 minutes, one phone), or null. */
   pairing: RemotePairing | null;
   remoteReady: { enabled: boolean; active: boolean; power: "ac" | "battery" | "unknown" };
-  engine: { background: boolean; startedAt: string; version: string };
+  engine: { background: boolean; mode?: "editor" | "background" | "standalone"; startedAt: string; version: string };
   editor: "open" | "closed" | "unknown";
   /** Phones that turned on notifications (sent from this Mac, not through the relay). */
   notifications: number;

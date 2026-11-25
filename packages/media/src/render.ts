@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, constants, createReadStream, createWriteStream, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
-import { AssetStore, JobStore, ReelForgeError, type Database, type JobKind, type RenderJob } from "@reelforge/core";
+import { AssetStore, JobStore, ProjectStore, ReelForgeError, type Database, type JobKind, type Project, type RenderJob } from "@reelforge/core";
 import { compileRender, exportSettings, previewSettings } from "./compile.ts";
 import { ffmpegBin, ffprobeBin, run } from "./ffmpeg.ts";
 import { ensureProxy } from "./proxy.ts";
@@ -331,6 +331,37 @@ export async function verifyOutput(path: string) {
   const a = data.streams.find((s) => s.codec_type === "audio");
   if (!v) throw new ReelForgeError("INTERNAL", "render produced no video stream");
   return { frames: Number(v.nb_frames ?? 0), width: v.width ?? 0, height: v.height ?? 0, videoCodec: v.codec_name, audioCodec: a?.codec_name ?? null };
+}
+
+/**
+ * Delete a project and the cache only it used: its preview renders, and the proxies, thumbnails,
+ * stills and filmstrips of its assets (asset ids are per project, so no other project shares them).
+ * AI-effect bakes are keyed by content and may be shared, so they stay for the cache's own pruning.
+ */
+export function deleteProjectWithCache(db: Database, cacheDir: string, projectId: string): Project {
+  const projects = new ProjectStore(db);
+  const pid = projects.get(projectId).id;
+  const assetIds = new AssetStore(db).list(pid).map((a) => a.id);
+  const proxies = assetIds.length
+    ? (db.prepare(`SELECT path FROM proxies WHERE asset_id IN (${assetIds.map(() => "?").join(",")})`).all(...assetIds) as { path: string }[]).map((r) => r.path)
+    : [];
+  const project = projects.delete(pid);
+  try {
+    rmSync(join(cacheDir, "previews", pid), { recursive: true, force: true });
+    for (const p of proxies) rmSync(p, { force: true });
+    for (const dir of ["proxies", "thumbs", "stills", join("stills", "strips")]) {
+      let names: string[];
+      try {
+        names = readdirSync(join(cacheDir, dir));
+      } catch {
+        continue;
+      }
+      for (const n of names) if (assetIds.some((id) => n.startsWith(`${id}-`))) rmSync(join(cacheDir, dir, n), { force: true });
+    }
+  } catch {
+    /* cache housekeeping is best-effort: the project itself is gone */
+  }
+  return project;
 }
 
 /** Keep the newest two previews per project; they are disposable cache. */

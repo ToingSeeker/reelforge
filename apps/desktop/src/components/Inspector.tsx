@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import type { Clip, ClipProps, ClipPropsPatch, Timeline } from "@reelforge/core/schema";
 import { DEFAULT_CLIP_PROPS, resolveClipProps, trackLabels } from "@reelforge/core/schema";
 import { buildRenderPlan } from "@reelforge/core/render-plan";
-import { MOTION_PRESETS, motionPatch, motionPresetOf, PICTURE_EFFECTS } from "@reelforge/core/effects";
+import { formatClock } from "@reelforge/core/timebase";
+import { MOTION_PRESETS, PICTURE_EFFECTS, type MotionPreset } from "@reelforge/core/effects";
+import { clipMotionPreset, motionPresetPatch } from "../motion-preset.ts";
 import { Icon } from "../icons.tsx";
 import { Accordion, NumberField, Row, Segmented, Slider } from "./ui.tsx";
 
@@ -123,7 +125,7 @@ export function Inspector({ timeline, clip, tab, onTab, onDraft, onCommit, onHid
     if (Object.keys(patch).length) onCommit(patch, "Reset clip");
   };
 
-  const motion = motionPresetOf(value);
+  const motion = clipMotionPreset(value);
   const zoomOn = value.scaleEnd !== null;
   const cropCount = (["cropLeft", "cropRight", "cropTop", "cropBottom"] as const).filter((k) => value[k] > 0).length;
   const looks = PICTURE_EFFECTS.filter((e) => value[e.key] > 0).length;
@@ -139,7 +141,7 @@ export function Inspector({ timeline, clip, tab, onTab, onDraft, onCommit, onHid
         <div className="rf-inspector-clip-text">
           <div className="rf-inspector-title" title={asset?.filename}>{asset?.filename ?? "Clip"}</div>
           <div className="rf-inspector-sub">
-            {labels.get(track.id) ?? track.name} · {(clip.duration / fps).toFixed(2)} s{locked ? " · locked" : ""}
+            {labels.get(track.id) ?? track.name} · {formatClock(clip.duration, timeline.project.settings.fps)}{locked ? " · locked" : ""}
           </div>
         </div>
         <button className="rf-btn rf-btn-quiet rf-btn-sm" onClick={reset} disabled={!Object.keys(clip.props).length || locked} title="Reset every property of this clip">
@@ -208,7 +210,7 @@ export function Inspector({ timeline, clip, tab, onTab, onDraft, onCommit, onHid
                   aria-label="Motion preset"
                   disabled={locked}
                   value={motion ?? ""}
-                  onChange={(e) => e.target.value && commit(motionPatch(e.target.value as Parameters<typeof motionPatch>[0]), "Motion")}
+                  onChange={(e) => e.target.value && commit(motionPresetPatch(e.target.value as MotionPreset), "Motion")}
                 >
                   {motion === null && <option value="">Custom</option>}
                   {MOTION_PRESETS.map((m) => (

@@ -10,14 +10,16 @@ import {
   rescaleFrames,
   secondsToFrames,
 } from "../src/timebase.ts";
+import { ReelForgeError } from "../src/errors.ts";
 
 test("parseFps accepts integers, fractions and NTSC decimals", () => {
   assert.deepEqual(parseFps("30"), { num: 30, den: 1 });
   assert.deepEqual(parseFps("30000/1001"), { num: 30000, den: 1001 });
   assert.deepEqual(parseFps("29.97"), { num: 30000, den: 1001 });
   assert.deepEqual(parseFps("60/2"), { num: 30, den: 1 });
-  assert.throws(() => parseFps("29.5"), RangeError);
-  assert.throws(() => parseFps("0"), RangeError);
+  // Bad input is a validation error at every boundary (CLI exit 2, HTTP 400, MCP), never INTERNAL.
+  assert.throws(() => parseFps("29.5"), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR");
+  assert.throws(() => parseFps("0"), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR");
 });
 
 test("rational normalises and rejects non-integers", () => {
@@ -64,7 +66,30 @@ test("parseTime accepts frames, seconds, timecode and clock", async () => {
   assert.equal(parseTime("2.5s", fps), 75);
   assert.equal(parseTime("00:00:03:10", fps), 100);
   assert.equal(parseTime("00:12.08", fps), 368);
-  assert.throws(() => parseTime("00:00:03:30", fps), RangeError);
-  assert.throws(() => parseTime("abc", fps), RangeError);
+  assert.throws(() => parseTime("00:00:03:30", fps), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR");
+  assert.throws(() => parseTime("abc", fps), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR");
   assert.equal(parseTime("1s", rational(30000, 1001)), 30);
+});
+
+test("MM:SS.FF past an hour reads back what formatClock writes", async () => {
+  const { parseTime } = await import("../src/timebase.ts");
+  const fps = rational(30);
+  for (const f of [0, 368, 59 * 60 * 30 + 29, 60 * 60 * 30, 75 * 60 * 30 + 3 * 30 + 10, 3 * 3600 * 30 + 17]) {
+    assert.equal(parseTime(formatClock(f, fps), fps), f, formatClock(f, fps));
+  }
+  assert.equal(formatClock(75 * 60 * 30 + 100, fps), "75:03.10");
+  assert.throws(() => parseTime("75:60.00", fps), /seconds go up to 59/);
+});
+
+test("drop-frame timecode (;) at 29.97 / 59.94, refused where it doesn't exist", async () => {
+  const { parseTime } = await import("../src/timebase.ts");
+  const ntsc = rational(30000, 1001);
+  assert.equal(parseTime("00:00:59;29", ntsc), 1799);
+  assert.equal(parseTime("00:01:00;02", ntsc), 1800, "frames ;00 and ;01 are skipped at minute 1");
+  assert.equal(parseTime("00:10:00;00", ntsc), 17982, "every tenth minute keeps them");
+  assert.equal(parseTime("01:00:00;00", ntsc), 107892, "an hour of 29.97 is 107892 frames");
+  assert.equal(parseTime("00:01:00:00", ntsc), 1800, "':' stays non-drop-frame");
+  assert.equal(parseTime("00:01:00;04", rational(60000, 1001)), 3600);
+  assert.throws(() => parseTime("00:01:00;01", ntsc), /doesn't exist in drop-frame/);
+  assert.throws(() => parseTime("00:00:01;00", rational(30)), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR" && /only exists at 29.97 and 59.94/.test(e.message));
 });

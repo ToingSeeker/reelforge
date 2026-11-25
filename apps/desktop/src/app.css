@@ -556,6 +556,13 @@ select.rf-input {
   opacity: 0;
   transition: opacity var(--dur-hover);
 }
+/* Label-above fields (crop grid, rotation / opacity): the reset sits at the end of the label line,
+   not left of the field, where the left column would put it on the panel edge. */
+.rf-mini .rf-numfield-reset {
+  top: -11px;
+  right: 2px;
+}
+.rf-mini:hover .rf-numfield-reset,
 .rf-numfield:hover .rf-numfield-reset,
 .rf-numfield:focus-within .rf-numfield-reset,
 .rf-numfield-reset:focus-visible {
@@ -1064,7 +1071,8 @@ select.rf-input {
 .rf-studio {
   display: grid;
   grid-template-columns: var(--rail-w) var(--library-w) minmax(0, 1fr) var(--inspector-w);
-  grid-template-rows: minmax(0, 1fr) var(--shell-gap) var(--timeline-h, clamp(200px, 31vh, 440px));
+  /* Default height fits the five default tracks at 900 px tall (compact rows below 800 px, see Timeline). */
+  grid-template-rows: minmax(0, 1fr) var(--shell-gap) var(--timeline-h, clamp(200px, 34vh, 440px));
   grid-template-areas:
     "rail library preview right"
     "split split split split"
@@ -1330,6 +1338,13 @@ select.rf-input {
 }
 .rf-asset-thumb img.is-ready {
   opacity: 1;
+}
+.rf-asset-thumb.is-alpha {
+  background: var(--checker) 0 0 / var(--checker-size);
+}
+.rf-asset-thumb.is-alpha img {
+  object-fit: contain;
+  mix-blend-mode: screen;
 }
 .rf-asset-thumb img.is-wave {
   padding: 18% 6%;
@@ -1609,9 +1624,13 @@ select.rf-input {
   position: absolute;
   top: 4px;
   left: 6px;
-  color: rgba(255, 255, 255, 0.7);
+  /* A dark chip, so the label reads on bright footage too. */
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--glass-menu);
+  color: var(--text-primary);
   font-size: 10px;
-  text-shadow: 0 1px 2px #000;
+  line-height: 14px;
 }
 .rf-frame-note,
 .rf-frame-badge {
@@ -2249,6 +2268,45 @@ select.rf-input {
 .rf-track-row.is-empty .rf-lane {
   height: 30px;
 }
+/* Short windows (1280×720 and the like): compact rows, so the default tracks fit without scrolling. */
+@media (max-height: 800px) {
+  .rf-timeline-toolbar {
+    height: 38px;
+  }
+  .rf-ruler-row {
+    height: 24px;
+  }
+  .rf-tick {
+    padding-top: 4px;
+  }
+  .rf-lane {
+    height: 42px;
+  }
+  .rf-track-row[data-kind="overlay"] .rf-lane {
+    height: 36px;
+  }
+  .rf-track-row[data-kind="caption"] .rf-lane {
+    height: 30px;
+  }
+  .rf-track-row[data-kind="audio"] .rf-lane {
+    height: 36px;
+  }
+  .rf-track-row.is-empty .rf-lane {
+    height: 24px;
+  }
+  .rf-clip,
+  .rf-caption-block {
+    top: 3px;
+    bottom: 3px;
+  }
+  /* Idle, the activity card keeps its button and drops the sentence, leaving the inspector room. */
+  .rf-agent-idle > p {
+    display: none;
+  }
+  .rf-agent-idle {
+    justify-content: flex-end;
+  }
+}
 .rf-lane.is-locked {
   background: repeating-linear-gradient(135deg, transparent 0 8px, rgba(238, 245, 240, 0.025) 8px 16px), var(--lane-bg);
 }
@@ -2289,6 +2347,14 @@ select.rf-input {
   background-repeat: repeat-x;
   background-size: auto 100%;
   pointer-events: none;
+}
+/* Thumbnails are JPEG, so a transparent picture comes out black: screen it over a checkerboard,
+   which drops the black and leaves the graphic on a "transparent" background. */
+.rf-clip-thumbs.is-alpha {
+  background-position: left center, 0 0;
+  background-repeat: repeat-x, repeat;
+  background-size: auto 100%, var(--checker-size);
+  background-blend-mode: screen;
 }
 .rf-clip-wave {
   position: absolute;
@@ -3391,6 +3457,15 @@ select.rf-input {
 .rf-proposal-status {
   font-size: 12px;
 }
+.rf-director-focus {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 16px -4px;
+  color: var(--text-muted);
+  font-size: var(--fs-meta);
+}
 .rf-sel-chip {
   flex: none;
   padding: 2px 8px;
@@ -3430,6 +3505,17 @@ select.rf-input {
   width: min(580px, calc(100vw - 32px));
   max-height: calc(100vh - 48px);
   overflow: auto;
+}
+/* The title and Close stay put while the long settings scroll under them. */
+.rf-dialog-settings > .rf-dialog-head {
+  position: sticky;
+  top: -20px;
+  z-index: 3;
+  margin: -20px -20px 0;
+  padding: 20px 20px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  /* The dialog's glass, made opaque so the scrolled text doesn't show through. */
+  background: linear-gradient(var(--glass-menu), var(--glass-menu)), var(--surface-base);
 }
 .rf-connector {
   display: flex;

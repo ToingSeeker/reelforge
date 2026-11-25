@@ -4,17 +4,50 @@
 // purely from the timeline, which stretches need baking and under what cache
 // key, so the engine, the compiler and the preview all agree on it.
 
-import { clampFxOpts } from "./fx-catalog.ts";
+import { FX_TIME_OPTIONS, clampFxOpts, fxNumberList } from "./fx-catalog.ts";
 import type { AiFx, Asset } from "./schema.ts";
 import type { Rational } from "./timebase.ts";
 
 /** Bump when the engine or how we call it changes what a bake looks like: every cached bake is redone. */
-export const FX_ENGINE_VERSION = "claude-video-effects@c97d01b+rf1";
+export const FX_ENGINE_VERSION = "claude-video-effects@c97d01b+rf2";
+/**
+ * SHA-256 of packages/fx-engine/scripts/fx.py (LF line ends) that FX_ENGINE_VERSION names. A test fails
+ * when fx.py changes and this doesn't: bump the version with it, or cached bakes keep the old look.
+ */
+export const FX_ENGINE_SOURCE_SHA256 = "9f800fef11d4f468708b41ff642fc4a2cf8001fc548274f82e850126bb549afd";
 
 /** Effects closer than this (seconds) share one bake, so the engine tracks the face once. */
 const MERGE_GAP_S = 1;
 /** Extra source on each side so face tracking has settled when an effect starts (the engine uses 0.5 s). */
 const LEAD_S = 0.5;
+
+/**
+ * What fx.py measures each time option from: "clip" is the start of the video it is given (our cut
+ * stretch, which starts LEAD_S before the effect), "effect" is the effect's own start. A test reads
+ * this off fx.py.
+ */
+export const FX_ENGINE_TIME_ORIGIN: Readonly<Record<string, Readonly<Record<string, "clip" | "effect">>>> = {
+  "tap": { at: "clip" },
+  "todo": { ticks: "clip" },
+  "apple-toggles": { ticks: "effect" },
+};
+
+/**
+ * Time options (FX_TIME_OPTIONS) are seconds into the source video; the engine wants them from the start
+ * of the stretch it is given or of the effect. `stretchStart`/`effectStart` are in source seconds.
+ */
+export function engineTimeOpts(fx: string, opts: Record<string, string | number>, stretchStart: number, effectStart: number): Record<string, string | number> {
+  const out = { ...opts };
+  for (const k of FX_TIME_OPTIONS[fx] ?? []) {
+    const v = out[k];
+    const list = v === undefined ? null : fxNumberList(v);
+    if (!list) continue;
+    const origin = FX_ENGINE_TIME_ORIGIN[fx]?.[k] === "effect" ? effectStart : stretchStart;
+    const moved = list.map((t) => Math.round((t - origin) * 1000) / 1000);
+    out[k] = typeof v === "number" ? moved[0]! : moved.join("|");
+  }
+  return out;
+}
 
 /** What one bake renders: a stretch of one source, with the effects that touch it. */
 export interface FxBakeSpec {
@@ -108,7 +141,7 @@ export function planClipFx(
         ...(e.text !== undefined ? { text: e.text } : {}),
         ...(e.color !== undefined ? { color: e.color } : {}),
         ...(e.images?.length ? { images: e.images.map(mediaPath).filter((x): x is string => !!x) } : {}),
-        ...(e.opts && Object.keys(e.opts).length ? { opts: clampFxOpts(e.fx, e.opts) } : {}),
+        ...(e.opts && Object.keys(e.opts).length ? { opts: engineTimeOpts(e.fx, clampFxOpts(e.fx, e.opts), srcFrom / rate, e.start / rate) } : {}),
       }));
     const body = { assetId: asset.id, sourcePath: asset.sourcePath, sourceFrom: srcFrom, sourceTo: srcTo, fps, shortSide, ...fxBakeSize(asset.width, asset.height, shortSide), effects };
     const key = stableHash(JSON.stringify({ v: FX_ENGINE_VERSION, size: asset.sizeBytes, ...body }));

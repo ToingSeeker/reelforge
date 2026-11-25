@@ -1,7 +1,7 @@
 // Wire contracts shared by the core, the REST server, the CLI and the desktop
 // UI. Browser-safe: no node: imports here.
 import { z } from "zod";
-import { FX_NAMES, FX_NUMERIC_OPTIONS, fxOptionRange } from "./fx-catalog.ts";
+import { FX_CATALOG, FX_NAMES, FX_NUMBER_LIST_OPTIONS, FX_NUMERIC_OPTIONS, fxOptionIssue } from "./fx-catalog.ts";
 
 export const PROJECT_SCHEMA_VERSION = 1;
 
@@ -157,6 +157,22 @@ export interface Track {
   hidden: boolean;
 }
 
+/** Option values the engine picks from a fixed set (anything else is ignored or fails mid-bake). */
+const FX_FONTS = ["bold", "serif", "mono", "hand", "ui", "uim", "uib", "anton", "mont", "monts", "montb", "didone", "didoneb", "didonei"];
+const FX_GRADES = ["moody", "bw", "warm", "cool", "pop"];
+export const FX_ENUM_OPTIONS: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
+  "backdrop-word": { font: FX_FONTS },
+  moody: { grade: FX_GRADES },
+  swipe: { grade: FX_GRADES },
+  "glass-widgets": { look: ["simple"] },
+};
+
+/** The `opts` keys an effect reads: its catalogue keys and numeric options, minus the dedicated fields. */
+export function fxOptionKeys(fx: string): string[] {
+  const info = FX_CATALOG.find((f) => f.fx === fx);
+  return [...new Set([...(info?.keys ?? []), ...(FX_NUMERIC_OPTIONS[fx] ?? []), ...(FX_NUMBER_LIST_OPTIONS[fx] ?? [])])].filter((k) => !["text", "color", "images"].includes(k)).sort();
+}
+
 /** Plain text the engine draws: no control characters, bounded. */
 const FxText = z.string().max(400).regex(/^[^\u0000-\u001f\u007f]*$/, "no control characters");
 
@@ -183,15 +199,22 @@ export const AiFxSchema = z
   .strict()
   .refine((e) => e.end > e.start, "end must be after start")
   .superRefine((e, ctx) => {
-    for (const k of FX_NUMERIC_OPTIONS[e.fx] ?? []) {
-      const v = e.opts?.[k];
-      if (v === undefined) continue;
-      if (typeof v !== "number") {
-        ctx.addIssue({ code: "custom", path: ["opts", k], message: `${e.fx} option "${k}" must be a number` });
+    const info = FX_CATALOG.find((f) => f.fx === e.fx);
+    if (!info) return;
+    // Fields and options the effect doesn't read would be dropped silently by the engine: refuse them.
+    if (e.text !== undefined && !info.keys.includes("text")) ctx.addIssue({ code: "custom", path: ["text"], message: `${e.fx} takes no text` });
+    if (e.color !== undefined && !info.keys.includes("color")) ctx.addIssue({ code: "custom", path: ["color"], message: `${e.fx} takes no color` });
+    if (e.images !== undefined && !info.images) ctx.addIssue({ code: "custom", path: ["images"], message: `${e.fx} takes no images` });
+    const known = fxOptionKeys(e.fx);
+    for (const [k, v] of Object.entries(e.opts ?? {})) {
+      if (!known.includes(k)) {
+        ctx.addIssue({ code: "custom", path: ["opts", k], message: `${e.fx} has no option "${k}"${known.length ? ` (options: ${known.join(", ")})` : " (it takes no options)"}` });
         continue;
       }
-      const r = fxOptionRange(e.fx, k);
-      if (r && (v < r[0] || v > r[1])) ctx.addIssue({ code: "custom", path: ["opts", k], message: `${e.fx} option "${k}" must be between ${r[0]} and ${r[1]}` });
+      const allowed = FX_ENUM_OPTIONS[e.fx]?.[k];
+      if (allowed && !allowed.includes(String(v))) ctx.addIssue({ code: "custom", path: ["opts", k], message: `${e.fx} option "${k}" must be one of ${allowed.join(", ")}` });
+      const issue = fxOptionIssue(e.fx, k, v);
+      if (issue) ctx.addIssue({ code: "custom", path: ["opts", k], message: issue });
     }
   });
 export type AiFx = z.infer<typeof AiFxSchema>;
@@ -321,38 +344,38 @@ const BaseTimelineOps = [
     sourceIn: Frame.optional(),
     duration: FrameCount.optional(),
     props: ClipPropsPatchSchema.optional(),
-  }),
+  }).strict(),
   z.object({
     type: z.literal("clip.update"),
     clipId: z.uuid(),
     /** Fields to change; others keep their value. */
     props: ClipPropsPatchSchema,
-  }),
+  }).strict(),
   z.object({
     type: z.literal("clip.move"),
     clipId: z.uuid(),
     start: Frame,
     trackId: z.uuid().optional(),
-  }),
+  }).strict(),
   z.object({
     type: z.literal("clip.trim"),
     clipId: z.uuid(),
     edge: z.enum(["start", "end"]),
     /** Absolute timeline frame the edge moves to. */
     frame: Frame,
-  }),
+  }).strict(),
   z.object({
     type: z.literal("clip.split"),
     clipId: z.uuid(),
     frame: Frame,
     newClipId: z.uuid().optional(),
-  }),
+  }).strict(),
   z.object({
     type: z.literal("clip.delete"),
     clipIds: z.array(z.uuid()).min(1).max(500),
     /** Close the gap: later clips on the same track shift left. */
     ripple: z.boolean().optional(),
-  }),
+  }).strict(),
   z.object({
     type: z.literal("track.update"),
     trackId: z.uuid(),
@@ -361,7 +384,7 @@ const BaseTimelineOps = [
     locked: z.boolean().optional(),
     hidden: z.boolean().optional(),
     captionStyle: z.lazy(() => CaptionStylePatchSchema).optional(),
-  }),
+  }).strict(),
 ] as const;
 
 
@@ -589,16 +612,18 @@ export interface Caption {
 
 const CaptionText = z.string().trim().min(1, "caption text is required").max(300);
 const CaptionWordSchema = z.object({ text: z.string().min(1).max(100), start: z.number().int().min(0), end: z.number().int().min(0) });
-const CaptionInput = z.object({
-  captionId: z.uuid().optional(),
-  start: Frame,
-  duration: FrameCount,
-  text: CaptionText,
-  words: z.array(CaptionWordSchema).max(200).optional(),
-});
+const CaptionInput = z
+  .object({
+    captionId: z.uuid().optional(),
+    start: Frame,
+    duration: FrameCount,
+    text: CaptionText,
+    words: z.array(CaptionWordSchema).max(200).optional(),
+  })
+  .strict();
 
 export const CaptionOpSchemas = [
-  z.object({ type: z.literal("caption.add"), trackId: z.uuid(), ...CaptionInput.shape }),
+  z.object({ type: z.literal("caption.add"), trackId: z.uuid(), ...CaptionInput.shape }).strict(),
   z.object({
     type: z.literal("caption.update"),
     captionId: z.uuid(),
@@ -606,10 +631,10 @@ export const CaptionOpSchemas = [
     start: Frame.optional(),
     duration: FrameCount.optional(),
     words: z.array(CaptionWordSchema).max(200).optional(),
-  }),
-  z.object({ type: z.literal("caption.delete"), captionIds: z.array(z.uuid()).min(1).max(5000) }),
+  }).strict(),
+  z.object({ type: z.literal("caption.delete"), captionIds: z.array(z.uuid()).min(1).max(5000) }).strict(),
   /** Replace every caption on a track (caption generation is one undo step). */
-  z.object({ type: z.literal("captions.replace"), trackId: z.uuid(), captions: z.array(CaptionInput).max(5000) }),
+  z.object({ type: z.literal("captions.replace"), trackId: z.uuid(), captions: z.array(CaptionInput).max(5000) }).strict(),
 ] as const;
 
 export const TimelineOpSchema = z.discriminatedUnion("type", [...BaseTimelineOps, ...CaptionOpSchemas]);

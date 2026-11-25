@@ -322,3 +322,41 @@ test("MCP render housekeeping: previews are reused per revision, and only this s
   assert.equal(cancelled.isError, false, JSON.stringify(cancelled.data));
 });
 
+
+test("MCP proposals: stale ones never reach the approval prompt; mixed, unchecked or empty proposals are refused; clear errors", { timeout: 120_000 }, async (t) => {
+  const asked: string[] = [];
+  const { call, home } = await connect(t, { elicit: (message) => (asked.push(message), { action: "accept", content: { approve: true } }) });
+  const f = fixtures();
+  const bad = await call("projects_create", { name: "Bad fps", fps: "abc" });
+  assert.equal(bad.isError, true);
+  assert.equal(bad.data.error.code, "VALIDATION_ERROR");
+  const project = (await call("projects_create", { name: "Stale" })).data.project;
+  const asset = (await call("media_import", { projectId: project.id, paths: [f.portrait] })).data.imported[0];
+  const v1 = (await call("timeline_get", { projectId: project.id })).data.context.timeline.tracks.find((x: any) => x.label === "V1").id;
+  const add = { type: "clip.add" as const, trackId: v1, assetId: asset.id, start: 0 };
+
+  const both = await call("timeline_propose_edit", { projectId: project.id, summary: "x", operations: [add], instruction: "also make it pop" });
+  assert.match(both.data.error.message, /either operations or an instruction/);
+  const sel = await call("timeline_propose_edit", { projectId: project.id, summary: "x", operations: [add], selection: ["00000000-0000-4000-8000-000000000000"] });
+  assert.match(sel.data.error.message, /selected clips are not on the timeline/);
+  const typo = await call("timeline_propose_edit", { projectId: project.id, summary: "x", operations: [{ ...add, speed: 2 }] });
+  assert.match(typo.data.error.message, /speed/);
+
+  const p = (await call("timeline_propose_edit", { projectId: project.id, summary: "Add the shot", operations: [add] })).data;
+  // The timeline moves on before the user is asked.
+  const db = openDatabase(join(home, "reelforge.db"));
+  t.after(() => db.close());
+  const tl = new TimelineStore(db);
+  tl.apply(project.id, { baseRevision: tl.get(project.id).project.revision, operations: [{ ...add, start: 300 }] }, "cli");
+  const stale = (await call("timeline_apply_proposal", { proposalId: p.proposalId })).data;
+  assert.equal(stale.status, "stale");
+  assert.equal(asked.length, 0, "the user is not asked to approve a proposal that can't apply");
+
+  const clipId = tl.get(project.id).clips[0]!.id;
+  const noop = await call("timeline_propose_edit", { projectId: project.id, summary: "nothing", operations: [{ type: "clip.move", clipId, start: 300 }] });
+  assert.equal(noop.isError, true);
+  assert.match(noop.data.error.message, /don't change anything/);
+
+  const job = await call("jobs_get", { jobId: "00000000-0000-4000-8000-000000000000" });
+  assert.match(job.data.error.message, /^job 0{8}-.* not found \(no render, preview or analysis job/);
+});

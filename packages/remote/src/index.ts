@@ -26,6 +26,7 @@ export {
   RemoteManager,
   normaliseUrl,
   safeFileName,
+  uniqueName,
   type EditorState,
   type PushPrefs,
   type RemoteAi,

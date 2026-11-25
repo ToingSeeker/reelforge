@@ -19,14 +19,32 @@ def clips(tl, kind="video"):
 
 
 def saved(page, timeout=15000):
-    page.wait_for_function("() => document.querySelector('.ed-save')?.innerText.trim() === 'Saved'", timeout=timeout)
+    page.wait_for_function("() => document.querySelector('.ed-save')?.innerText.trim().startsWith('Saved')", timeout=timeout)
 
 
 def rev():
     return timeline()["project"]["revision"]
 
 
+def close_sheet(page):
+    """On a phone each tool's controls live in a sheet over the timeline; its dock button tapped again shuts it."""
+    if page.locator(".editor.panel-open").count():
+        page.locator('.ed-dock .ed-tool[aria-pressed="true"]').first.click()
+        page.wait_for_function("() => !document.querySelector('.editor.panel-open')", timeout=5000)
+        page.wait_for_timeout(250)
+
+
+def tool(page, name):
+    """Opens a tool's sheet from the dock along the bottom (Clip, Frame, Captions, Audio, Look)."""
+    b = page.locator(".ed-dock .ed-tool", has_text=name).first
+    if b.get_attribute("aria-pressed") != "true":
+        b.click()
+    page.wait_for_function("() => document.querySelector('.editor.panel-open')", timeout=5000)
+    page.wait_for_timeout(300)
+
+
 def tap_clip(page, i):
+    close_sheet(page)
     el = page.locator(".ed-lane.main .ed-clip").nth(i)
     el.scroll_into_view_if_needed()
     b = el.bounding_box()
@@ -50,6 +68,7 @@ with sync_playwright() as p:
     tap_clip(page, 1)
     c1 = clips(base)[1]
     check("tap selects a clip (outline + handles)", page.locator(".ed-clip.sel .ed-handle").count() == 2)
+    tool(page, "Clip")
     end_btn = page.get_by_role("button", name="End: one less")
     for _ in range(5):
         end_btn.click()
@@ -68,6 +87,7 @@ with sync_playwright() as p:
 
     # drag the right handle (one gesture = one revision)
     r1 = rev()
+    close_sheet(page)
     h = page.locator(".ed-clip.sel .ed-handle.r")
     h.scroll_into_view_if_needed()
     page.wait_for_timeout(200)
@@ -83,12 +103,13 @@ with sync_playwright() as p:
     check("handle drag = one trim, one revision", rev() == r1 + 1 and nc2["duration"] < nc1["duration"], f"dur {nc1['duration']}→{nc2['duration']} rev {r1}→{rev()}")
 
     # ── Split at the playhead, undo, redo ───────────────────────────────────
+    close_sheet(page)
     b = page.locator(".ed-clip.sel").bounding_box()
     lo, hi = max(b["x"], 40), min(b["x"] + b["width"], 380)
     page.mouse.click((lo + hi) / 2, page.locator(".ed-ruler").bounding_box()["y"] + 10)
     page.wait_for_timeout(300)
     n0 = len(clips(timeline()))
-    page.get_by_role("button", name="Split at").click()
+    page.get_by_role("button", name="Split here", exact=True).click()
     saved(page)
     check("Split at playhead adds a clip", len(clips(timeline())) == n0 + 1)
     shot(page, "11-after-split")
@@ -103,6 +124,7 @@ with sync_playwright() as p:
 
     # ── Delete (ripple) and undo ────────────────────────────────────────────
     tap_clip(page, 0)
+    tool(page, "Clip")
     before = clips(timeline())
     page.get_by_role("button", name="Delete", exact=True).click()
     page.get_by_role("button", name="Delete and close the gap (ripple)").click()
@@ -117,6 +139,7 @@ with sync_playwright() as p:
 
     # ── Reorder ─────────────────────────────────────────────────────────────
     order0 = [c["id"] for c in clips(timeline())]
+    tool(page, "Clip")
     page.get_by_role("button", name="Reorder clips").click()
     page.locator(".sheet").get_by_role("button", name="down").first.click()
     shot(page, "12-reorder")
@@ -130,10 +153,11 @@ with sync_playwright() as p:
 
     # ── Frame ───────────────────────────────────────────────────────────────
     playhead_before = page.locator(".ed-ph-label").inner_text()
-    page.get_by_role("button", name="Frame").click()
-    page.wait_for_timeout(300)
+    close_sheet(page)
+    tool(page, "Frame")
     check("switching tools keeps the playhead", page.locator(".ed-ph-label").inner_text() == playhead_before, playhead_before)
     tap_clip(page, 1)
+    tool(page, "Frame")
     wide = clips(timeline())[1]
     if page.get_by_role("button", name="Show it").count():
         page.get_by_role("button", name="Show it").click()
@@ -155,6 +179,7 @@ with sync_playwright() as p:
     check("Scale 115% and X +3% stored as 1.15 / 0.03", abs(pr.get("scale", 1) - 1.15) < 1e-9 and abs(pr.get("x", 0) - 0.03) < 1e-9, str(pr))
     # drag on the preview
     r2 = rev()
+    close_sheet(page)
     fb = page.locator(".ed-frame").bounding_box()
     page.mouse.move(fb["x"] + fb["width"] / 2, fb["y"] + fb["height"] / 2)
     page.mouse.down()
@@ -167,14 +192,15 @@ with sync_playwright() as p:
     want_x = round(0.03 + 30 / fb["width"], 2)
     check("drag on preview = one framing edit in frame fractions (screen-size independent)", rev() == r2 + 1 and abs(pr2.get("x", 0) - want_x) < 0.011, f"x={pr2.get('x')} want≈{want_x} rev {r2}→{rev()}")
     shot(page, "14-frame")
+    tool(page, "Frame")
     page.get_by_role("button", name="Reset").click()
     saved(page)
     pr3 = [c for c in timeline()["clips"] if c["id"] == wide["id"]][0]["props"]
     check("Reset framing clears fit/scale/x/y only", not any(k in pr3 for k in ("fit", "scale", "x", "y")), str(pr3))
 
     # ── Captions ────────────────────────────────────────────────────────────
-    page.get_by_role("button", name="Captions").click()
-    page.wait_for_timeout(300)
+    close_sheet(page)
+    tool(page, "Captions")
     check("caption lane appears in Captions mode", page.locator(".ed-lane.captions .ed-cap").count() == 6)
     page.locator(".ed-capnav").click()
     page.locator(".sheet").get_by_text("The spider trade strategy").click()
@@ -209,9 +235,10 @@ with sync_playwright() as p:
     check("next caption selects the following one", "4 of 6" in page.locator(".ed-capnav").inner_text())
 
     # ── Audio ───────────────────────────────────────────────────────────────
-    page.get_by_role("button", name="Audio").click()
+    close_sheet(page)
+    tool(page, "Audio")
     tap_clip(page, 1)
-    page.wait_for_timeout(300)
+    tool(page, "Audio")
     g = page.get_by_label("Clip volume in decibels")
     g.fill("-6")
     g.dispatch_event("input")
@@ -225,21 +252,23 @@ with sync_playwright() as p:
     page.get_by_role("switch", name="Mute A1").click()
     saved(page)
 
-    # ── Style ───────────────────────────────────────────────────────────────
-    page.get_by_role("button", name="Style").click()
+    # ── Look ────────────────────────────────────────────────────────────────
+    close_sheet(page)
+    tool(page, "Look")
     vg = page.get_by_label("Vignette, percent")
     vg.fill("50")
     vg.dispatch_event("input")
     saved(page)
     pr = [c for c in timeline()["clips"] if c["id"] == wide["id"]][0]["props"]
     check("vignette 50% stored", pr.get("vignette") == 0.5, str(pr.get("vignette")))
-    shot(page, "18-style")
+    shot(page, "18-look")
 
     # ── Conflict: the desktop edits underneath ──────────────────────────────
-    page.get_by_role("button", name="Clip").click()
+    close_sheet(page)
     t = timeline()
     api(f"/v1/projects/{PID}/operations", "POST", {"baseRevision": t["project"]["revision"], "operations": [{"type": "clip.update", "clipId": clips(t)[2]["id"], "props": {"opacity": 0.9}}]})
     tap_clip(page, 1)
+    tool(page, "Clip")
     page.get_by_role("button", name="End: one less").click()
     page.wait_for_function("() => document.querySelector('.ed-status')?.innerText.includes('Timeline changed')", timeout=15000)
     shot(page, "19-conflict")
@@ -254,6 +283,7 @@ with sync_playwright() as p:
     d0 = [c for c in tq["clips"] if c["id"] == wide["id"]][0]["duration"]
     page.route("**/api/command", lambda route: route.abort())
     tap_clip(page, 1)
+    tool(page, "Clip")
     page.get_by_role("button", name="End: one less").click()
     page.wait_for_timeout(1500)
     check("queued while unreachable: not reported as saved", page.locator(".ed-save").inner_text().strip() != "Saved", page.locator(".ed-save").inner_text())
@@ -273,8 +303,8 @@ with sync_playwright() as p:
     check("Mac's version kept: trim dropped, desktop change stands", [c for c in tc["clips"] if c["id"] == wide["id"]][0]["duration"] == d0 and [c for c in tc["clips"] if c["id"] == clips(tq)[2]["id"]][0]["props"].get("opacity") == 0.7)
 
     # ── Connection loss keeps the draft ─────────────────────────────────────
-    page.get_by_role("button", name="Captions").click()
-    page.wait_for_timeout(300)
+    close_sheet(page)
+    tool(page, "Captions")
     stop_relay()
     page.wait_for_function("() => document.querySelector('.ed-status')?.innerText.includes('Reconnecting')", timeout=30000)
     shot(page, "20-offline")
@@ -292,7 +322,7 @@ with sync_playwright() as p:
     shot(page, "21-review-rev")
     body = page.locator("body").inner_text()
     check("Review lists the manual steps", "Trim clip" in body and "Caption text" in body, body[:300].replace("\n", " | "))
-    page.get_by_role("button", name="Export this revision").click()
+    page.get_by_role("button", name=f"Export revision {n}", exact=True).click()
     page.wait_for_url("**/#/exports", timeout=20000)
     time.sleep(1)
     jobs = api(f"/v1/projects/{PID}/jobs")["jobs"]

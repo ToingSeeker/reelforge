@@ -853,7 +853,7 @@ export function settingsPanel(ed, v) {
     ed.section('set-mac', 'Your Mac', null, [
       row('Name', cat?.macName ?? pairing?.macName ?? '—'),
       row('Connection', ed.live ? 'Online' : 'Offline'),
-      engine ? row('Engine', engine.background ? 'Running in the background' : 'Running with the editor window') : null,
+      engine ? row('Engine', core.engineMode(engine)) : null,
       cat?.version ? row('ReelForge', cat.version) : null,
       row('This phone', pairing?.deviceName ?? '—'),
       button('Phone, notifications & pairing', { iconName: 'settings', small: true, full: true, onclick: () => ed.openDeviceSheet() }),

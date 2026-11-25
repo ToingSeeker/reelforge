@@ -128,6 +128,7 @@ export class ProjectStore {
     const { name, baseRevision } = parse(RenameProjectInputSchema, input);
     return transaction(this.#db, () => {
       const current = this.get(pid);
+      if (current.name === name) return current; // nothing changes: no new revision, no history entry
       commitRevision(this.#db, {
         projectId: pid,
         baseRevision,

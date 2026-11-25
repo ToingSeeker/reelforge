@@ -37,3 +37,19 @@ test("status tracks missing/changed files; relink requires matching media (FR-00
   writeFileSync(join(dir, "x"), "");
   assert.throws(() => assets.get(project.id, "00000000-0000-4000-8000-000000000000"), (e: unknown) => e instanceof ReelForgeError && e.code === "NOT_FOUND");
 });
+
+test("probed durations keep their last frame: 1/4/7/10/299-frame files are exactly that long", (t) => {
+  const dir = tempDir(t);
+  const db = openDatabase(join(dir, "db.sqlite"));
+  const project = new ProjectStore(db).create({ name: "P" }, "cli");
+  const assets = new AssetStore(db);
+  // What FFmpeg reports for 30 fps MP4s of that many frames (a hair short of frames / 30).
+  const reported: [number, number][] = [[1, 33_008], [4, 133_008], [7, 233_008], [10, 333_008], [299, 9_966_016], [300, 10_000_000]];
+  for (const [frames, us] of reported) {
+    const m = fakeMedia(dir, `f${frames}.mp4`, { durationUs: us });
+    assert.equal(assets.add(project.id, m.file, m.probe, "cli").asset.durationFrames, frames, `${frames} frames`);
+  }
+  // A real partial frame still doesn't count as a whole one.
+  const half = fakeMedia(dir, "half.mp4", { durationUs: 150_000 });
+  assert.equal(assets.add(project.id, half.file, half.probe, "cli").asset.durationFrames, 4);
+});

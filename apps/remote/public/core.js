@@ -158,6 +158,19 @@ export function status() {
   };
 }
 
+/**
+ * How the Mac's engine runs, in words, from what it reports. Only `background` says nothing about a foreground
+ * engine (older Macs): it may be the editor's or one started by hand, so don't claim either.
+ */
+export function engineMode(engine) {
+  if (!engine) return null;
+  const mode = engine.mode ?? (engine.background ? 'background' : null);
+  if (mode === 'background') return 'In the background (no window needed)';
+  if (mode === 'editor') return 'Inside the editor app (stops when it quits)';
+  if (mode === 'standalone') return 'Started by hand (reelforge serve)';
+  return 'In the foreground (editor app or terminal)';
+}
+
 // ── pairing ─────────────────────────────────────────────────────────────────
 /** Step 1–2: send the hello for this code; resolves with the Mac's answer, opened (not yet stored). */
 export async function startPairing(code) {
@@ -170,7 +183,9 @@ export async function startPairing(code) {
     const a = await fetch(`/pair/answer?lookup=${ph.lookup}`, { cache: 'no-store' });
     if (a.status === 204) continue;
     if (!a.ok) throw new Error((await a.json().catch(() => ({}))).error ?? 'The pairing ended. Make a new code on your Mac.');
-    return { payload: await ph.open(await a.json()), deviceName };
+    const payload = await ph.open(await a.json());
+    // The Mac's name for this phone wins: it may have added " 2" to tell it from another one.
+    return { payload, deviceName: typeof payload.deviceName === 'string' && payload.deviceName ? payload.deviceName : deviceName };
   }
   throw new Error('Your Mac didn’t answer. Check it’s online and the code is still showing, then try again.');
 }
@@ -214,12 +229,41 @@ export async function switchMac(macId) {
   await connect();
 }
 
-function guessDeviceName() {
-  const ua = navigator.userAgent;
-  if (/iPhone/.test(ua)) return 'iPhone';
-  if (/iPad/.test(ua)) return 'iPad';
-  if (/Android/.test(ua)) return 'Android phone';
-  return 'Phone';
+/**
+ * How the Mac lists this phone: the kind of device and the browser ("iPhone · Safari", "iPad · Chrome"), so two
+ * phones are told apart there (the Mac adds " 2" to a second one with the same name). iPadOS asks for desktop
+ * pages and says "Macintosh"; its touch screen gives it away.
+ */
+export function guessDeviceName(ua = navigator.userAgent, touchPoints = navigator.maxTouchPoints ?? 0) {
+  const device = /iPhone/.test(ua)
+    ? 'iPhone'
+    : /iPad/.test(ua) || (/Macintosh/.test(ua) && touchPoints > 1)
+      ? 'iPad'
+      : /Android/.test(ua)
+        ? /Mobile/.test(ua) ? 'Android phone' : 'Android tablet'
+        : /CrOS/.test(ua)
+          ? 'Chromebook'
+          : /Macintosh/.test(ua)
+            ? 'Mac'
+            : /Windows/.test(ua)
+              ? 'Windows PC'
+              : /Linux/.test(ua)
+                ? 'Linux PC'
+                : 'Phone';
+  const browser = /SamsungBrowser/.test(ua)
+    ? 'Samsung Internet'
+    : /EdgiOS|EdgA|Edg\//.test(ua)
+      ? 'Edge'
+      : /OPiOS|OPR\//.test(ua)
+        ? 'Opera'
+        : /FxiOS|Firefox\//.test(ua)
+          ? 'Firefox'
+          : /CriOS|Chrome\//.test(ua)
+            ? 'Chrome'
+            : /Safari\//.test(ua)
+              ? 'Safari'
+              : null;
+  return browser ? `${device} · ${browser}` : device;
 }
 
 // ── the stream ──────────────────────────────────────────────────────────────
@@ -955,7 +999,11 @@ export function rerunInstruction(id) {
   if (!item) return null;
   item.state = 'cancelled';
   item.finishedAt = Date.now();
-  return addInstruction(item.projectId, item.instruction, { about: item.about });
+  const next = addInstruction(item.projectId, item.instruction, { about: item.about });
+  // Not the user cancelling it: it was sent again. The conversation says so instead of "Cancelled".
+  item.replacedBy = next?.id ?? true;
+  persist();
+  return next;
 }
 
 export const instructionsFor = (projectId) => saved.outbox.filter((x) => x.macId === activePairing()?.macId && x.projectId === projectId);

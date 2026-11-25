@@ -3,8 +3,23 @@ import { statSync } from "node:fs";
 import type { Database } from "./db.ts";
 import { ReelForgeError } from "./errors.ts";
 import { AssetStore } from "./assets.ts";
-import { ANALYSIS_KINDS, ProjectIdSchema, type Analysis, type AnalysisKind, type AnalysisResults, type AnalysisState } from "./schema.ts";
+import { ANALYSIS_KINDS, ProjectIdSchema, type Analysis, type Asset, type AnalysisKind, type AnalysisResults, type AnalysisState } from "./schema.ts";
 import { parse } from "./validate.ts";
+
+/** The analyses that make sense for an asset: scenes need a picture that moves, beats and transcripts need sound. */
+export function applicableAnalysisKinds(asset: Pick<Asset, "kind" | "hasAudio">): AnalysisKind[] {
+  return ANALYSIS_KINDS.filter((k) => (k === "scenes" ? asset.kind === "video" : asset.hasAudio));
+}
+
+/** Transcription languages: an ISO 639 code (en, id, deu) or "auto" to detect it. */
+export const TRANSCRIPT_LANGUAGE = /^(auto|[a-z]{2,3})$/;
+
+export function checkTranscriptLanguage(language: unknown): string {
+  if (typeof language !== "string" || !TRANSCRIPT_LANGUAGE.test(language)) {
+    throw new ReelForgeError("VALIDATION_ERROR", `invalid language "${String(language).slice(0, 40)}" (use an ISO code like en, id or de, or auto)`);
+  }
+  return language;
+}
 
 interface AnalysisRow {
   id: string;
@@ -100,6 +115,7 @@ export class AnalysisStore {
   enqueue(projectId: string, assetId: string, kinds: readonly AnalysisKind[], params: Record<string, unknown> = {}): Analysis[] {
     const asset = new AssetStore(this.#db).get(projectId, assetId);
     if (asset.status === "missing") throw new ReelForgeError("VALIDATION_ERROR", `${asset.filename} is offline; relink it before analysing`, { assetId });
+    if (params.language !== undefined) checkTranscriptLanguage(params.language);
     for (const kind of kinds) {
       if (!ANALYSIS_KINDS.includes(kind)) throw new ReelForgeError("VALIDATION_ERROR", `unknown analysis kind "${kind}"`);
       if (kind === "beats" && !asset.hasAudio) throw new ReelForgeError("VALIDATION_ERROR", `${asset.filename} has no audio to find beats in`, { assetId });

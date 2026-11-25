@@ -19,6 +19,7 @@ import {
   sealBytes,
   unseal,
   unsealBytes,
+  uniqueName,
   type PairPayload,
   type RemoteManagerOptions,
 } from "@reelforge/remote";
@@ -279,6 +280,21 @@ test("pairing: a one-time code, credentials only inside ECDH, per-phone tokens t
   await until("cut off", () => p.status() === 200 && p.raw.length > 0 && again.status().devices.length === 0);
   await until("refused", async () => (await fetch(`${url}/api/queue`, { headers: p.auth })).status === 401);
   assert.equal((await fetch(`${url}/api/queue`, { headers: p.auth })).status, 401);
+});
+
+test("pairing: two phones of the same kind are told apart on the Mac's list, and each phone learns its name", async (t) => {
+  const { m, url, creds } = await paired(t);
+  assert.equal(creds.deviceName, "Test iPhone");
+  const second = await pair(url, (await m.startPairing()).pairing!.code);
+  assert.equal(second.deviceName, "Test iPhone 2");
+  const p2 = phone(url, second);
+  t.after(() => p2.close());
+  const hi = await p2.send("device.hello");
+  await until("second phone paired", () => p2.reply(hi.id, "device"));
+  const third = await pair(url, (await m.startPairing()).pairing!.code, "Test iPad");
+  assert.equal(third.deviceName, "Test iPad");
+  assert.deepEqual(m.status().devices.map((d) => d.name).sort(), ["Test iPad", "Test iPhone", "Test iPhone 2"]);
+  assert.equal(uniqueName("iPhone · Safari", ["iPhone · Safari", "iPhone · Safari 2"]), "iPhone · Safari 3");
 });
 
 test("queue: instructions wait on the relay while the Mac is away, run once, can be edited or cancelled first", async (t) => {

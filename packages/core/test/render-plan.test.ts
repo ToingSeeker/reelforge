@@ -6,7 +6,9 @@ import {
   audioGain,
   AssetStore,
   buildRenderPlan,
+  JobStore,
   openDatabase,
+  ReelForgeError,
   pictureAlpha,
   placement,
   ProjectStore,
@@ -14,6 +16,7 @@ import {
   TimelineStore,
   type PlanSegment,
 } from "../src/index.ts";
+import { appendFileSync } from "node:fs";
 import { fakeMedia, tempDir } from "./helpers.ts";
 
 function seg(over: Partial<Omit<PlanSegment, "props">> & { props?: Partial<PlanSegment["props"]> } = {}): PlanSegment {
@@ -154,3 +157,34 @@ test("a video plays its own sound; muting its track silences it, hiding only hid
   assert.deepEqual(audioOf(), []);
 });
 
+
+test("an export refuses media that changed on disk since import; the preview still renders it", (t) => {
+  const s = project(t, 300);
+  s.apply([{ type: "clip.add", trackId: s.video, assetId: s.a.id, start: 0, duration: 60 }]);
+  appendFileSync(s.a.sourcePath, "re-encoded, maybe shorter");
+  const jobs = new JobStore(s.db);
+  assert.throws(
+    () => jobs.create(s.p.id, "export", { width: 1080, height: 1920, useProxies: false, crf: 18, preset: "medium" as const, audioBitrateK: 192 }, "/tmp/x.mp4"),
+    (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR" && /media changed on disk since import: v\.mp4; relink/.test(e.message),
+  );
+  assert.equal(jobs.create(s.p.id, "preview", { width: 540, height: 960, useProxies: true, crf: 28, preset: "veryfast" as const, audioBitrateK: 96 }, null).state, "queued");
+});
+
+test("a failed or cancelled job is retried once: a second retry would render to the same file twice", (t) => {
+  const s = project(t, 300);
+  s.apply([{ type: "clip.add", trackId: s.video, assetId: s.a.id, start: 0, duration: 60 }]);
+  const jobs = new JobStore(s.db);
+  const settings = { width: 1080, height: 1920, useProxies: false, crf: 18, preset: "medium" as const, audioBitrateK: 192 };
+  const first = jobs.create(s.p.id, "export", settings, "/tmp/out.mp4");
+  jobs.cancel(first.id);
+  const again = jobs.retry(first.id);
+  assert.equal(again.retryOf, first.id);
+  assert.throws(() => jobs.retry(first.id), (e: unknown) => e instanceof ReelForgeError && /already retried as job/.test(e.message));
+  // Another cancelled export to the same file can't be retried while one is queued there.
+  const other = jobs.create(s.p.id, "export", settings, "/tmp/out.mp4");
+  jobs.cancel(other.id);
+  assert.throws(() => jobs.retry(other.id), (e: unknown) => e instanceof ReelForgeError && e.code === "BUSY");
+  jobs.cancel(again.id);
+  assert.equal(jobs.retry(again.id).retryOf, again.id, "the newest attempt can be retried");
+  assert.equal(jobs.list(s.p.id).filter((j) => j.state === "queued").length, 1);
+});

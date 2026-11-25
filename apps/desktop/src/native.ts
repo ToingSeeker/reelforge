@@ -1,6 +1,6 @@
 import { isTauri } from "./api.ts";
 
-const MEDIA_EXTENSIONS = ["mp4", "mov", "jpg", "jpeg", "png", "wav", "mp3"];
+const MEDIA_EXTENSIONS = ["mp4", "mov", "mkv", "webm", "jpg", "jpeg", "png", "wav", "mp3", "m4a", "aiff", "aif"];
 
 /** Native open dialog (desktop). The webview itself has no filesystem access. */
 export async function pickMediaFiles(opts: { multiple?: boolean } = {}): Promise<string[]> {
@@ -13,7 +13,7 @@ export async function pickMediaFiles(opts: { multiple?: boolean } = {}): Promise
     multiple: opts.multiple ?? true,
     directory: false,
     title: "Import media",
-    filters: [{ name: "Media (MP4, MOV, JPEG, PNG, WAV, MP3)", extensions: MEDIA_EXTENSIONS }],
+    filters: [{ name: "Media (MP4, MOV, MKV, WebM, JPEG, PNG, WAV, MP3, M4A, AIFF)", extensions: MEDIA_EXTENSIONS }],
   });
   if (!picked) return [];
   return Array.isArray(picked) ? picked : [picked];

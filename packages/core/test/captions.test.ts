@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   AnalysisStore,
   AssetStore,
+  planCaptions,
   planSpeechCaptions,
   captionStates,
   captionsToSrt,
@@ -169,3 +170,23 @@ test("speech captions: audio on an audio track is used as is; no sound at all is
   assert.throws(() => planSpeechCaptions(empty.db, empty.p.id), /nothing on the timeline has sound/);
 });
 
+
+test("captions in another language than the transcript's transcribe again; a bad language is refused", (t) => {
+  const s = setup(t);
+  s.apply([{ type: "clip.add", trackId: s.voice, assetId: s.asset.id, start: 0, duration: 150 }]);
+  const store = new AnalysisStore(s.db);
+  const [a] = store.enqueue(s.p.id, s.asset.id, ["transcript"]);
+  store.claim(a!.id);
+  store.complete(a!.id, "test", transcript); // detected: en
+  assert.equal(planCaptions(s.db, s.p.id).missing.length, 0);
+  assert.equal(planCaptions(s.db, s.p.id, { language: "en" }).missing.length, 0, "same language: reused");
+  assert.equal(planCaptions(s.db, s.p.id, { language: "auto" }).missing.length, 0);
+  assert.deepEqual(planCaptions(s.db, s.p.id, { language: "id" }).missing.map((m) => m.assetId), [s.asset.id], "Indonesian asked: transcribe again");
+  assert.throws(() => planCaptions(s.db, s.p.id, { language: "english" }), /invalid language "english"/);
+  assert.throws(() => store.enqueue(s.p.id, s.asset.id, ["transcript"], { language: "EN!" }), (e: unknown) => e instanceof Error && /invalid language/.test(e.message));
+  // Once transcribed as asked, it's used.
+  const [b] = store.enqueue(s.p.id, s.asset.id, ["transcript"], { language: "id" });
+  store.claim(b!.id);
+  store.complete(b!.id, "test", { ...transcript, language: "id" });
+  assert.equal(planCaptions(s.db, s.p.id, { language: "id" }).missing.length, 0);
+});

@@ -68,6 +68,7 @@ test("unknown and malformed ids", (t) => {
   const store = new ProjectStore(openDatabase(tempDb(t)));
   assert.equal(code(() => store.get("00000000-0000-4000-8000-000000000000")), "NOT_FOUND");
   assert.equal(code(() => store.get("../../etc/passwd")), "VALIDATION_ERROR");
+  assert.throws(() => store.get("my-project"), /"my-project" is not a valid id \(ids are UUIDs/);
 });
 
 test("state survives close/reopen and is shared between two handles", (t) => {
@@ -105,4 +106,19 @@ test("resize changes the format, bumps revision, and is a no-op when unchanged",
   assert.deepEqual(store.history(p.id)[1]?.payload, { from: { width: 1080, height: 1920 }, to: { width: 1920, height: 1080 } });
   assert.equal(code(() => store.resize(p.id, { width: 1081, height: 1080, baseRevision: 2 }, "desktop")), "VALIDATION_ERROR");
   assert.equal(code(() => store.resize(p.id, { width: 1080, height: 1080, baseRevision: 1 }, "desktop")), "REVISION_CONFLICT");
+});
+
+test("renaming to the same name changes nothing: no revision, no history", (t) => {
+  const store = new ProjectStore(openDatabase(tempDb(t)));
+  const p = store.create({ name: "Same" }, "cli");
+  const r = store.rename(p.id, { name: "  Same ", baseRevision: 1 }, "cli");
+  assert.equal(r.revision, 1);
+  assert.equal(store.history(p.id).length, 1);
+});
+
+test("a baseRevision from the future says so instead of 'changed since'", (t) => {
+  const store = new ProjectStore(openDatabase(tempDb(t)));
+  const p = store.create({ name: "A" }, "cli");
+  assert.throws(() => store.rename(p.id, { name: "B", baseRevision: 9 }, "cli"), /revision 9 doesn't exist yet \(the project is at revision 1\)/);
+  assert.throws(() => store.rename(p.id, { name: "B", baseRevision: 0 }, "cli"), /changed since revision 0/);
 });

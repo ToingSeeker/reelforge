@@ -294,12 +294,13 @@ function AssetCard({
   const online = list.filter((x) => x.status !== "missing");
   items.push({ label: list.length > 1 ? `Add ${online.length} to timeline` : "Add to timeline", icon: "plus", disabled: !online.length, onSelect: () => onAppend(online) });
   if (kinds.length && !missing) items.push({ label: "Analyse (scenes, beats, speech)", icon: "director", onSelect: () => list.forEach((x) => kindsFor(x).length && x.status !== "missing" && onAnalyze(x, kindsFor(x))) });
-  if (missing) items.push({ label: "Relink file…", icon: "link", onSelect: () => onRelink(asset) });
+  // Changed on disk counts too: exports refuse it until it's relinked (to the same or the updated file).
+  if (asset.status !== "online") items.push({ label: "Relink file…", icon: "link", onSelect: () => onRelink(asset) });
 
   return (
     <li className={`rf-asset${missing ? " is-missing" : ""}${selected ? " is-selected" : ""}`} aria-selected={selected}>
       <button
-        className="rf-asset-thumb"
+        className={`rf-asset-thumb${asset.hasAlpha ? " is-alpha" : ""}`}
         onPointerDown={onPointerDown}
         onDoubleClick={() => !missing && onAppend([asset])}
         onKeyDown={(e) => {
@@ -374,7 +375,7 @@ function AssetCard({
           <Icon name="more" size={16} strokeWidth={2.4} />
         </button>
       </div>
-      {missing && (
+      {asset.status !== "online" && (
         <button className="rf-link-btn" onClick={() => onRelink(asset)}>
           <Icon name="link" size={12} /> Relink
         </button>

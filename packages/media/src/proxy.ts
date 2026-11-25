@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { Database } from "@reelforge/core";
+import { ReelForgeError, type Database } from "@reelforge/core";
 import { ffmpegBin, ffmpegReason, ffprobeBin, limiter, run } from "./ffmpeg.ts";
 import { sourceInputArgs } from "./probe.ts";
 import { BT709_TAGS } from "./compile.ts";
@@ -28,14 +28,19 @@ export function ensureProxy(
   cacheDir: string,
   assetId: string,
   sourcePath: string,
-  kind: "video" | "image" = "video",
+  kind: "video" | "image" | "audio" = "video",
   alpha = false,
 ): Promise<string> {
-  const size = statSync(sourcePath).size;
+  let size: number;
+  try {
+    size = statSync(sourcePath).size;
+  } catch {
+    return Promise.reject(new ReelForgeError("NOT_FOUND", "source media is offline; relink it", { assetId }));
+  }
   const row = db.prepare("SELECT path, source_size FROM proxies WHERE asset_id = ?").get(assetId) as
     | { path: string; source_size: number }
     | undefined;
-  const ext = kind === "image" ? (alpha ? "png" : "jpg") : "mp4";
+  const ext = kind === "image" ? (alpha ? "png" : "jpg") : kind === "audio" ? "m4a" : "mp4";
   const out = join(cacheDir, "proxies", `${assetId}-${size}-v${PROXY_VERSION}${alpha ? "-a" : ""}.${ext}`);
   if (row && row.path === out && row.source_size === size && existsSync(out)) return Promise.resolve(out);
 
@@ -53,7 +58,10 @@ export function ensureProxy(
       const to709 = "scale=out_color_matrix=bt709:out_range=tv,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv";
       await run(
         ffmpegBin(),
-        kind === "image"
+        kind === "audio"
+          ? // Sound only, as AAC every browser decodes (AIFF, Opus-in-WebM… aren't decoded everywhere).
+            [...common, "-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4", `file:${tmp}`]
+          : kind === "image"
           ? // Stills: one ≤1280 px picture, enough for a 1080-wide frame at preview size; PNG keeps transparency.
             [
               ...common, "-frames:v", "1",
@@ -88,13 +96,17 @@ export function ensureProxy(
       renameSync(tmp, out);
     } catch (e) {
       rmSync(tmp, { force: true });
-      throw new Error(`could not create a proxy: ${ffmpegReason(e, sourcePath)}`);
+      if (e instanceof ReelForgeError) throw e;
+      throw new ReelForgeError("VALIDATION_ERROR", `could not create a preview proxy: ${ffmpegReason(e, sourcePath)}`, { assetId });
     }
     // Our own file, but probed like every source: forced demuxer, local files only.
-    const dims = (await run(ffprobeBin(), ["-v", "error", ...sourceInputArgs(out), "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])).stdout
-      .trim()
-      .split(",")
-      .map(Number);
+    const dims =
+      kind === "audio"
+        ? [0, 0]
+        : (await run(ffprobeBin(), ["-v", "error", ...sourceInputArgs(out), "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])).stdout
+            .trim()
+            .split(",")
+            .map(Number);
     db.prepare(
       `INSERT INTO proxies (asset_id, path, width, height, source_size, created_at) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT (asset_id) DO UPDATE SET path = excluded.path, width = excluded.width, height = excluded.height,

@@ -4,7 +4,9 @@ import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, renam
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { AssetStore, openDatabase, ProjectStore, ReelForgeError, TimelineStore } from "@reelforge/core";
-import { ensureFilmstrip, ensureThumbnail, importMedia, probeFile, relinkMedia, resolveSource, sourceInputArgs, sourceStill, STILL_SUPERSEDED } from "../src/index.ts";
+import { ensureFilmstrip, ensureProxy, ensureThumbnail, importMedia, probeFile, relinkMedia, resolveSource, sourceInputArgs, sourceStill, STILL_SUPERSEDED } from "../src/index.ts";
+import { ffmpegReason } from "../src/ffmpeg.ts";
+import { execFileSync } from "node:child_process";
 import { fixtures } from "./fixtures.ts";
 
 const f = fixtures();
@@ -208,4 +210,65 @@ test("phone editor pictures: a still the phone moved on from is skipped; the fil
   const p = await probe(strip.path);
   assert.deepEqual([p.width, p.height], [320, 90]);
   assert.deepEqual(readdirSync(join(cache, "stills", "strips")), [basename(strip.path)], "the per-tile files are cleaned up");
+});
+
+test("a video renamed to .png/.jpg is refused at import with a reason, not imported as a 0×0 image", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "reelforge-fake-image-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  for (const name of ["video.png", "video.jpg"]) {
+    copyFileSync(f.portrait, join(dir, name));
+    await assert.rejects(probe(join(dir, name)), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR" && /not a readable image|does not match its/.test(e.message), name);
+  }
+  // A real picture with the other picture extension is refused too: its codec doesn't match.
+  copyFileSync(f.png, join(dir, "png.jpg"));
+  await assert.rejects(probe(join(dir, "png.jpg")), (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR");
+});
+
+test("FFmpeg reasons never carry memory addresses", () => {
+  assert.equal(ffmpegReason({ stderr: "[png @ 0x766cc64380] Invalid PNG signature 0x2066747970.\n" }), "[png] Invalid PNG signature 0x2066747970.");
+  assert.equal(ffmpegReason({ stderr: "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x7f8b1c004080] moov atom not found" }), "[mov,mp4,m4a,3gp,3g2,mj2] moov atom not found");
+});
+
+test("AIFF, M4A, MKV and WebM import (and an audio-only WebM is audio)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "reelforge-formats-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const ff = (args: string[]) => execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args]);
+  const pic = ["-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30:duration=1"];
+  const snd = ["-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=48000"];
+  ff([...snd, join(dir, "a.aiff")]);
+  ff([...snd, "-c:a", "aac", join(dir, "a.m4a")]);
+  ff([...pic, ...snd, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", join(dir, "v.mkv")]);
+  ff([...pic, ...snd, "-c:v", "libvpx-vp9", "-b:v", "200k", "-c:a", "libopus", "-shortest", join(dir, "v.webm")]);
+  ff([...snd, "-c:a", "libopus", join(dir, "voice.webm")]);
+  const home = mkdtempSync(join(tmpdir(), "reelforge-formats-db-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const db = openDatabase(join(home, "db.sqlite"));
+  const project = new ProjectStore(db).create({ name: "Formats" }, "cli");
+  const r = await importMedia(db, project.id, ["a.aiff", "a.m4a", "v.mkv", "v.webm", "voice.webm"].map((n) => join(dir, n)), "cli");
+  assert.deepEqual(r.failed, []);
+  assert.deepEqual(r.imported.map((a) => [a.filename, a.kind, a.hasVideo, a.hasAudio]), [
+    ["a.aiff", "audio", false, true],
+    ["a.m4a", "audio", false, true],
+    ["v.mkv", "video", true, true],
+    ["v.webm", "video", true, true],
+    ["voice.webm", "audio", false, true],
+  ]);
+  for (const a of r.imported) assert.ok(a.durationFrames! >= 29 && a.durationFrames! <= 31, `${a.filename}: ${a.durationFrames} frames`);
+  // The preview gets every sound as AAC it can decode; the video ones get the usual proxy.
+  const cache = join(home, "cache");
+  for (const a of r.imported) {
+    const out = await ensureProxy(db, cache, a.id, a.sourcePath, a.kind === "audio" ? "audio" : "video");
+    const codecs = execFileSync("ffprobe", ["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", out]).toString().trim().split("\n");
+    assert.deepEqual(codecs, a.kind === "audio" ? ["aac"] : ["h264", "aac"], a.filename);
+  }
+});
+
+test("a proxy that can't be made is a VALIDATION_ERROR with the reason, not a bare 500", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "reelforge-proxy-fail-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const db = openDatabase(join(home, "db.sqlite"));
+  await assert.rejects(ensureProxy(db, join(home, "cache"), "00000000-0000-4000-8000-000000000001", f.corrupt), (e: unknown) =>
+    e instanceof ReelForgeError && e.code === "VALIDATION_ERROR" && /could not create a preview proxy: /.test(e.message) && !/0x[0-9a-f]{6}/.test(e.message));
+  await assert.rejects(ensureProxy(db, join(home, "cache"), "00000000-0000-4000-8000-000000000001", join(home, "gone.mp4")), (e: unknown) =>
+    e instanceof ReelForgeError && e.code === "NOT_FOUND");
 });

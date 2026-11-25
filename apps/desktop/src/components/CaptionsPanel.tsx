@@ -46,6 +46,10 @@ export function CaptionsPanel(p: Props) {
   const [maxWords, setMaxWords] = useState(3);
   const [language, setLanguage] = useState("auto");
   const [pending, setPending] = useState(false);
+  // Set only when the engine answered "transcribing": the retry below waits for those transcripts.
+  // A request in flight is not waiting, so finished transcripts never trigger a second request.
+  const [waiting, setWaiting] = useState(false);
+  const inFlight = useRef(false);
   const style: CaptionStyle = resolveCaptionStyle(track?.captionStyle);
   const captions = tl.captions.filter((c) => c.trackId === track?.id);
 
@@ -63,7 +67,9 @@ export function CaptionsPanel(p: Props) {
   const progress = running.length ? running.reduce((s, a) => s + (a!.progress ?? 0), 0) / running.length : 0;
 
   const generate = async () => {
-    if (!p.client || !track) return;
+    if (!p.client || !track || inFlight.current) return;
+    inFlight.current = true;
+    setWaiting(false);
     setPending(true);
     try {
       const r = await p.client.generateCaptions(tl.project.id, { trackId: track.id, sourceTrackIds: sources, maxWords, language, baseRevision: tl.project.revision });
@@ -71,24 +77,29 @@ export function CaptionsPanel(p: Props) {
         p.notify("info", `${r.count} captions created.`);
         setPending(false);
         p.onTimelineReplaced();
+      } else {
+        // "transcribing": keep pending; the effect below retries once the transcripts finish.
+        setWaiting(true);
       }
-      // "transcribing": keep pending; the effect below retries when the transcripts finish.
     } catch (e) {
       setPending(false);
       p.notify("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      inFlight.current = false;
     }
   };
 
   useEffect(() => {
-    if (!pending || running.length) return;
+    if (!waiting || running.length) return;
     const failed = transcripts.find((a) => a?.state === "failed");
     if (failed) {
+      setWaiting(false);
       setPending(false);
       p.notify("error", `Transcription failed: ${failed.error}`);
       return;
     }
     if (transcripts.every((a) => a?.state === "completed")) void generate();
-  }, [pending, running.length, transcripts.map((a) => a?.state).join()]);
+  }, [waiting, running.length, transcripts.map((a) => a?.state).join()]);
 
   const setStyle = (patch: CaptionStylePatch, label = "Caption style") => track && p.onApply(label, [{ type: "track.update", trackId: track.id, captionStyle: patch }]);
 

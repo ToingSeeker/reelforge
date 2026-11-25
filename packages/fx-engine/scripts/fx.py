@@ -2113,7 +2113,7 @@ class Tracker:
             base_options=BaseOptions(model_asset_path=os.path.join(ROOT, 'models', 'selfie_segmenter.tflite')),
             running_mode=vision.RunningMode.VIDEO, output_confidence_masks=True, output_category_mask=False))
         self.fd = cv2.FaceDetectorYN.create(os.path.join(ROOT, 'models', 'yunet.onnx'), '', (aw, ah), 0.6, 0.3, 20)
-        self.prev = None
+        self.prev = None; self.frames = self.faces = self.bodies = 0  # what tracking found, for the report after pass 1
 
     def __call__(self, rgb, ms):
         img = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
@@ -2125,14 +2125,14 @@ class Tracker:
         if self.prev is not None: m = 0.65 * m + 0.35 * self.prev
         self.prev = m
         _, f = self.fd.detect(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        face = None
+        face = None; self.frames += 1
         if f is not None and len(f):
-            r = max(f, key=lambda r: r[2] * r[3] * r[-1]); face = (r[0] + r[2] / 2, r[1] + r[3] / 2, r[2])
+            r = max(f, key=lambda r: r[2] * r[3] * r[-1]); face = (r[0] + r[2] / 2, r[1] + r[3] / 2, r[2]); self.faces += 1
         else:
             rows = np.where((m > 0.5).sum(1) > m.shape[1] * 0.01)[0]
             if len(rows):
                 top = rows[0]; band = m[top:top + max(4, int(m.shape[0] * 0.06))] > 0.5; xs = np.where(band.any(0))[0]
-                fw = max(8.0, (xs.max() - xs.min()) * 0.8); face = (float(xs.mean()), top + fw * 0.7, fw)
+                fw = max(8.0, (xs.max() - xs.min()) * 0.8); face = (float(xs.mean()), top + fw * 0.7, fw); self.bodies += 1
         return (m * 255).astype(np.uint8), face
 
 
@@ -2219,6 +2219,7 @@ def main():
             m, f = trk(fr_, int(t * 1000)); masks[i] = m; faces.append(f)
         else:
             faces.append(None); trk.prev = None
+    print(f'Tracked: face in {trk.faces} of {trk.frames} frames, body only in {trk.bodies}', flush=True)
     sm = smooth(faces, fps)
     if sm is None: sm = np.tile([aw / 2, ah * 0.33, aw * 0.15], (len(faces), 1))
     for f in fxs:

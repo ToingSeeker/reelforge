@@ -7,6 +7,7 @@ import type { Notify } from "../editor.ts";
 import { Icon } from "../icons.tsx";
 import { ProposalCard } from "./ProposalCard.tsx";
 import { captionRequest } from "../caption-intent.ts";
+import { defaultModel } from "../ai-model.ts";
 import type { AiRun } from "../activity.ts";
 
 interface Props {
@@ -70,15 +71,11 @@ export function AIDirector(p: Props) {
     void p.client.aiProviders().then(setProviders, () => setProviders([]));
   }, [p.client]);
 
-  // Default model: Claude with an API key, else an installed Claude Code or Codex, else the first local model.
+  // Default model: the saved choice, else a local Ollama model. Paid providers only when picked.
   useEffect(() => {
     if (!providers.length) return;
-    const valid = choice && providers.some((x) => x.id === choice.provider && x.models.includes(choice.model));
-    if (valid) return;
-    const ready = (x: AIProviderInfo) => x.models.length > 0 && (x.id === "anthropic" ? x.credential !== "none" : x.available !== false);
-    const order = ["anthropic", "claude-code", "codex", "ollama"];
-    const first = order.map((id) => providers.find((x) => x.id === id && ready(x))).find(Boolean) ?? providers.find((x) => x.id === "anthropic");
-    if (first) setChoice({ provider: first.id, model: first.defaultModel ?? first.models[0]! });
+    const next = defaultModel(providers, choice);
+    if (next !== choice) setChoice(next);
   }, [providers]);
 
   useEffect(() => {
@@ -290,6 +287,11 @@ export function AIDirector(p: Props) {
           }}
         >
           {!groups.length && <option value="">No models</option>}
+          {groups.length > 0 && !choice && (
+            <option value="" disabled>
+              Choose a model…
+            </option>
+          )}
           {groups.map((g) => (
             <optgroup key={g.id} label={g.label}>
               {g.options.map((o) => (
@@ -320,6 +322,12 @@ export function AIDirector(p: Props) {
                 </button>
               ))}
             </div>
+            {!choice && groups.length > 0 && (
+              <p className="rf-hint">
+                No local model is running, so none is picked for you. Choose one above: Claude, Claude Code and Codex send the project to a paid service. Or
+                start Ollama (ollama.com) to keep everything on this Mac.
+              </p>
+            )}
             {provider?.id === "anthropic" && provider.credential === "none" && (
               <p className="rf-hint">
                 Claude needs an API key. <button className="rf-link-btn" onClick={p.onOpenSettings}>Add it in Settings</button>, or pick Claude Code, Codex or a local model.
@@ -355,6 +363,15 @@ export function AIDirector(p: Props) {
         <div ref={bottom} />
       </div>
 
+      {/* Above the field, not inside it, so the chip doesn't cut the placeholder short. */}
+      {p.selection.length > 0 && (
+        <p className="rf-director-focus">
+          <span className="rf-sel-chip" title="The AI Director will focus on the selected clips">
+            {p.selection.length} selected
+          </span>
+          <span>{p.selection.length === 1 ? "The request is about this clip." : "The request is about these clips."}</span>
+        </p>
+      )}
       <form
         className="rf-director-input"
         onSubmit={(e) => {
@@ -381,9 +398,8 @@ export function AIDirector(p: Props) {
             ))}
           </div>
         )}
-        {p.selection.length > 0 && <span className="rf-sel-chip" title="The AI Director will focus on the selected clips">{p.selection.length} selected</span>}
         <input
-          placeholder="Tell me what to edit, or type / for shortcuts…"
+          placeholder="Describe an edit, or type /"
           aria-label="Instruction for the AI Director"
           role="combobox"
           aria-expanded={suggestions.length > 0}
@@ -414,7 +430,7 @@ export function AIDirector(p: Props) {
             }
           }}
         />
-        <button className="rf-send" disabled={!text.trim() || !!pending || (!choice && !slash)} aria-label={slash ? "Run command" : "Send"}>
+        <button className="rf-send" disabled={!text.trim() || !!pending || (!choice && !slash && !captionRequest(text))} aria-label={slash ? "Run command" : "Send"}>
           <Icon name="send" size={17} />
         </button>
       </form>
@@ -441,7 +457,7 @@ function ConsentDialog(p: { provider: string; context: ProjectContext | null; on
         <ul className="rf-consent-list">
           <li>Project settings and the timeline ({c ? `${c.timeline.clips.length} clips, ${c.timeline.captions.length} captions` : "…"})</li>
           <li>File names and technical details of {c ? c.assets.length : "…"} media files</li>
-          <li>Analysis results: scenes, beats{transcripts ? `, and transcripts of ${transcripts} file(s)` : ""}</li>
+          <li>Analysis results: scenes, beats{transcripts ? `, and transcripts of ${transcripts} file${transcripts === 1 ? "" : "s"}` : ""}</li>
         </ul>
         <button className="rf-link-btn" onClick={() => setShow((s) => !s)} aria-expanded={show}>
           {show ? "Hide" : "Show"} the exact data

@@ -80,6 +80,9 @@
   --lane-bg: rgba(26, 54, 46, 0.4);
   --timeline-head: #10231e; /* sticky ruler / track heads: opaque so clips scroll under them */
   --timeline-ruler: #11251f;
+  /* Transparency checkerboard behind pictures with alpha (motion graphics, transparent PNGs). */
+  --checker: repeating-conic-gradient(var(--surface-raised) 0 25%, var(--surface-base) 0 50%);
+  --checker-size: 10px 10px;
 
   /* Shape */
   --radius-panel: 16px;

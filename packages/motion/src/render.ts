@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CreateMotionInputSchema, type MotionRenderSpec } from "@reelforge/core/motion-catalog";
+import { CreateMotionInputSchema, motionLengthIssue, type MotionRenderSpec } from "@reelforge/core/motion-catalog";
 
 interface Request {
   spec: MotionRenderSpec;
@@ -74,8 +74,12 @@ async function main() {
   });
   const req = JSON.parse(line) as Request;
   const { spec } = req;
-  // Never trust the caller with the props: they reach a browser page.
-  const checked = CreateMotionInputSchema.parse({ template: spec.template, props: spec.props, durationFrames: spec.frames });
+  // Never trust the caller with the props: they reach a browser page. spec.frames is the length plus a spare frame.
+  const parsed = CreateMotionInputSchema.safeParse({ template: spec.template, props: spec.props, durationFrames: spec.frames - 1 });
+  if (!parsed.success) throw new Error(`invalid motion graphic: ${parsed.error.issues.map((i) => (i.path.length ? `${i.path.join(".")}: ${i.message}` : i.message)).join("; ")}`);
+  const tooLong = motionLengthIssue(spec.frames - 1, spec.fps);
+  if (tooLong) throw new Error(tooLong);
+  const checked = parsed.data;
 
   const url = await serveUrl(req);
   const { renderMedia, selectComposition } = await import("@remotion/renderer");

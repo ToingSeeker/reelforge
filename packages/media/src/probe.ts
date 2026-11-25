@@ -12,6 +12,11 @@ export const SUPPORTED_EXTENSIONS: Record<string, AssetKind> = {
   ".png": "image",
   ".wav": "audio",
   ".mp3": "audio",
+  ".m4a": "audio",
+  ".aiff": "audio",
+  ".aif": "audio",
+  ".mkv": "video",
+  ".webm": "video",
 };
 
 /**
@@ -28,6 +33,19 @@ const DEMUXERS: Record<string, string> = {
   ".png": "png_pipe",
   ".wav": "wav",
   ".mp3": "mp3",
+  ".m4a": "mov",
+  ".aiff": "aiff",
+  ".aif": "aiff",
+  // Matroska and WebM share one demuxer; neither format can point at other files.
+  ".mkv": "matroska",
+  ".webm": "matroska",
+};
+
+/** The picture codec a still must carry: a video or anything else renamed to .png is refused at import. */
+const IMAGE_CODECS: Record<string, string> = {
+  ".png": "png",
+  ".jpg": "mjpeg",
+  ".jpeg": "mjpeg",
 };
 
 /** Input arguments for any FFmpeg tool reading a source: forced demuxer, local files only. */
@@ -126,6 +144,10 @@ export function interpretProbe(data: FfProbe, expected: AssetKind): AssetProbe {
     kind = "audio";
   }
   if (kind === "image" && !v) throw new ReelForgeError("VALIDATION_ERROR", "file is not a readable image");
+  // A decoder that couldn't read the header reports a 0×0 picture (a video renamed to .png, a truncated file).
+  if (kind !== "audio" && v && !(v.width && v.height)) {
+    throw new ReelForgeError("VALIDATION_ERROR", kind === "image" ? "file is not a readable image (no picture size: is it really an image?)" : "video has no readable picture size");
+  }
   if (kind === "audio" && !a) throw new ReelForgeError("VALIDATION_ERROR", "file has no audio stream");
 
   const rotation = v ? rotationOf(v) : 0;
@@ -174,6 +196,10 @@ export async function probeFile(file: AssetFile): Promise<AssetProbe> {
   // Belt and braces: the forced demuxer must be the one that actually opened the file.
   const formats = (data.format?.format_name ?? "").split(",");
   if (!formats.includes(DEMUXERS[ext]!)) {
+    throw new ReelForgeError("VALIDATION_ERROR", `file content does not match its ${ext} extension`);
+  }
+  const v = data.streams?.find((st) => st.codec_type === "video");
+  if (expected === "image" && v?.codec_name !== IMAGE_CODECS[ext]) {
     throw new ReelForgeError("VALIDATION_ERROR", `file content does not match its ${ext} extension`);
   }
   return interpretProbe(data, expected);

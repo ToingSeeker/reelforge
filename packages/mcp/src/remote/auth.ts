@@ -5,7 +5,7 @@
 // The key persists across restarts until the user generates a new one. Tokens are stored hashed.
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 const ACCESS_TTL = 60 * 60 * 1000;
@@ -80,6 +80,8 @@ export class ConnectorAuth {
   #state: State;
   readonly #codes = new Map<string, PendingCode>();
   #pairingFailures = 0;
+  /** Identity of the state file as last read or written: another process (`reelforge connector revoke`) may replace it. */
+  #seen = "";
 
   constructor(stateFile: string, pairingCode?: string) {
     this.#file = stateFile;
@@ -89,13 +91,43 @@ export class ConnectorAuth {
     this.#save();
   }
 
+  #stamp(): string {
+    try {
+      const st = statSync(this.#file);
+      return `${st.ino}:${st.mtimeMs}:${st.size}`;
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Pick up changes another process made to the state file (a revoke from the CLI while this connector runs):
+   * a revoked token stops working on its next request, not at the next restart. Runs before every check and
+   * every change, so this process never writes back state the file no longer has.
+   */
+  #sync(): void {
+    const stamp = this.#stamp();
+    if (!stamp || stamp === this.#seen) return;
+    try {
+      const next = JSON.parse(readFileSync(this.#file, "utf8")) as State;
+      if (next.secret !== this.#state.secret) this.#codes.clear(); // revoked: pending codes go too
+      this.#state = next;
+      if (!this.#state.pairingCode) this.#state.pairingCode = newKey();
+      this.#seen = stamp;
+    } catch {
+      // Mid-write or unreadable: keep what we have and look again on the next request.
+    }
+  }
+
   /** The access key; shown to the user (Settings, terminal), never sent to a client. */
   get pairingCode(): string {
+    this.#sync();
     return this.#state.pairingCode!;
   }
 
   /** Replace the access key. Apps already connected keep working; new ones need the new key. */
   rotatePairingCode(): string {
+    this.#sync();
     this.#state.pairingCode = newKey();
     this.#pairingFailures = 0;
     this.#save();
@@ -103,6 +135,7 @@ export class ConnectorAuth {
   }
 
   get secret(): Buffer {
+    this.#sync();
     return Buffer.from(this.#state.secret, "base64url");
   }
 
@@ -115,6 +148,7 @@ export class ConnectorAuth {
     writeFileSync(tmp, JSON.stringify(this.#state, null, 2), { mode: 0o600 });
     chmodSync(tmp, 0o600);
     renameSync(tmp, this.#file);
+    this.#seen = this.#stamp();
   }
 
   /** Forget every client, token and paired browser, and issue a new access key (`reelforge connector revoke`). */
@@ -126,6 +160,7 @@ export class ConnectorAuth {
   }
 
   connections(): { clientName: string; createdAt: string; active: boolean }[] {
+    this.#sync();
     const now = Date.now();
     return this.#state.clients.map((c) => ({
       clientName: c.clientName,
@@ -138,6 +173,7 @@ export class ConnectorAuth {
 
   /** Check an access key typed into one of our pages. Locks after repeated failures. */
   checkPairingCode(input: string): boolean {
+    this.#sync();
     if (this.#pairingFailures >= MAX_PAIRING_FAILURES) throw new OAuthError("access_denied", "Too many wrong access keys. Generate a new key in ReelForge Settings → Claude & ChatGPT.", 429);
     const normalized = input.toUpperCase().replace(/[^A-Z0-9]/g, "");
     const ok = safeEqual(normalized, this.pairingCode.replace(/-/g, ""));
@@ -147,6 +183,7 @@ export class ConnectorAuth {
 
   /** A browser that entered the access key may approve edits without typing it again. */
   newOwnerCookie(): { value: string; maxAgeSeconds: number } {
+    this.#sync();
     const value = token(32);
     this.#state.owners.push({ hash: sha(value), exp: Date.now() + OWNER_TTL });
     this.#save();
@@ -154,6 +191,7 @@ export class ConnectorAuth {
   }
 
   isOwner(cookieValue: string | undefined): boolean {
+    this.#sync();
     if (!cookieValue) return false;
     const h = sha(cookieValue);
     return this.#state.owners.some((o) => o.exp > Date.now() && safeEqual(o.hash, h));
@@ -172,6 +210,7 @@ export class ConnectorAuth {
   // ---- registration (RFC 7591) ------------------------------------------------------
 
   register(body: unknown): ClientRecord & { tokenEndpointAuthMethod: "none" } {
+    this.#sync();
     const b = (body ?? {}) as { redirect_uris?: unknown; client_name?: unknown };
     if (!Array.isArray(b.redirect_uris) || !b.redirect_uris.length || b.redirect_uris.length > 10) throw new OAuthError("invalid_redirect_uri", "redirect_uris must list 1–10 URIs");
     const uris = b.redirect_uris.map((u) => {
@@ -206,6 +245,7 @@ export class ConnectorAuth {
   }
 
   client(clientId: string | null | undefined): ClientRecord | undefined {
+    this.#sync();
     return clientId ? this.#state.clients.find((c) => c.clientId === clientId) : undefined;
   }
 
@@ -225,12 +265,14 @@ export class ConnectorAuth {
   }
 
   issueCode(clientId: string, redirectUri: string, challenge: string): string {
+    this.#sync();
     const code = token(32);
     this.#codes.set(sha(code), { clientId, redirectUri, challenge, exp: Date.now() + CODE_TTL });
     return code;
   }
 
   exchange(params: URLSearchParams): { access_token: string; token_type: "Bearer"; expires_in: number; refresh_token: string; scope: string } {
+    this.#sync();
     const grant = params.get("grant_type");
     const clientId = params.get("client_id") ?? "";
     if (!this.client(clientId)) throw new OAuthError("invalid_client", "unknown client", 401);
@@ -267,6 +309,7 @@ export class ConnectorAuth {
 
   /** The client behind a bearer token, or undefined. */
   verifyAccessToken(bearer: string | undefined): ClientRecord | undefined {
+    this.#sync();
     if (!bearer) return undefined;
     const h = sha(bearer);
     const rec = this.#state.tokens.find((t) => t.kind === "access" && t.exp > Date.now() && safeEqual(t.hash, h));

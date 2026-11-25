@@ -5,6 +5,7 @@ import { trackLabels } from "@reelforge/core/schema";
 import { formatClock, type Rational } from "@reelforge/core/timebase";
 import type { Client } from "../api.ts";
 import { useThumbnail } from "../editor.ts";
+import { dragMoved, dragTrackId, groupMoveOps, shiftedTrack } from "../clip-drag.ts";
 import { Icon, type IconName } from "../icons.tsx";
 
 const HEADER_W = 196; // keep in step with --track-head-w in app.css
@@ -39,7 +40,9 @@ interface Props {
 
 type Drag =
   | { kind: "caption"; caption: Caption; originX: number; delta: number; moved: boolean }
-  | { kind: "move"; clip: Clip; originX: number; delta: number; trackId: string; moved: boolean }
+  /** `clip` is the grabbed one; `group` every clip moving with it (the selection, minus locked tracks), grabbed included.
+   *  `offset` shifts each clip that many tracks down (negative: up). */
+  | { kind: "move"; clip: Clip; group: Clip[]; originX: number; delta: number; offset: number; moved: boolean }
   | { kind: "trim-start" | "trim-end"; clip: Clip; originX: number; delta: number; moved: boolean }
   | { kind: "playhead" };
 
@@ -115,17 +118,17 @@ export function Timeline(p: Props) {
   );
 
   const snapPoints = useCallback(
-    (exclude: string | null) => {
+    (exclude: ReadonlySet<string>) => {
       const pts = [0, p.playhead, ...p.snapExtra];
-      for (const c of tl?.clips ?? []) if (c.id !== exclude) pts.push(c.start, c.start + c.duration);
-      for (const c of tl?.captions ?? []) if (c.id !== exclude) pts.push(c.start, c.start + c.duration);
+      for (const c of tl?.clips ?? []) if (!exclude.has(c.id)) pts.push(c.start, c.start + c.duration);
+      for (const c of tl?.captions ?? []) if (!exclude.has(c.id)) pts.push(c.start, c.start + c.duration);
       return pts;
     },
     [tl?.clips, tl?.captions, p.playhead, p.snapExtra],
   );
 
   const snapFrame = useCallback(
-    (frames: number[], exclude: string | null): number => {
+    (frames: number[], exclude: ReadonlySet<string>): number => {
       // Returns the correction (in frames) that snaps the closest of `frames` to a snap point.
       if (!snap) return 0;
       const limit = SNAP_PX / px;
@@ -195,21 +198,27 @@ export function Timeline(p: Props) {
       if (drag.kind === "caption") {
         const c = drag.caption;
         let delta = Math.max(-c.start, raw);
-        delta += snapFrame([c.start + delta, c.start + delta + c.duration], c.id);
+        delta += snapFrame([c.start + delta, c.start + delta + c.duration], new Set([c.id]));
         setDrag({ ...drag, delta: Math.max(-c.start, delta), moved: drag.moved || Math.abs(e.clientX - drag.originX) > 3 });
         return;
       }
       const moved = drag.moved || Math.abs(e.clientX - drag.originX) > 3;
       const c = drag.clip;
       if (drag.kind === "move") {
+        const tracks = tl?.tracks ?? [];
+        // Vertical: shift the whole group by the grabbed clip's track change, if every member fits there.
         const target = trackAtClientY(e.clientY);
-        const trackId = target && !target.locked && assets.get(c.assetId) && canPlace(assets.get(c.assetId)!, target.kind) ? target.id : drag.trackId;
-        let delta = Math.max(-c.start, raw);
-        delta += snapFrame([c.start + delta, c.start + delta + c.duration], c.id);
-        setDrag({ ...drag, delta: Math.max(-c.start, delta), trackId, moved });
+        const want = target ? tracks.indexOf(target) - tracks.findIndex((t) => t.id === c.trackId) : drag.offset;
+        const offset = want === drag.offset || drag.group.every((g) => shiftedTrack(tracks, assets, g, want)) ? want : drag.offset;
+        // Horizontal: the earliest clip of the group stops at 00:00; snapping follows the grabbed clip.
+        const minStart = Math.min(...drag.group.map((g) => g.start));
+        let delta = Math.max(-minStart, raw);
+        delta += snapFrame([c.start + delta, c.start + delta + c.duration], new Set(drag.group.map((g) => g.id)));
+        // A change of track is a move even without any sideways motion.
+        setDrag({ ...drag, delta: Math.max(-minStart, delta), offset, moved: dragMoved(drag.moved, e.clientX - drag.originX, offset) });
       } else {
         const edge = drag.kind === "trim-start" ? c.start : c.start + c.duration;
-        let delta = raw + snapFrame([edge + raw], c.id);
+        let delta = raw + snapFrame([edge + raw], new Set([c.id]));
         if (drag.kind === "trim-start") delta = Math.min(delta, c.duration - 1);
         else delta = Math.max(delta, 1 - c.duration);
         setDrag({ ...drag, delta, moved });
@@ -223,8 +232,10 @@ export function Timeline(p: Props) {
       }
       if (drag.kind !== "playhead" && drag.moved) {
         const c = drag.clip;
-        if (drag.kind === "move" && (drag.delta !== 0 || drag.trackId !== c.trackId)) {
-          p.onApply("Move clip", [{ type: "clip.move", clipId: c.id, start: c.start + drag.delta, ...(drag.trackId !== c.trackId ? { trackId: drag.trackId } : {}) }]);
+        if (drag.kind === "move") {
+          // The whole group in one request: one undo step, and all-or-nothing if anything would overlap.
+          const ops = groupMoveOps(tl?.tracks ?? [], assets, drag.group, drag.delta, drag.offset);
+          if (ops.length) p.onApply(drag.group.length > 1 ? `Move ${drag.group.length} clips` : "Move clip", ops);
         } else if (drag.kind === "trim-start" && drag.delta !== 0) {
           p.onApply("Trim clip", [{ type: "clip.trim", clipId: c.id, edge: "start", frame: c.start + drag.delta }]);
         } else if (drag.kind === "trim-end" && drag.delta !== 0) {
@@ -239,24 +250,31 @@ export function Timeline(p: Props) {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };
-  }, [drag, px, frameAtClientX, snapFrame, assets]);
+  }, [drag, px, frameAtClientX, snapFrame, assets, tl?.tracks]);
 
   const startClipDrag = (e: RPointerEvent, clip: Clip, track: Track) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     const additive = e.shiftKey || e.metaKey;
+    let selection: ReadonlySet<string> = p.selection;
     if (additive) {
       const next = new Set(p.selection);
       next.has(clip.id) ? next.delete(clip.id) : next.add(clip.id);
       p.onSelect(next);
+      selection = next;
     } else if (!p.selection.has(clip.id)) {
-      p.onSelect(new Set([clip.id]));
+      selection = new Set([clip.id]);
+      p.onSelect(new Set(selection));
     }
-    if (track.locked) return;
+    if (track.locked || !selection.has(clip.id)) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const x = e.clientX - rect.left;
     const kind = x < EDGE_PX ? "trim-start" : x > rect.width - EDGE_PX ? "trim-end" : "move";
-    setDrag(kind === "move" ? { kind, clip, originX: e.clientX, delta: 0, trackId: clip.trackId, moved: false } : { kind, clip, originX: e.clientX, delta: 0, moved: false });
+    if (kind !== "move") return setDrag({ kind, clip, originX: e.clientX, delta: 0, moved: false });
+    // Selected clips move together; ones on locked tracks stay put.
+    const locked = new Set((tl?.tracks ?? []).filter((t) => t.locked).map((t) => t.id));
+    const group = (tl?.clips ?? []).filter((c) => c.id === clip.id || (selection.has(c.id) && !locked.has(c.trackId)));
+    setDrag({ kind, clip, group, originX: e.clientX, delta: 0, offset: 0, moved: false });
   };
 
   const zoomBy = (factor: number) => {
@@ -267,12 +285,21 @@ export function Timeline(p: Props) {
     requestAnimationFrame(() => el && (el.scrollLeft = centerFrame * next - viewW / 2));
   };
 
-  const onWheel = (e: React.WheelEvent) => {
-    if (e.ctrlKey || e.metaKey) {
+  // ⌘/Ctrl + wheel zooms. React attaches wheel listeners as passive, where preventDefault is
+  // ignored (and warns), so this one is registered natively; it reads the latest zoomBy via a ref.
+  const zoomRef = useRef(zoomBy);
+  zoomRef.current = zoomBy;
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
-      zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15);
-    }
-  };
+      zoomRef.current(e.deltaY < 0 ? 1.15 : 1 / 1.15);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
 
   const step = rulerStep(fps, px);
   const ticks = useMemo(() => {
@@ -355,7 +382,7 @@ export function Timeline(p: Props) {
         </button>
       </div>
 
-      <div className="rf-timeline-scroll" ref={scroller} onWheel={onWheel}>
+      <div className="rf-timeline-scroll" ref={scroller}>
         <div className="rf-timeline-content" style={{ width: HEADER_W + contentW }}>
           <div className="rf-ruler-row">
             <div className="rf-track-head rf-ruler-head" />
@@ -446,10 +473,11 @@ const TrackRows = memo(function TrackRows(p: {
   return (
     <>
       {(tl?.tracks ?? []).map((track) => {
-        const allClips = tl!.clips.filter((c) => (drag?.kind === "move" && drag.clip.id === c.id ? drag.trackId : c.trackId) === track.id);
+        const allClips = tl!.clips.filter((c) => dragTrackId(drag?.kind === "move" ? drag : null, tl!.tracks, p.assets, c) === track.id);
         const allCaptions = track.kind === "caption" ? tl!.captions.filter((c) => c.trackId === track.id) : [];
         const empty = !allClips.length && !allCaptions.length && p.dropHover?.trackId !== track.id && !(drag?.kind === "move");
-        const clips = allClips.filter((c) => inView(c.start, c.duration) || p.selection.has(c.id) || (drag && "clip" in drag && drag.clip.id === c.id));
+        const inDrag = (c: Clip) => !!drag && ((drag.kind === "move" && drag.group.some((g) => g.id === c.id)) || ("clip" in drag && drag.clip.id === c.id));
+        const clips = allClips.filter((c) => inView(c.start, c.duration) || p.selection.has(c.id) || inDrag(c));
         const captions = allCaptions.filter((c) => inView(c.start, c.duration) || p.selectedCaption === c.id || (drag?.kind === "caption" && drag.caption.id === c.id));
         return (
           <div key={track.id} className={`rf-track-row${empty ? " is-empty" : ""}`} data-kind={track.kind}>
@@ -490,9 +518,9 @@ const TrackRows = memo(function TrackRows(p: {
                 let start = c.start;
                 let duration = c.duration;
                 let sourceIn = c.sourceIn;
-                if (drag && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id) {
-                  if (drag.kind === "move") start += drag.delta;
-                  else if (drag.kind === "trim-start") {
+                if (drag?.kind === "move" && inDrag(c)) start += drag.delta;
+                else if (drag && (drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id) {
+                  if (drag.kind === "trim-start") {
                     start += drag.delta;
                     duration -= drag.delta;
                     sourceIn += drag.delta;
@@ -513,7 +541,7 @@ const TrackRows = memo(function TrackRows(p: {
                     selected={p.selection.has(c.id)}
                     markers={p.markers.get(c.id)}
                     range={`${formatClock(start, fps)} – ${formatClock(start + duration, fps)}`}
-                    dragging={drag !== null && (drag.kind === "move" || drag.kind === "trim-start" || drag.kind === "trim-end") && drag.clip.id === c.id && drag.moved}
+                    dragging={drag !== null && drag.kind !== "playhead" && drag.kind !== "caption" && inDrag(c) && drag.moved}
                     onPointerDown={(e) => handlers.clipDown(e, c, track)}
                   />
                 );
@@ -622,7 +650,11 @@ function ClipView(p: ClipViewProps) {
     >
       {wave && <span className="rf-clip-wave" style={wave} aria-hidden="true" />}
       {picture && thumb && !missing && !waveform && (
-        <span className="rf-clip-thumbs" style={{ backgroundImage: `url(${thumb})`, width: roomy ? Math.min(160, p.width * 0.42) : "100%" }} aria-hidden="true" />
+        <span
+          className={`rf-clip-thumbs${p.asset?.hasAlpha ? " is-alpha" : ""}`}
+          style={{ backgroundImage: p.asset?.hasAlpha ? `url(${thumb}), var(--checker)` : `url(${thumb})`, width: roomy ? Math.min(160, p.width * 0.42) : "100%" }}
+          aria-hidden="true"
+        />
       )}
       <span className="rf-clip-text">
         <span className="rf-clip-label">

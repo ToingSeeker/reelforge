@@ -167,6 +167,7 @@ function rail(current) {
 function unavailableCard({ compact = false } = {}) {
   const st = core.status();
   const w = statusWords();
+  if (live.revoked) return revokedCard();
   if (st.live || st.transport === 'connecting') return null;
   const stopped = st.engine === 'stopped';
   return h(
@@ -188,6 +189,21 @@ function unavailableCard({ compact = false } = {}) {
         ),
     h('p', { class: 'muted small', text: 'You can still look at what was synced and queue instructions; they run when the Mac is back.' }),
     h('div', { class: 'row gap mt' }, button('Retry connection', { iconName: 'refresh', small: true, onclick: () => core.connect() })),
+  );
+}
+
+/**
+ * The Mac removed this phone: nothing sent from here will run there again, and retrying can't fix it. Say so,
+ * and lead to pairing again (the stream answers 401 on every connect, so this holds across reloads).
+ */
+function revokedCard() {
+  const mac = pairing()?.macName ?? 'Your Mac';
+  return h(
+    'section',
+    { class: 'card notice warn', role: 'status' },
+    h('div', { class: 'row gap' }, icon('unlock'), h('div', { class: 'grow' }, h('b', { text: 'This phone is no longer paired' }), h('p', { class: 'muted', text: `${mac} removed it, so it can’t send instructions or exports there. What you see was synced before.` }))),
+    h('p', { class: 'muted small', text: 'To use it again, make a new pairing code on the Mac (Settings → Remote Access) and pair again.' }),
+    h('div', { class: 'row gap mt' }, button('Pair again', { kind: 'mint', iconName: 'qr', small: true, onclick: () => go('#/pair') })),
   );
 }
 
@@ -855,6 +871,8 @@ function sessionScreen(r) {
     'div',
     { class: 'session' },
     head,
+    // Under the header, not in the scrolling feed (which opens at its newest entry): always in sight.
+    elsewhere ? lockNotice(editing) : null,
     h(
       'div',
       { class: 's-body' },
@@ -862,6 +880,11 @@ function sessionScreen(r) {
       composerSlot(p.id),
     ),
   );
+}
+
+/** Why Edit is greyed out, said on the page and not only to screen readers: another phone holds the edit. */
+function lockNotice(editing) {
+  return h('p', { class: 's-lock', role: 'status' }, icon('lock', { size: 16 }), h('span', { text: `${editing.deviceName} is editing this project by hand. Edit opens here once they tap Done there.` }));
 }
 
 // The composer stays where it is across redraws: moving it out of the page, even for a moment, takes the
@@ -1322,6 +1345,12 @@ const INSTRUCTION_STATE = {
 function instructionCard(p, it) {
   // Taken by the Mac: "Agent is planning changes" (activityCard) reports it, from the Mac's own events.
   if (['accepted', 'running'].includes(it.state)) return userBubble(it.instruction, it.createdAt, it.about ? 'About a version' : null);
+  // Sent again (Run on current timeline / Try again): the new one follows below; this one only says so, once.
+  if (it.replacedBy)
+    return [
+      userBubble(it.instruction, it.createdAt, it.about ? 'About a version' : null),
+      h('div', { class: 'agent replaced' }, h('div', { class: 'hd' }, icon('refresh'), h('span', { class: 'grow', text: 'Sent again on the current timeline, below' }))),
+    ];
   const [text, tone, ic, hint] = INSTRUCTION_STATE[it.state] ?? [capital(it.state), 'neutral', null, null];
   const editable = ['local', 'queued'].includes(it.state);
   const actions = [];
@@ -1434,7 +1463,7 @@ function composer(projectId) {
     // (the card in the conversation offers Edit / Try again).
     let sending = false;
     const submit = () => {
-      if (sending) return;
+      if (sending || live.revoked) return;
       const text = area.value.trim();
       if (!text) return area.focus();
       sending = true;
@@ -1480,7 +1509,9 @@ function composer(projectId) {
   c.sendBtn.classList.toggle('queue', offline);
   c.sendBtn.replaceChildren(offline ? h('span', { class: 'send-label', text: 'Queue' }) : icon('send', { size: 20 }));
   c.hint.hidden = !offline;
-  c.hint.textContent = relayDown ? 'Queue instruction · no connection: saved on this phone, sent when you’re back online.' : 'Queue instruction · your Mac is away: it waits in the queue and runs when the Mac connects.';
+  // A removed phone can't queue anything: nothing it sends will ever run on that Mac.
+  c.sendBtn.disabled = live.revoked || null;
+  c.hint.textContent = live.revoked ? 'This phone is no longer paired with the Mac. Pair again to send instructions.' : relayDown ? 'Queue instruction · no connection: saved on this phone, sent when you’re back online.' : 'Queue instruction · your Mac is away: it waits in the queue and runs when the Mac connects.';
   const ab = pendingAbout?.projectId === projectId ? pendingAbout : null;
   c.about.hidden = !ab;
   c.about.replaceChildren(...(ab ? [icon('history', { size: 14 }), h('span', { text: `About version ${ab.version}` }), iconButton('x', 'Don’t refer to this version', () => ((pendingAbout = null), render()))] : []));
@@ -1922,7 +1953,7 @@ function openDeviceSheet(part = 'all') {
     const rows = [
       ['Connection', st.transport === 'connected' ? 'Connected to the relay' : capital(st.transport)],
       ['Engine', { ready: 'Ready', busy: 'Busy', stopped: 'Stopped', unavailable: 'Unavailable', unknown: 'Unknown' }[st.engine]],
-      ['Runs', st.live && snapEngine ? (snapEngine.background ? 'In the background (no window needed)' : 'Inside the editor app') : 'Unknown'],
+      ['Runs', st.live && snapEngine ? core.engineMode(snapEngine) : 'Unknown'],
       ['Desktop editor', { open: 'Open', closed: 'Closed', unknown: 'Unknown' }[st.editor]],
       ['Last seen', st.live ? 'Now' : st.lastSeen ? ago(st.lastSeen) : 'Unknown'],
       ['Remote Ready', !st.live || !rr ? 'Unknown' : !rr.enabled ? 'Off' : rr.power === 'battery' ? 'On · on battery, so macOS may still sleep' : rr.active ? 'On · keeping the Mac awake on power' : 'On'],

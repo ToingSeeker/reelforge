@@ -7,7 +7,9 @@ import { join } from "node:path";
 import {
   CreateMotionInputSchema,
   MOTION_TEMPLATE_IDS,
+  MOTION_MAX_SECONDS,
   MOTION_TEMPLATES,
+  motionFileName,
   motionRenderSpec,
   openDatabase,
   parse,
@@ -15,7 +17,7 @@ import {
   TimelineStore,
   type TimelineOp,
 } from "@reelforge/core";
-import { createRenderJob, ensureProxy, importMedia, motionAvailable, RenderRunner, renderMotion } from "../src/index.ts";
+import { createRenderJob, ensureProxy, importMedia, motionAvailable, motionOutputPath, RenderRunner, renderMotion } from "../src/index.ts";
 import { hasAlphaPixFmt } from "../src/probe.ts";
 
 const ff = (args: string[]) => execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args]);
@@ -125,6 +127,24 @@ test("motion inputs are validated against the template", () => {
   assert.equal(a.frames, 151, "one spare frame so the probed length never comes up short");
 });
 
+test("motion graphics are at most MOTION_MAX_SECONDS long, whoever asks (not only the desktop panel)", () => {
+  const input = parse(CreateMotionInputSchema, { template: "badge", props: MOTION_TEMPLATES.badge.defaults, durationFrames: 30 });
+  const at = (durationFrames: number, fps: { num: number; den: number }) => () => motionRenderSpec({ ...input, durationFrames }, { width: 640, height: 360, fps });
+  assert.equal(MOTION_MAX_SECONDS, 60);
+  assert.equal(at(1800, { num: 30, den: 1 })().frames, 1801);
+  assert.throws(at(1801, { num: 30, den: 1 }), (e: { code?: string; message?: string }) => e.code === "VALIDATION_ERROR" && /at most 60 seconds \(1800 frames/.test(e.message ?? ""));
+  assert.equal(at(3596, { num: 60000, den: 1001 })().frames, 3597);
+  assert.throws(at(3597, { num: 60000, den: 1001 }), /at most 60 seconds/);
+  assert.throws(at(24 * 60 * 60 * 240, { num: 30, den: 1 }), /at most 60 seconds/);
+});
+
+test("rendered graphics get a readable file name", () => {
+  assert.equal(motionFileName("title-card", { ...MOTION_TEMPLATES["title-card"].defaults }), "Title card - Your headline");
+  assert.equal(motionFileName("lower-third", { ...MOTION_TEMPLATES["lower-third"].defaults, name: "Dr. A/B: \"C\"" }), "Lower third - Dr. A B C");
+  assert.equal(motionFileName("badge", { ...MOTION_TEMPLATES.badge.defaults, text: "../.." }), "Badge");
+  assert.equal(motionFileName("badge", { ...MOTION_TEMPLATES.badge.defaults, text: "x".repeat(40) }).length, "Badge - ".length + 40);
+});
+
 test("Remotion renders a template to ProRes 4444 with alpha at the project size", { skip: !motionAvailable().ok && "motion renderer not installed", timeout: 300_000 }, async (t) => {
   const { home } = setup(t);
   const input = parse(CreateMotionInputSchema, { template: "badge", props: MOTION_TEMPLATES.badge.defaults, durationFrames: 20 });
@@ -133,6 +153,9 @@ test("Remotion renders a template to ProRes 4444 with alpha at the project size"
   // A stable bundle cache, so re-runs don't re-bundle the compositions.
   const out = await renderMotion(spec, { generatedDir: join(home, "generated"), cacheDir: join(tmpdir(), "reelforge-test-motion-cache"), onProgress: (p) => progress.push(p) });
   assert.ok(existsSync(out));
+  // Imported under a readable name; the key-named render stays as the cache.
+  assert.equal(out, join(home, "generated", "motion", spec.key, "Badge - NEW.mov"));
+  assert.ok(existsSync(motionOutputPath(join(home, "generated"), spec.key)));
   const info = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-print_format", "json", "-show_streams", out]).toString()) as { streams: { codec_name: string; pix_fmt: string; width: number; height: number; nb_frames: string }[] };
   const v = info.streams[0]!;
   assert.deepEqual([v.codec_name, v.width, v.height, Number(v.nb_frames)], ["prores", 640, 360, 21]);
@@ -144,4 +167,20 @@ test("Remotion renders a template to ProRes 4444 with alpha at the project size"
   // Rendering the same spec again reuses the file.
   const again = await renderMotion(spec, { generatedDir: join(home, "generated"), cacheDir: join(tmpdir(), "reelforge-test-motion-cache") });
   assert.equal(again, out);
+});
+
+test("the renderer accepts a graphic exactly at the length limit and explains a refusal", { skip: !motionAvailable().ok && "motion renderer not installed", timeout: 300_000 }, async (t) => {
+  const { home } = setup(t);
+  const cacheDir = join(tmpdir(), "reelforge-test-motion-cache");
+  // At 5 fps the 60 s limit is 300 frames: rendered as 301 (one spare), which the renderer must not count as over.
+  const input = parse(CreateMotionInputSchema, { template: "badge", props: MOTION_TEMPLATES.badge.defaults, durationFrames: 300 });
+  const spec = motionRenderSpec(input, { width: 160, height: 90, fps: { num: 5, den: 1 } });
+  const out = await renderMotion(spec, { generatedDir: join(home, "generated"), cacheDir });
+  assert.ok(existsSync(out));
+  // A request that skipped the engine's checks: the error names the field, not a dump of zod issues.
+  const bad = { ...spec, key: "00000000000000b1", props: { ...spec.props, text: "" } };
+  await assert.rejects(renderMotion(bad, { generatedDir: join(home, "generated"), cacheDir }), (e: Error) => {
+    assert.match(e.message, /^motion graphic render failed: invalid motion graphic: props\.text: text is required$/);
+    return true;
+  });
 });

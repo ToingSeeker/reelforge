@@ -43,14 +43,49 @@ export async function importMedia(db: Database, projectId: string, paths: string
   return result;
 }
 
+/** How deep folder imports look: deep enough for "Footage/Day 1/Cam A", not a whole disk. */
+const MAX_FOLDER_DEPTH = 8;
+
 /**
- * Folders the user dropped or picked become the media files directly inside them (not subfolders,
- * not hidden files); other entries are only counted. For the person's own actions (desktop, REST):
- * MCP imports never take folders, so a client can't use import to list a directory.
+ * Folders the user dropped or picked become the media files inside them, subfolders included
+ * (not hidden files or folders, and symlinked folders aren't followed, so a link loop can't
+ * recurse); other entries are only counted. At most MAX_IMPORT_BATCH + 1 files are collected,
+ * so importMedia still reports the batch limit. For the person's own actions (desktop, REST,
+ * CLI): MCP imports never take folders, so a client can't use import to list a directory.
  */
 export function expandFolders(paths: string[]): { paths: string[]; skipped: number } {
   let skipped = 0;
   const out: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    } catch {
+      skipped++; // unreadable folder
+      return;
+    }
+    for (const e of entries) {
+      if (out.length > MAX_IMPORT_BATCH) return;
+      const full = join(dir, e.name);
+      if (e.name.startsWith(".")) {
+        skipped++;
+        continue;
+      }
+      if (e.isDirectory()) {
+        if (depth < MAX_FOLDER_DEPTH) walk(full, depth + 1);
+        else skipped++;
+        continue;
+      }
+      let file = false;
+      try {
+        file = (e.isFile() || e.isSymbolicLink()) && statSync(full).isFile();
+      } catch {
+        // dangling link
+      }
+      if (file && extname(e.name).toLowerCase() in SUPPORTED_EXTENSIONS) out.push(full);
+      else skipped++;
+    }
+  };
   for (const p of paths) {
     let dir = false;
     try {
@@ -58,21 +93,8 @@ export function expandFolders(paths: string[]): { paths: string[]; skipped: numb
     } catch {
       // not there: importMedia reports it
     }
-    if (!dir) {
-      out.push(p);
-      continue;
-    }
-    for (const name of readdirSync(p).sort()) {
-      const full = join(p, name);
-      let file = false;
-      try {
-        file = statSync(full).isFile();
-      } catch {
-        // dangling link
-      }
-      if (file && !name.startsWith(".") && extname(name).toLowerCase() in SUPPORTED_EXTENSIONS) out.push(full);
-      else skipped++;
-    }
+    if (dir) walk(p, 1);
+    else out.push(p);
   }
   return { paths: out, skipped };
 }

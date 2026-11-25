@@ -162,6 +162,8 @@ test("render and preview from the CLI, JSON job result, path rules", async (t) =
   const id = (await run("project", "create", "--name", "Render", "--width", "320", "--height", "568")).json.project.id;
   const asset = (await run("media", "import", id, f.portrait)).json.imported[0];
   await run("clip", "add", id, "--track", "V1", "--asset", asset.id, "--start", "0", "--duration", "1s");
+  // A dissolve from the first frame of the source has no handle to dissolve from: the render says it's a cut.
+  await run("clip", "add", id, "--track", "V1", "--asset", asset.id, "--start", "1s", "--duration", "10", "--props", '{"transitionIn":6}');
 
   const { mkdtempSync, existsSync, realpathSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -173,6 +175,7 @@ test("render and preview from the CLI, JSON job result, path rules", async (t) =
   assert.equal(r.code, 0, JSON.stringify(r.error ?? r.json));
   assert.equal(r.json.job.state, "completed");
   assert.equal(existsSync(out), true);
+  assert.match(r.json.warnings.join(" "), /transition into portrait\.mp4 won't play/);
 
   const again = await run("render", id, "--out", out);
   assert.equal(again.code, 2, "never overwrites an existing file");
@@ -181,6 +184,8 @@ test("render and preview from the CLI, JSON job result, path rules", async (t) =
   const p = await run("preview", id);
   assert.equal(p.json.job.kind, "preview");
   assert.equal(p.json.job.settings.useProxies, true);
+  const same = await run("preview", id);
+  assert.equal(same.json.job.id, p.json.job.id, "same revision: the finished preview is reused, like the API");
 
   const jobs = await run("jobs", "list", id);
   assert.equal(jobs.json.jobs.length, 2);
@@ -298,6 +303,9 @@ test("serve --token-stdin: the token arrives on stdin and no child process ever 
     const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
     const project = ((await (await fetch(`${ready.url}/v1/projects`, { method: "POST", headers: auth, body: JSON.stringify({ name: "T" }) })).json()) as { project?: { id: string } }).project;
     assert.ok(project?.id, `${mode}: the token authenticates`);
+    // The phone says how the engine runs: the editor's child (--token-stdin) or one started by hand.
+    const engine = ((await (await fetch(`${ready.url}/v1/engine`, { headers: auth })).json()) as { engine: { mode: string; background: boolean } }).engine;
+    assert.deepEqual([engine.mode, engine.background], [mode === "stdin" ? "editor" : "standalone", false]);
     await fetch(`${ready.url}/v1/projects/${project.id}/assets`, { method: "POST", headers: auth, body: JSON.stringify({ paths: [join(home, "clip.mp4")] }) });
     const dumps = (await import("node:fs")).readdirSync(home).filter((f) => f.startsWith("child-env-"));
     assert.ok(dumps.length > 0, `${mode}: ffprobe ran`);
@@ -364,4 +372,97 @@ test("ai from the CLI: propose (local), apply needs --yes, consent flags", async
   assert.equal(blocked.code, 7, "CONSENT_REQUIRED");
   assert.equal((await run("ai", "consent", id)).code, 2, "needs --grant or --revoke");
   assert.ok((await run("ai", "consent", id, "--grant")).json.consent.grantedAt);
+});
+
+test("media import: folders (subfolders too), and a non-zero exit when nothing imports", async (t) => {
+  const run = harness(t);
+  const { fixtures } = await import("../../media/test/fixtures.ts");
+  const { copyFileSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const f = fixtures();
+  const id = (await run("project", "create", "--name", "Import")).json.project.id;
+  const dir = mkdtempSync(join(tmpdir(), "reelforge-cli-folder-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, "day 1", "cam a"), { recursive: true });
+  copyFileSync(f.portrait, join(dir, "day 1", "cam a", "take.mp4"));
+  copyFileSync(f.wav, join(dir, "vo.wav"));
+  writeFileSync(join(dir, "notes.txt"), "x");
+
+  const folder = await run("media", "import", id, dir);
+  assert.equal(folder.code, 0, JSON.stringify(folder.error));
+  assert.deepEqual(folder.json.imported.map((a: any) => a.filename).sort(), ["take.mp4", "vo.wav"]);
+  assert.equal(folder.json.skipped, 1);
+
+  const allBad = await run("media", "import", id, f.corrupt, f.avi);
+  assert.equal(allBad.code, 2, "nothing imported is a failure");
+  assert.equal(allBad.json.failed.length, 2, "the reasons are still printed");
+  assert.equal((await run("media", "import", id, join(dir, "nope.mp4"))).code, 3);
+  assert.equal((await run("media", "import", id, f.portrait, f.corrupt)).code, 0, "some imported (or already there) is success");
+
+  const empty = mkdtempSync(join(tmpdir(), "reelforge-cli-empty-"));
+  t.after(() => rmSync(empty, { recursive: true, force: true }));
+  const none = await run("media", "import", id, empty);
+  assert.equal(none.code, 2);
+  assert.match(none.error.message, /no media files there/);
+});
+
+test("flag validation: --ops-file, --max-words, --language, --recipient; help lists every exit code", async (t) => {
+  const run = harness(t);
+  const id = (await run("project", "create", "--name", "Flags")).json.project.id;
+  const ops = await run("timeline", "apply", id, "--ops-file", "/nonexistent/ops.json");
+  assert.equal(ops.code, 3);
+  assert.equal(ops.error.code, "NOT_FOUND");
+  assert.match(ops.error.message, /ops file not found/);
+  assert.equal((await run("timeline", "apply", id, "--ops-file", tmpdir())).code, 2);
+
+  const words = await run("captions", "generate", id, "--max-words", "0");
+  assert.equal(words.code, 2);
+  assert.match(words.error.message, /--max-words must be between 1 and 12/);
+  const lang = await run("captions", "generate", id, "--language", "english");
+  assert.equal(lang.code, 2);
+  assert.match(lang.error.message, /invalid language "english"/);
+
+  const { fixtures } = await import("../../media/test/fixtures.ts");
+  const asset = (await run("media", "import", id, fixtures().wav)).json.imported[0];
+  const analyze = await run("media", "analyze", id, asset.id, "--kinds", "beats", "--language", "xx-yy");
+  assert.equal(analyze.code, 2, "a bad language is invalid input, not an internal error");
+  // Default kinds are the ones that apply: a silent video only gets scene detection.
+  const silent = (await run("media", "import", id, fixtures().silent)).json.imported[0];
+  const scenes = await run("media", "analyze", id, silent.id);
+  assert.equal(scenes.code, 0, JSON.stringify(scenes.error));
+  assert.deepEqual(scenes.json.analyses.map((a: any) => [a.kind, a.state]), [["scenes", "completed"]]);
+
+  const consent = await run("ai", "consent", id, "--grant", "--recipient", "openai");
+  assert.deepEqual(consent.json.consent.recipients, ["openai"]);
+  assert.deepEqual((await run("ai", "consent", id, "--grant", "--recipient", "claude-code")).json.consent.recipients, ["openai", "anthropic"], "a provider id stands for its recipient");
+  assert.equal((await run("ai", "consent", id, "--grant", "--recipient", "skynet")).code, 2);
+  assert.deepEqual((await run("ai", "consent", id, "--revoke", "--recipient", "openai")).json.consent.recipients, ["anthropic"]);
+  assert.deepEqual((await run("ai", "consent", id, "--grant")).json.consent.recipients, ["anthropic", "*"], "no --recipient: everyone, as before");
+
+  let help = "";
+  await main(["--help"], { out: (s) => (help += s), err: () => {}, isTTY: false, env: {} });
+  for (const c of ["5 unauthorized", "7 AI consent required", "8 busy"]) assert.ok(help.includes(c), c);
+  assert.match(help, /--provider anthropic\|claude-code\|codex\|ollama/);
+});
+
+test("ai providers lists every provider ai propose accepts", async (t) => {
+  const run = harness(t);
+  const prev = process.env.REELFORGE_OLLAMA_URL;
+  process.env.REELFORGE_OLLAMA_URL = "http://127.0.0.1:9"; // nothing there: Ollama unavailable, quickly
+  t.after(() => (prev === undefined ? delete process.env.REELFORGE_OLLAMA_URL : (process.env.REELFORGE_OLLAMA_URL = prev)));
+  const r = await run("ai", "providers");
+  assert.equal(r.code, 0, JSON.stringify(r.error));
+  assert.deepEqual(r.json.providers.map((p: any) => p.id), ["anthropic", "claude-code", "codex", "ollama"]);
+  assert.deepEqual(r.json.providers.map((p: any) => p.recipient), ["anthropic", "anthropic", "openai", "ollama"]);
+});
+
+test("piped into head, the CLI exits quietly instead of an EPIPE stack", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const home = mkdtempSync(join(tmpdir(), "reelforge-epipe-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  // More JSON than a pipe buffers, so the writer is still writing when head goes away.
+  for (let i = 0; i < 400; i++) await main(["project", "create", "--name", `Project number ${i}`], { out: () => {}, err: () => {}, isTTY: false, env: { REELFORGE_HOME: home } });
+  const bin = new URL("../bin/reelforge.js", import.meta.url).pathname;
+  const r = spawnSync("/bin/bash", ["-c", `set -o pipefail; "${process.execPath}" "${bin}" --home "${home}" project list | head -c 1 >/dev/null; echo "exit=$?"`], { encoding: "utf8" });
+  assert.equal(r.stdout.trim(), "exit=0");
+  assert.doesNotMatch(r.stderr, /EPIPE|Error/);
 });

@@ -4,8 +4,8 @@ import { ReelForgeError } from "./errors.ts";
 import { assertRevision } from "./revisions.ts";
 import { buildRenderPlan } from "./render-plan.ts";
 import { TimelineStore } from "./timeline.ts";
-import type { TimelineDiff } from "./timeline-ops.ts";
-import { ProjectIdSchema, trackLabels, type Actor, type AIConsent, type AIProposal, type ProposalChange, type Timeline, type TimelineOp } from "./schema.ts";
+import { isEmptyDiff, type TimelineDiff } from "./timeline-ops.ts";
+import { ProjectIdSchema, trackLabels, type Actor, type AiFx, type AIConsent, type AIProposal, type ProposalChange, type Timeline, type TimelineOp } from "./schema.ts";
 import { parse } from "./validate.ts";
 
 interface ProposalRow {
@@ -63,7 +63,15 @@ export function describeChanges(before: Timeline, diff: TimelineDiff): ProposalC
   const labels = trackLabels(before.tracks);
   const name = new Map(before.assets.map((a) => [a.id, a.filename]));
   const props = (p: Record<string, unknown>) => {
-    const keys = Object.entries(p).map(([k, v]) => `${k} ${typeof v === "number" ? Math.round(v * 1000) / 1000 : v}`);
+    const value = (k: string, v: unknown) => {
+      if (typeof v === "number") return Math.round(v * 1000) / 1000;
+      // AI effects: name, source time range and text (times are in the clip's source, like sourceIn).
+      if (k === "aiEffects" && Array.isArray(v)) {
+        return (v as AiFx[]).map((e) => `${e.fx} ${s(e.start)}–${s(e.end)} of source${e.text ? ` “${e.text.slice(0, 40)}”` : ""}`).join("; ") || "none";
+      }
+      return v !== null && typeof v === "object" ? JSON.stringify(v) : v;
+    };
+    const keys = Object.entries(p).map(([k, v]) => `${k} ${value(k, v)}`);
     return keys.length ? ` · ${keys.join(", ")}` : "";
   };
   const out: ProposalChange[] = [];
@@ -121,6 +129,37 @@ export function engineWarnings(after: Timeline): string[] {
   return out;
 }
 
+/** Applying is refused for good once the timeline moved on: retrying can't help, a new proposal can. */
+function staleError(p: AIProposal, details?: Record<string, unknown>): ReelForgeError {
+  return new ReelForgeError(
+    "REVISION_CONFLICT",
+    `the timeline changed since this proposal was made (revision ${p.baseRevision}), so it can no longer be applied; ask for a new proposal`,
+    { ...details, proposalId: p.id, baseRevision: p.baseRevision, status: "stale" },
+  );
+}
+
+/**
+ * AI effects the proposal adds or changes must lie inside their clip's source media: an effect past the end
+ * of the footage never plays. (The schema can't check this: it doesn't know the media's length.)
+ */
+function assertEffectsInSource(before: Timeline, diff: TimelineDiff) {
+  const length = new Map(before.assets.map((a) => [a.id, a.durationFrames]));
+  const issues: { path: string; message: string }[] = [];
+  for (const ch of diff.clips) {
+    const c = ch.after;
+    const max = c ? length.get(c.assetId) : null;
+    if (!c || max == null) continue;
+    const old = new Set((ch.before?.props.aiEffects ?? []).map((e) => JSON.stringify(e)));
+    (c.props.aiEffects ?? []).forEach((e, i) => {
+      if (old.has(JSON.stringify(e))) return;
+      if (e.end > max) {
+        issues.push({ path: `clip ${c.id} props.aiEffects.${i}`, message: `${e.fx} runs to source frame ${e.end} but the media is only ${max} frames long (start/end are source frames)` });
+      }
+    });
+  }
+  if (issues.length) throw new ReelForgeError("VALIDATION_ERROR", issues.map((i) => `${i.path}: ${i.message}`).join("; "), { issues });
+}
+
 export interface NewProposal {
   instruction: string;
   /** Default "user". */
@@ -160,7 +199,15 @@ export class ProposalStore {
           const before = timeline.get(pid);
           return { before, after: before, operations: [] as TimelineOp[], diff: { tracks: [], clips: [], captions: [] }, durationAfter: before.durationFrames };
         })();
-    const warnings = [...p.warnings, ...engineWarnings(preview.after)];
+    assertEffectsInSource(preview.before, preview.diff);
+    // Only what this proposal causes: problems the timeline already had are not its warnings.
+    const already = new Set(engineWarnings(preview.before));
+    const warnings = [...p.warnings, ...engineWarnings(preview.after).filter((w) => !already.has(w))];
+    // Operations that change nothing (the timeline already looks like that) are stored as "no changes", so
+    // the proposal can't be approved and then recorded as applied without any edit having happened.
+    const noop = preview.operations.length > 0 && isEmptyDiff(preview.diff);
+    if (noop) warnings.push("These operations would not change anything on the timeline.");
+    const operations = noop ? [] : preview.operations;
     const id = randomUUID();
     this.#db
       .prepare(
@@ -170,15 +217,26 @@ export class ProposalStore {
       )
       .run(
         id, pid, preview.before.project.revision, p.instruction, p.requestedBy ?? "user", JSON.stringify(p.selection), p.provider, p.model, p.summary,
-        JSON.stringify(preview.operations), JSON.stringify(p.explanations), JSON.stringify(warnings),
+        JSON.stringify(operations), JSON.stringify(noop ? [] : p.explanations), JSON.stringify(warnings),
         JSON.stringify(describeChanges(preview.before, preview.diff)), preview.before.durationFrames, preview.durationAfter,
         p.usage ? JSON.stringify(p.usage) : null, this.#now(),
       );
     return this.get(id);
   }
 
+  /** Pending proposals whose project has moved on can never apply: record them as stale. */
+  #markStale(where: string, arg: string) {
+    this.#db
+      .prepare(
+        `UPDATE ai_proposals SET status = 'stale' WHERE status = 'pending' AND ${where}
+           AND base_revision <> (SELECT revision FROM projects WHERE projects.id = ai_proposals.project_id)`,
+      )
+      .run(arg);
+  }
+
   get(id: string): AIProposal {
     const pid = parse(ProjectIdSchema, id);
+    this.#markStale("id = ?", pid);
     const row = this.#db.prepare("SELECT * FROM ai_proposals WHERE id = ?").get(pid) as unknown as ProposalRow | undefined;
     if (!row) throw new ReelForgeError("NOT_FOUND", `proposal ${pid} not found`, { proposalId: pid });
     return toProposal(row);
@@ -186,6 +244,7 @@ export class ProposalStore {
 
   list(projectId: string, limit = 50): AIProposal[] {
     const pid = parse(ProjectIdSchema, projectId);
+    this.#markStale("project_id = ?", pid);
     const rows = this.#db.prepare("SELECT * FROM ai_proposals WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?").all(pid, limit) as unknown as ProposalRow[];
     return rows.map(toProposal);
   }
@@ -197,6 +256,7 @@ export class ProposalStore {
    */
   apply(proposalId: string, approval: { by: Actor; channel: string }): { proposal: AIProposal; timeline: Timeline } {
     const p = this.get(proposalId);
+    if (p.status === "stale") throw staleError(p);
     if (p.status !== "pending") throw new ReelForgeError("VALIDATION_ERROR", `proposal is already ${p.status}`, { proposalId, status: p.status });
     if (!p.operations.length) throw new ReelForgeError("VALIDATION_ERROR", "this proposal has no changes to apply");
     if (!approval.channel) throw new ReelForgeError("VALIDATION_ERROR", "an approval needs a channel (how the person approved it)");
@@ -205,6 +265,7 @@ export class ProposalStore {
     } catch (e) {
       if (e instanceof ReelForgeError && e.code === "REVISION_CONFLICT") {
         this.#db.prepare("UPDATE ai_proposals SET status = 'stale' WHERE id = ? AND status = 'pending'").run(p.id);
+        throw staleError(p, e.details);
       }
       throw e;
     }
@@ -218,9 +279,10 @@ export class ProposalStore {
     return { proposal: this.get(p.id), timeline };
   }
 
+  /** Dismiss a proposal that was never applied (pending, or stale because the timeline moved on). */
   reject(proposalId: string, by: Actor): AIProposal {
     const p = this.get(proposalId);
-    if (p.status !== "pending") throw new ReelForgeError("VALIDATION_ERROR", `proposal is already ${p.status}`, { proposalId, status: p.status });
+    if (p.status !== "pending" && p.status !== "stale") throw new ReelForgeError("VALIDATION_ERROR", `proposal is already ${p.status}`, { proposalId, status: p.status });
     this.#db.prepare("UPDATE ai_proposals SET status = 'rejected', approved_by = ?, decided_at = ? WHERE id = ?").run(by, this.#now(), p.id);
     return this.get(p.id);
   }
