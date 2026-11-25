@@ -89,7 +89,20 @@ export class JobStore {
     retryOf: string | null = null,
   ): RenderJob {
     const pid = parse(ProjectIdSchema, projectId);
-    const plan = buildRenderPlan(new TimelineStore(this.#db).get(pid));
+    const timeline = new TimelineStore(this.#db).get(pid);
+    const plan = buildRenderPlan(timeline);
+    if (kind === "export") {
+      // A file that changed since import may no longer be the media the clips were cut from (shorter,
+      // re-encoded): the preview still plays it, but an export would bake in whatever it now is.
+      const changed = timeline.assets.filter((a) => a.status === "changed" && a.id in plan.sources);
+      if (changed.length) {
+        throw new ReelForgeError(
+          "VALIDATION_ERROR",
+          `media changed on disk since import: ${changed.map((a) => a.filename).join(", ")}; relink it (to the same or the updated file) before exporting, or re-import it if it is different media now`,
+          { changed: changed.map((a) => a.id) },
+        );
+      }
+    }
     // Settings may depend on the plan (output size); the job is only visible once complete.
     const resolved = typeof settings === "function" ? settings(plan) : settings;
     const id = randomUUID();
@@ -188,7 +201,25 @@ export class JobStore {
     if (job.state !== "failed" && job.state !== "cancelled") {
       throw new ReelForgeError("VALIDATION_ERROR", `only failed or cancelled jobs can be retried (this one is ${job.state})`, { jobId });
     }
-    return this.create(job.projectId, job.kind, job.settings, job.kind === "export" ? job.outputPath : null, job.id);
+    return transaction(this.#db, () => {
+      // Each job is retried once: a second retry would queue another render to the same file.
+      const again = this.#db.prepare("SELECT id, state FROM render_jobs WHERE retry_of = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(job.id) as
+        | { id: string; state: JobState }
+        | undefined;
+      if (again) {
+        throw new ReelForgeError("VALIDATION_ERROR", `this job was already retried as job ${again.id} (${again.state}); retry that one instead`, {
+          jobId,
+          retryJobId: again.id,
+        });
+      }
+      if (job.kind === "export" && job.outputPath) {
+        const busy = this.#db.prepare(`SELECT id FROM render_jobs WHERE kind = 'export' AND output_path = ? AND state IN ${ACTIVE} LIMIT 1`).get(job.outputPath) as
+          | { id: string }
+          | undefined;
+        if (busy) throw new ReelForgeError("BUSY", `another export to ${job.outputPath} is already queued or running (job ${busy.id})`, { jobId, busyJobId: busy.id });
+      }
+      return this.create(job.projectId, job.kind, job.settings, job.kind === "export" ? job.outputPath : null, job.id);
+    });
   }
 
   /** Jobs whose runner process died mid-render are failed, not left spinning forever. */

@@ -162,6 +162,9 @@ export function compileRender({ plan, settings, inputs, output, overlays = [], f
     const i = input(seg.assetId, ["-ss", sec(seg.renderSourceIn), "-t", sec(len + 1)]);
     const f = [
       `aresample=${AUDIO_RATE}`,
+      // Mono plays at full level on both sides, as in the live preview (Web Audio's up-mix); FFmpeg's own
+      // mono → stereo conversion treats it as a centre channel and lowers it by 3 dB.
+      ...(plan.sources[seg.assetId]?.channels === 1 ? ["pan=stereo|c0=c0|c1=c0"] : []),
       "aformat=sample_fmts=fltp:channel_layouts=stereo",
       "apad",
       `atrim=end_sample=${smp(len)}`,

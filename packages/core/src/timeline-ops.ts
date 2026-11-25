@@ -4,7 +4,7 @@
 
 import { ReelForgeError } from "./errors.ts";
 import type { Asset, Caption, CaptionWord, Clip, ClipPropsPatch, TimelineOp, Track, TrackKind } from "./schema.ts";
-import { MAX_FRAME, sparseClipProps } from "./schema.ts";
+import { DEFAULT_CLIP_PROPS, MAX_FRAME, sparseClipProps } from "./schema.ts";
 import { secondsToFrames, type Rational } from "./timebase.ts";
 
 export type AssetInfo = Pick<Asset, "id" | "kind" | "durationFrames" | "hasVideo" | "hasAudio">;
@@ -23,6 +23,18 @@ function fail(message: string, details: Record<string, unknown> = {}): never {
   throw new ReelForgeError("VALIDATION_ERROR", message, details);
 }
 
+function notFound(message: string, details: Record<string, unknown>): never {
+  throw new ReelForgeError("NOT_FOUND", message, details);
+}
+
+const article = (word: string) => (/^[aeiou]/i.test(word) ? "an" : "a");
+
+/** Props that only change the picture: meaningless on a clip that only plays sound. */
+const PICTURE_PROPS = [
+  "fit", "scale", "scaleEnd", "x", "y", "xEnd", "yEnd", "rotation", "opacity", "cropLeft", "cropTop", "cropRight", "cropBottom",
+  "blur", "sharpen", "vignette", "grayscale", "sepia", "grain", "aiEffects",
+] as const;
+
 export function canPlace(asset: AssetInfo, track: TrackKind): boolean {
   switch (track) {
     case "video":
@@ -37,11 +49,21 @@ export function canPlace(asset: AssetInfo, track: TrackKind): boolean {
 
 export const clipEnd = (c: Clip) => c.start + c.duration;
 
-/** Fades and transitions shrink with the clip instead of blocking a trim. */
+/**
+ * Fades and transitions shrink with the clip instead of blocking a trim. When both fades no
+ * longer fit, they share the clip in proportion, so neither one silently disappears.
+ */
 function fitProps(p: ClipPropsPatch, duration: number): ClipPropsPatch {
   const out = { ...p };
-  if (out.fadeIn !== undefined) out.fadeIn = Math.min(out.fadeIn, duration);
-  if (out.fadeOut !== undefined) out.fadeOut = Math.min(out.fadeOut, duration - (out.fadeIn ?? 0));
+  const fadeIn = out.fadeIn ?? 0;
+  const fadeOut = out.fadeOut ?? 0;
+  if (fadeIn + fadeOut > duration) {
+    if (fadeIn > 0 && fadeOut > 0) {
+      out.fadeIn = Math.floor((fadeIn * duration) / (fadeIn + fadeOut));
+      out.fadeOut = duration - out.fadeIn;
+    } else if (fadeIn > 0) out.fadeIn = duration;
+    else out.fadeOut = duration;
+  }
   if (out.transitionIn !== undefined) out.transitionIn = Math.min(out.transitionIn, duration);
   if (out.scaleEnd === null) delete out.scaleEnd;
   return sparseClipProps(out);
@@ -71,7 +93,7 @@ class Draft {
   }
 
   caption(id: string): Caption {
-    return this.captions.get(id) ?? fail(`caption ${id} not found`, { captionId: id });
+    return this.captions.get(id) ?? notFound(`caption ${id} not found`, { captionId: id });
   }
 
   putCaption(c: Caption): void {
@@ -93,15 +115,15 @@ class Draft {
   }
 
   track(id: string): Track {
-    return this.tracks.get(id) ?? fail(`track ${id} not found`, { trackId: id });
+    return this.tracks.get(id) ?? notFound(`track ${id} not found`, { trackId: id });
   }
 
   clip(id: string): Clip {
-    return this.clips.get(id) ?? fail(`clip ${id} not found`, { clipId: id });
+    return this.clips.get(id) ?? notFound(`clip ${id} not found`, { clipId: id });
   }
 
   asset(id: string): AssetInfo {
-    return this.state.assets.get(id) ?? fail(`asset ${id} not found in this project`, { assetId: id });
+    return this.state.assets.get(id) ?? notFound(`asset ${id} not found in this project`, { assetId: id });
   }
 
   unlocked(trackId: string): Track {
@@ -115,7 +137,7 @@ class Draft {
     const track = this.track(c.trackId);
     const asset = this.asset(c.assetId);
     if (!canPlace(asset, track.kind)) {
-      fail(`a ${asset.kind} asset cannot go on the ${track.kind} track "${track.name}"`, { clipId: c.id, trackId: track.id });
+      fail(`${article(asset.kind)} ${asset.kind} asset cannot go on the ${track.kind} track "${track.name}"`, { clipId: c.id, trackId: track.id });
     }
     if (!Number.isInteger(c.start) || c.start < 0) fail("clip would start before 00:00", { clipId: c.id });
     if (!Number.isInteger(c.duration) || c.duration < 1) fail("clip must be at least one frame long", { clipId: c.id });
@@ -136,6 +158,28 @@ class Draft {
     }
   }
 
+  /** Refuse props the clip can't show or play (a blur on a sound-only clip, AI effects on a still). */
+  checkPatch(c: Clip, patch: ClipPropsPatch): void {
+    const track = this.track(c.trackId);
+    const asset = this.asset(c.assetId);
+    const set = (k: keyof ClipPropsPatch) => {
+      const v = patch[k];
+      if (v === undefined || JSON.stringify(v) === JSON.stringify(DEFAULT_CLIP_PROPS[k])) return false;
+      return true;
+    };
+    if (track.kind !== "video" && track.kind !== "overlay") {
+      const picture = PICTURE_PROPS.filter(set);
+      if (picture.length) {
+        fail(`${picture.join(", ")} only ${picture.length === 1 ? "applies" : "apply"} to picture clips (video or overlay tracks); "${track.name}" only plays sound`, {
+          clipId: c.id,
+          props: picture,
+        });
+      }
+    } else if (set("aiEffects") && asset.kind !== "video") {
+      fail(`AI effects work on video clips only, not on ${article(asset.kind)} ${asset.kind}`, { clipId: c.id });
+    }
+  }
+
   put(c: Clip): void {
     const fixed = { ...c, props: fitProps(c.props, c.duration) };
     this.clips.set(c.id, fixed);
@@ -149,6 +193,9 @@ function apply(d: Draft, op: TimelineOp, newId: () => string): void {
       d.unlocked(op.trackId);
       const asset = d.asset(op.assetId);
       const sourceIn = op.sourceIn ?? 0;
+      if (asset.durationFrames !== null && sourceIn >= asset.durationFrames) {
+        fail(`in point ${sourceIn} is past the end of the source media (${asset.durationFrames} frames)`, { sourceIn, sourceFrames: asset.durationFrames });
+      }
       const duration =
         op.duration ??
         (asset.durationFrames === null
@@ -156,12 +203,15 @@ function apply(d: Draft, op: TimelineOp, newId: () => string): void {
           : asset.durationFrames - sourceIn);
       const id = op.clipId ?? newId();
       if (d.clips.has(id)) fail(`clip ${id} already exists`, { clipId: id });
-      d.put({ id, trackId: op.trackId, assetId: op.assetId, start: op.start, duration, sourceIn, props: op.props ?? {} });
+      const clip = { id, trackId: op.trackId, assetId: op.assetId, start: op.start, duration, sourceIn, props: op.props ?? {} };
+      d.checkPatch(clip, clip.props);
+      d.put(clip);
       return;
     }
     case "clip.update": {
       const c = d.clip(op.clipId);
       d.unlocked(c.trackId);
+      d.checkPatch(c, op.props);
       d.put({ ...c, props: { ...c.props, ...op.props } });
       return;
     }
@@ -179,7 +229,9 @@ function apply(d: Draft, op: TimelineOp, newId: () => string): void {
       if (op.edge === "start") {
         if (op.frame >= clipEnd(c)) fail("trim start must stay before the clip end", { clipId: c.id });
         const delta = op.frame - c.start;
-        d.put({ ...c, start: op.frame, sourceIn: c.sourceIn + delta, duration: c.duration - delta });
+        // A still has no source time: its start can move anywhere, there is nothing "before" it.
+        const still = d.asset(c.assetId).kind === "image";
+        d.put({ ...c, start: op.frame, sourceIn: still ? Math.max(0, c.sourceIn + delta) : c.sourceIn + delta, duration: c.duration - delta });
       } else {
         if (op.frame <= c.start) fail("trim end must stay after the clip start", { clipId: c.id });
         d.put({ ...c, duration: op.frame - c.start });

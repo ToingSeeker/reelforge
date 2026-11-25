@@ -277,7 +277,11 @@ export function RemoteAccessSettings({ client, notify, onLoaded }: { client: Cli
       <div className="rf-connector-field">
         <span>Engine</span>
         <p className="rf-hint">
-          {engine?.background || st.engine.background ? "Running in the background" : "Running inside the editor (stops when the editor quits)"}
+          {engine?.background || st.engine.background
+            ? "Running in the background"
+            : st.engine.mode === "standalone"
+              ? "Started by hand (reelforge serve)"
+              : "Running inside the editor (stops when the editor quits)"}
           {engine ? ` · pid ${engine.pid}` : ""} · version {st.engine.version} · started {ago(st.engine.startedAt, now)} · editor {st.editor}
         </p>
       </div>

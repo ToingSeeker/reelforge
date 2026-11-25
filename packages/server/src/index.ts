@@ -6,6 +6,7 @@ import {
   ActorSchema,
   AnalysisStore,
   ANALYSIS_KINDS,
+  applicableAnalysisKinds,
   AssetStore,
   buildProjectContext,
   buildRenderPlan,
@@ -39,6 +40,7 @@ import {
   AnalysisRunner,
   bakePath,
   createRenderJob,
+  deleteProjectWithCache,
   ensureProxy,
   ensureThumbnail,
   expandFolders,
@@ -52,7 +54,7 @@ import {
   RenderRunner,
   retryRenderJob,
 } from "@reelforge/media";
-import { dirname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 
 // Local REST API (PRD §15). Loopback only, bearer token always required,
 // Host/Origin checked so a web page can't reach it via DNS rebinding.
@@ -286,7 +288,8 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     engine: fxAvailable(),
     bakes: fxBakesOf(projectId).map((b) => {
       const st = fxBaker.state(b.key);
-      return st?.state === "done" ? { key: b.key, state: "done" as const } : { key: b.key, ...(st ?? { state: "missing" as const }) };
+      if (st?.state === "done") return { key: b.key, state: "done" as const, ...(st.warning ? { warning: st.warning } : {}) };
+      return { key: b.key, ...(st ?? { state: "missing" as const }) };
     }),
   });
   // Motion graphics: one Remotion render at a time; finished files are imported as assets once.
@@ -340,7 +343,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
     if ([...motionImports.keys()].some((slot) => slot.startsWith(`${pid}:`))) {
       throw new ReelForgeError("BUSY", "A motion graphic for this project is still rendering. Delete it once that's done.", { projectId: pid });
     }
-    const project = projects.delete(pid);
+    const project = deleteProjectWithCache(opts.db, opts.cacheDir, pid);
     fxBaker.retain(pid, new Set());
     for (const slot of [...motionErrors.keys()]) if (slot.startsWith(`${pid}:`)) motionErrors.delete(slot);
     return project;
@@ -474,7 +477,9 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
       pattern: re(`/v1/projects/${ID}/assets/${ID}/analyze`),
       handle: async ({ req, res, params: [id, assetId] }) => {
         const b = (await readJson(req)) as { kinds?: unknown; language?: unknown };
-        const kinds = (b.kinds ?? [...ANALYSIS_KINDS]) as AnalysisKind[];
+        // No kinds given: the ones that apply (no scenes for a sound file, no beats/transcript for a silent video).
+        const kinds = (b.kinds ?? applicableAnalysisKinds(assets.get(id!, assetId!))) as AnalysisKind[];
+        if (b.kinds === undefined && !kinds.length) throw new ReelForgeError("VALIDATION_ERROR", "nothing to analyse: this asset has no moving picture and no sound");
         if (!Array.isArray(kinds) || !kinds.length) throw new ReelForgeError("VALIDATION_ERROR", `kinds must be a non-empty array of ${ANALYSIS_KINDS.join(", ")}`);
         return send(res, 202, { analyses: analyze(id!, assetId!, kinds, typeof b.language === "string" ? { language: b.language } : {}) });
       },
@@ -499,6 +504,7 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
           ...(b.trackId ? { trackId: b.trackId } : {}),
           ...(b.sourceTrackIds ? { sourceTrackIds: b.sourceTrackIds } : {}),
           ...(typeof b.maxWords === "number" ? { maxWords: Math.max(1, Math.min(12, Math.round(b.maxWords))) } : {}),
+          ...(b.language !== undefined ? { language: b.language } : {}),
         });
         if (plan.missing.length) {
           // Start the transcripts that are missing or stale; the client asks again when they finish.
@@ -800,8 +806,12 @@ export function startApiServer(opts: ApiServerOptions): Promise<RunningServer> {
         const asset = assets.get(id!, assetId!);
         if (asset.status === "missing") throw new ReelForgeError("NOT_FOUND", "source media is offline", { assetId: asset.id });
         if (asset.kind === "audio") {
-          const ext = asset.sourcePath.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav";
-          return sendFile(req, res, asset.sourcePath, ext);
+          // Sound files browsers decode everywhere go as they are; anything else (AIFF, Opus/Vorbis, PCM in a
+          // .mov…) as an AAC proxy, so the preview never gets a file it can't play or one with the wrong type.
+          const ext = extname(asset.sourcePath).toLowerCase();
+          if (ext === ".mp3" || ext === ".wav") return sendFile(req, res, asset.sourcePath, ext === ".mp3" ? "audio/mpeg" : "audio/wav");
+          if ((ext === ".mp4" || ext === ".m4a" || ext === ".mov") && asset.audioCodec === "aac") return sendFile(req, res, asset.sourcePath, "audio/mp4");
+          return sendFile(req, res, await ensureProxy(opts.db, opts.cacheDir, asset.id, asset.sourcePath, "audio"), "audio/mp4");
         }
         const path = await ensureProxy(opts.db, opts.cacheDir, asset.id, asset.sourcePath, asset.kind, asset.hasAlpha);
         return sendFile(req, res, path, asset.kind === "image" ? (path.endsWith(".png") ? "image/png" : "image/jpeg") : "video/mp4");

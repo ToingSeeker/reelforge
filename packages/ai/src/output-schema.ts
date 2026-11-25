@@ -9,6 +9,8 @@ const str = { type: "string" };
 const int = { type: "integer" };
 const num = { type: "number" };
 const bool = { type: "boolean" };
+/** null clears an animation end value (back to a static scale / position). */
+const numOrNull = { type: ["number", "null"] };
 const obj = (properties: Record<string, unknown>, required: string[]) => ({ type: "object", additionalProperties: false, properties, required });
 const op = (type: string, properties: Record<string, unknown>, required: string[]) =>
   obj({ type: { type: "string", enum: [type] }, why: str, ...properties }, ["type", "why", ...required]);
@@ -26,7 +28,7 @@ const AIFX = obj(
 const PROPS = obj(
   {
     fit: { type: "string", enum: ["cover", "contain"] },
-    scale: num, scaleEnd: num, x: num, y: num, xEnd: num, yEnd: num, rotation: num, opacity: num,
+    scale: num, scaleEnd: numOrNull, x: num, y: num, xEnd: numOrNull, yEnd: numOrNull, rotation: num, opacity: num,
     cropLeft: num, cropTop: num, cropRight: num, cropBottom: num,
     fadeIn: int, fadeOut: int, transitionIn: int, gainDb: num,
     blur: num, sharpen: num, vignette: num, grayscale: num, sepia: num, grain: num,

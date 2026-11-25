@@ -161,6 +161,8 @@ export interface PairPayload {
   deviceSecret: string;
   /** Base64 broadcast key. */
   broadcastKey: string;
+  /** The name the Mac lists this phone under (the phone's own, made unique among the paired phones). */
+  deviceName?: string;
 }
 
 export function verifyPairHello(secret: string, hello: unknown): PairHello {

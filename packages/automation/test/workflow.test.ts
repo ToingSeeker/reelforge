@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, ProposalStore, TimelineStore, WorkflowRunStore } from "@reelforge/core";
-import { globImportSteps, parseWorkflow, quoteUntrusted, runWorkflow } from "../src/index.ts";
+import { globImportSteps, parseWorkflow, quoteUntrusted, resumeWorkflow, runWorkflow } from "../src/index.ts";
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-wf-")));
 process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
@@ -119,6 +119,27 @@ test("an AI Director step waits for approval unless --approve-ai", async (t) => 
   assert.equal(fromClient.status, "waiting_approval");
   assert.equal(new ProposalStore(s.db).get(fromClient.steps[2]!.result!.proposalId as string).requestedBy, "mcp");
 
+  // Resume: refused while the proposal waits, then the remaining steps run once it is applied.
+  const withTail = { ...spec("Resume"), steps: [...spec("Resume").steps, { edit: { operations: [{ type: "clip.update", clipId: "${clip:a_red.mp4}", props: { opacity: 0.5 } }] } }] };
+  const stopped = await runWorkflow(s.db, withTail, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  assert.deepEqual(stopped.steps.map((x) => x.status), ["completed", "completed", "waiting_approval", "pending"]);
+  assert.match(stopped.steps[2]!.detail!, /resume/);
+  const pid = stopped.steps[2]!.result!.proposalId as string;
+  await assert.rejects(resumeWorkflow(s.db, stopped.id, withTail, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir }), /still waiting for your approval/);
+  await assert.rejects(resumeWorkflow(s.db, stopped.id, spec("Resume"), { cacheDir: s.cacheDir, actor: "cli", baseDir: dir }), /not the one the run started with/);
+  new ProposalStore(s.db).apply(pid, { by: "cli", channel: "cli:--yes" });
+  const resumed = await resumeWorkflow(s.db, stopped.id, withTail, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  assert.equal(resumed.status, "completed", JSON.stringify(resumed.steps));
+  assert.deepEqual(resumed.steps.map((x) => x.status), ["completed", "completed", "completed", "completed"]);
+  assert.deepEqual(new TimelineStore(s.db).get(resumed.projectId!).clips[0]!.props, { fadeOut: 9, opacity: 0.5 });
+  await assert.rejects(resumeWorkflow(s.db, stopped.id, withTail, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir }), /is completed/);
+  // A rejected proposal ends the run as failed; the steps after it are skipped, not left pending.
+  const again = await runWorkflow(s.db, withTail, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  new ProposalStore(s.db).reject(again.steps[2]!.result!.proposalId as string, "cli");
+  const refused = await resumeWorkflow(s.db, again.id, withTail, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  assert.equal(refused.status, "failed");
+  assert.deepEqual(refused.steps.map((x) => x.status), ["completed", "completed", "failed", "skipped"]);
+
   const approved = await runWorkflow(s.db, spec("Go"), { cacheDir: s.cacheDir, actor: "cli", baseDir: dir, approveAi: true });
   assert.equal(approved.status, "completed");
   assert.deepEqual(new TimelineStore(s.db).get(approved.projectId!).clips[0]!.props, { fadeOut: 9 });
@@ -217,4 +238,53 @@ test("quoteUntrusted leaves no live Markdown or HTML in an approval prompt", () 
   const cut = quoteUntrusted("a".repeat(10) + "*".repeat(20), 12);
   assert.equal(cut, "“aaaaaaaaaa\\*…”");
   assert.equal(quoteUntrusted("line\nbreak\u202eflip"), "“line break flip”");
+});
+
+test("validate checks deeply and says what is wrong", () => {
+  const base = { version: 1, name: "x", project: { name: "a" } };
+  const issues = (spec: object) => {
+    try {
+      parseWorkflow(spec);
+    } catch (e) {
+      return (e as { details: { issues: { path: string; message: string }[] } }).details.issues.map((i) => `${i.path}: ${i.message}`).join(" | ");
+    }
+    return "valid";
+  };
+  assert.match(issues({ ...base, steps: [{ explode: {} }] }), /steps\.0: unknown step "explode" \(use import, analyze/);
+  assert.match(issues({ ...base, steps: [{ import: { paths: ["a.mp4"] }, preview: {} }] }), /steps\.0: a step is an object with exactly one key/);
+  assert.match(issues({ ...base, steps: [{ render: { out: 3 } }] }), /steps\.0\.render\.out/);
+  assert.match(issues({ ...base, project: { name: "a", fps: "abc" }, steps: [{ preview: {} }] }), /project\.fps: unsupported frame rate "abc"/);
+  assert.match(issues({ ...base, project: { name: "a", width: 7 }, steps: [{ preview: {} }] }), /project\.width/);
+  assert.match(issues({ ...base, steps: [{ edit: { operations: [{ type: "clip.nope" }] } }] }), /steps\.0\.edit\.operations\.0\.type: unknown operation type "clip\.nope"/);
+  assert.match(issues({ ...base, steps: [{ edit: { operations: [{ type: "clip.move", clipId: "x", start: 0, track: "V2" }] } }] }), /operations\.0\.track: clip\.move has no field "track"/);
+  assert.match(issues({ ...base, steps: [{ append: { asset: "a", track: "V1", props: { fadein: 3 } } }] }), /append\.props\.fadein: unknown clip property/);
+  assert.equal(issues({ ...base, steps: [{ edit: { operations: [{ type: "clip.update", why: "ok", clipId: "${clip:a.mp4}", props: { fadeIn: "0.5s" } }] } }] }), "valid");
+});
+
+test("a run whose project can't be opened fails without leaving steps pending", async (t) => {
+  const s = db(t);
+  const run = await runWorkflow(s.db, { version: 1, name: "x", project: { id: "00000000-0000-4000-8000-000000000000" }, steps: [{ preview: {} }, { render: { out: "x.mp4" } }] }, { cacheDir: s.cacheDir, actor: "cli", baseDir: dir });
+  assert.equal(run.status, "failed");
+  assert.match(run.error!, /^project: .*not found/);
+  assert.deepEqual(run.steps.map((x) => x.status), ["skipped", "skipped"]);
+});
+
+test("time strings work for fades and dissolves too", async (t) => {
+  const s = db(t);
+  const run = await runWorkflow(
+    s.db,
+    {
+      version: 1,
+      name: "Fades",
+      project: { name: "F" },
+      steps: [
+        { import: { paths: [join(dir, "footage", "a_red.mp4")] } },
+        { append: { asset: "a_red.mp4", track: "V1", props: { fadeIn: "0.5s" } } },
+        { edit: { operations: [{ type: "clip.update", clipId: "${clip:a_red.mp4}", props: { fadeOut: "1s", transitionIn: "00:00:00:06" } }] } },
+      ],
+    },
+    { cacheDir: s.cacheDir, actor: "cli", baseDir: dir },
+  );
+  assert.equal(run.status, "completed", JSON.stringify(run.steps));
+  assert.deepEqual(new TimelineStore(s.db).get(run.projectId!).clips[0]!.props, { fadeIn: 15, fadeOut: 30, transitionIn: 6 });
 });

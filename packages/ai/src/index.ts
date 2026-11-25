@@ -2,13 +2,13 @@ export { propose, type ProposeInput } from "./planner.ts";
 export { MODEL_OUTPUT_SCHEMA, parseModelOutput } from "./output-schema.ts";
 export { SYSTEM_PROMPT, OPERATIONS_GUIDE } from "./prompt.ts";
 export { AnthropicProvider, ANTHROPIC_DEFAULT_MODEL } from "./providers/anthropic.ts";
-export { OllamaProvider, listOllamaModels, ollamaUrl } from "./providers/ollama.ts";
+export { OllamaProvider, defaultOllamaModel, listOllamaModels, ollamaUrl } from "./providers/ollama.ts";
 export { ClaudeCodeProvider, CodexProvider, CLAUDE_CODE_MODELS, CODEX_NO_TOOLS, claudeBinary, codexBinary, listCodexModels, strictSchema, stripNulls } from "./providers/agents.ts";
 export { setCredential, getCredential, credentialSource } from "./credentials.ts";
 export type { PlannerProvider, CompletionRequest, CompletionResult, ChatTurn } from "./providers/types.ts";
 
 import { AnthropicProvider } from "./providers/anthropic.ts";
-import { OllamaProvider, listOllamaModels } from "./providers/ollama.ts";
+import { OllamaProvider, defaultOllamaModel, listOllamaModels } from "./providers/ollama.ts";
 import { ClaudeCodeProvider, CodexProvider, CLAUDE_CODE_MODELS, claudeBinary, codexBinary, listCodexModels } from "./providers/agents.ts";
 import { credentialSource } from "./credentials.ts";
 import { ANTHROPIC_DEFAULT_MODEL } from "./providers/anthropic.ts";
@@ -59,5 +59,5 @@ export function providerReady(p: AIProviderInfo): boolean {
 export async function defaultModelFor(id: string): Promise<string> {
   if (id === "anthropic" || id === "claude-code") return ANTHROPIC_DEFAULT_MODEL;
   if (id === "codex") return listCodexModels()[0] ?? "";
-  return (await listOllamaModels()).models[0] ?? "";
+  return defaultOllamaModel();
 }

@@ -6,7 +6,7 @@
 // the cache under the spec's key.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
@@ -37,6 +37,37 @@ export function fxAvailable(): { ok: true } | { ok: false; reason: string } {
 export function bakePath(cacheDir: string, key: string): string {
   if (!/^[0-9a-f]{16}$/.test(key)) throw new ReelForgeError("VALIDATION_ERROR", "invalid effect key");
   return join(cacheDir, "fx", `${key}.mp4`);
+}
+
+/** What the bake noticed that the person should know (no face to track), kept next to the baked file. */
+export function bakeInfoPath(cacheDir: string, key: string): string {
+  return bakePath(cacheDir, key).replace(/\.mp4$/, ".json");
+}
+
+/** The warning saved with a finished bake, if any. */
+export function bakeWarning(cacheDir: string, key: string): string | undefined {
+  try {
+    const w = (JSON.parse(readFileSync(bakeInfoPath(cacheDir, key), "utf8")) as { warning?: unknown }).warning;
+    return typeof w === "string" ? w : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The engine reports "Tracked: face in F of N frames, body only in B" after pass 1. Without a face it
+ * places the graphics from the body's outline, and without either around the middle of the frame:
+ * the bake still succeeds, so say so.
+ */
+export function trackingWarning(engineOutput: string): string | undefined {
+  const m = /Tracked: face in (\d+) of (\d+) frames, body only in (\d+)/.exec(engineOutput);
+  if (!m) return undefined;
+  const [faces, frames, bodies] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (frames === 0 || faces > 0) return undefined;
+  // The body outline comes from a person segmenter that also "finds" people in graphics and scenery.
+  return bodies > 0
+    ? "No face found in this clip: effects that follow a face are placed from a guessed body outline and may sit off."
+    : "No face found in this clip: effects that follow a face are placed around the middle of the frame.";
 }
 
 const secs = (frames: number, fps: { num: number; den: number }) => ((frames * fps.den) / fps.num).toFixed(6);
@@ -99,7 +130,7 @@ export async function bakeFx(spec: FxBakeSpec, opts: BakeOptions): Promise<strin
     // 3. Run it. Its own ffmpeg calls find ours first on PATH.
     const partial = join(work, "baked.mp4");
     const short = spec.shortSide;
-    await runEngine(python, [join(dir, "scripts/fx.py"), "--plan", planFile, clip, partial, "--width", String(short)], {
+    const report = await runEngine(python, [join(dir, "scripts/fx.py"), "--plan", planFile, clip, partial, "--width", String(short)], {
       cwd: work,
       env: { ...process.env, PATH: `${dirname(ffmpegBin()) === "." ? "" : `${dirname(ffmpegBin())}:`}${process.env.PATH ?? ""}`, PYTHONDONTWRITEBYTECODE: "1", PYTHONNOUSERSITE: "1" },
       signal: opts.signal,
@@ -107,6 +138,10 @@ export async function bakeFx(spec: FxBakeSpec, opts: BakeOptions): Promise<strin
       onProgress: opts.onProgress,
     });
     mkdirSync(dirname(out), { recursive: true });
+    const warning = trackingWarning(report);
+    const info = bakeInfoPath(opts.cacheDir, spec.key);
+    if (warning) writeFileSync(info, JSON.stringify({ warning }));
+    else rmSync(info, { force: true });
     renameSync(partial, out);
     return out;
   } finally {
@@ -137,15 +172,16 @@ async function cardStill(src: string, out: string): Promise<void> {
 
 /**
  * The engine prints "Pass 1: tracking…", "Pass 2: adding the effects…" and "  12.0s / 30.0s"
- * every 5 s of pass 2. Tracking is roughly the first third of the time.
+ * every 5 s of pass 2. Tracking is roughly the first third of the time. Resolves with its tracking report line.
  */
 function runEngine(
   python: string,
   args: string[],
   o: { cwd: string; env: NodeJS.ProcessEnv; signal?: AbortSignal; duration: number; onProgress?: (p: number) => void },
-): Promise<void> {
+): Promise<string> {
   return new Promise((resolve, reject) => {
     if (o.signal?.aborted) return reject(new Error("cancelled"));
+    let report = "";
     let child: ChildProcess;
     try {
       child = spawn(python, ["-I", ...args], { cwd: o.cwd, env: o.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -159,6 +195,7 @@ function runEngine(
     const onOut = (c: Buffer) => {
       const s = c.toString("utf8");
       tail = (tail + s).slice(-4000);
+      report = /Tracked: [^\n]*\n/.exec(tail)?.[0].trim() ?? report;
       if (/Pass 1/.test(s)) o.onProgress?.(0.02);
       if (/Pass 2/.test(s)) o.onProgress?.(0.35);
       for (const m of s.matchAll(/([\d.]+)s \/ ([\d.]+)s/g)) o.onProgress?.(0.35 + 0.63 * Math.min(1, Number(m[1]) / Math.max(0.1, Number(m[2]))));
@@ -173,7 +210,7 @@ function runEngine(
       clearTimeout(timer);
       o.signal?.removeEventListener("abort", abort);
       if (o.signal?.aborted) return reject(new Error("cancelled"));
-      if (code === 0) return resolve();
+      if (code === 0) return resolve(report);
       // The first Python exception is the real one; MediaPipe often adds a noisy one at interpreter exit.
       const lines = tail.split("\n").map((l) => l.trim()).filter(Boolean);
       const last = lines.find((l) => /^[A-Za-z_.]*(Error|Exception)\b.*:/.test(l) && !l.includes("'NoneType' object is not callable")) ?? lines.slice(-2).join(" | ");
@@ -182,7 +219,10 @@ function runEngine(
   });
 }
 
-export type BakeState = { state: "queued" | "running"; progress: number } | { state: "done"; path: string } | { state: "failed"; error: string };
+export type BakeState =
+  | { state: "queued" | "running"; progress: number }
+  | { state: "done"; path: string; /** The bake worked but may not look right (no face found). */ warning?: string }
+  | { state: "failed"; error: string };
 
 /**
  * One bake at a time (each is CPU-heavy), deduplicated by key, shared by the
@@ -208,7 +248,9 @@ export class FxBaker {
     const s = this.#states.get(key);
     if (s) return s;
     const p = bakePath(this.#cacheDir, key);
-    return existsSync(p) ? { state: "done", path: p } : null;
+    if (!existsSync(p)) return null;
+    const warning = bakeWarning(this.#cacheDir, key);
+    return { state: "done", path: p, ...(warning ? { warning } : {}) };
   }
 
   /** Queue a bake (or return the one in flight). Resolves with the baked file. */
@@ -244,7 +286,8 @@ export class FxBaker {
         signal: ctl.signal,
         onProgress: (progress) => this.#states.set(key, { state: "running", progress }),
       });
-      this.#states.set(key, { state: "done", path });
+      const warning = bakeWarning(this.#cacheDir, key);
+      this.#states.set(key, { state: "done", path, ...(warning ? { warning } : {}) });
       r.resolve(path);
     } catch (e) {
       this.#states.set(key, { state: "failed", error: e instanceof Error ? e.message : String(e) });

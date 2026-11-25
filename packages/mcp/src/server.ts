@@ -26,7 +26,7 @@ import {
 } from "@reelforge/core";
 import { AnalysisRunner, createRenderJob, importMedia, RenderRunner, type ImportResult } from "@reelforge/media";
 import type { RenderJob } from "@reelforge/core";
-import { ANTHROPIC_DEFAULT_MODEL, listOllamaModels, OPERATIONS_GUIDE, parseModelOutput, propose, providerFor } from "@reelforge/ai";
+import { ANTHROPIC_DEFAULT_MODEL, defaultOllamaModel, OPERATIONS_GUIDE, parseModelOutput, propose, providerFor } from "@reelforge/ai";
 import { globImportSteps, parseWorkflow, quoteUntrusted, runWorkflow, timelineSteps } from "@reelforge/automation";
 
 export const SERVER_INFO = { name: "reelforge", version: "0.1.0-alpha.1" };
@@ -122,7 +122,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       annotations: WRITE,
     },
     tool(({ name, width, height, fps }: { name: string; width?: number; height?: number; fps?: string }) => ({
-      project: projects.create({ name, settings: { ...(width ? { width } : {}), ...(height ? { height } : {}), ...(fps ? { fps: parseFps(fps) } : {}) } }, "mcp"),
+      project: projects.create({ name, settings: { ...(width ? { width } : {}), ...(height ? { height } : {}), ...(fps ? { fps: fpsOf(fps) } : {}) } }, "mcp"),
     })),
   );
   server.registerTool("projects_get", { title: "Get project", inputSchema: { projectId: Id }, annotations: READ }, tool(({ projectId }: { projectId: string }) => ({ project: projects.get(projectId) })));
@@ -259,9 +259,21 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       annotations: WRITE,
     },
     tool(async (a: { projectId: string; summary: string; operations?: Record<string, unknown>[]; instruction?: string; director?: { provider: string; model?: string }; selection?: string[] }) => {
+      if (a.operations && a.instruction) throw new ReelForgeError("VALIDATION_ERROR", "give either operations or an instruction for the AI Director, not both");
+      if (a.operations && a.director) throw new ReelForgeError("VALIDATION_ERROR", "director only applies with an instruction; operations you planned don't go to the AI Director");
+      if (a.selection?.length) {
+        const clips = new Set(timeline.get(a.projectId).clips.map((c) => c.id));
+        const unknown = a.selection.filter((id) => !clips.has(id));
+        if (unknown.length) throw new ReelForgeError("VALIDATION_ERROR", "selected clips are not on the timeline", { unknown });
+      }
       if (a.operations) {
         const parsed = parseModelOutput(JSON.stringify({ summary: a.summary, warnings: [], operations: a.operations }));
         if (parsed.errors.length) throw new ReelForgeError("VALIDATION_ERROR", parsed.errors.join("; "));
+        if (!parsed.operations.length) throw new ReelForgeError("VALIDATION_ERROR", "operations is empty: nothing to propose");
+        const preview = timeline.preview(a.projectId, parsed.operations);
+        if (!preview.diff.clips.length && !preview.diff.tracks.length && !preview.diff.captions?.length) {
+          throw new ReelForgeError("VALIDATION_ERROR", "these operations don't change anything on the timeline (it already looks like that); nothing to propose");
+        }
         const proposal = proposals.create(a.projectId, {
           instruction: "", // the summary is the client's words, never shown as the user's instruction
           requestedBy: "mcp",
@@ -277,8 +289,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       }
       if (!a.instruction) throw new ReelForgeError("VALIDATION_ERROR", "give operations, or an instruction for the AI Director");
       const provider = providerFor(a.director?.provider ?? "ollama");
-      const model = a.director?.model ?? (provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : (await listOllamaModels()).models[0]);
-      if (!model) throw new ReelForgeError("UNAVAILABLE", "no local model available in Ollama");
+      const model = a.director?.model ?? (provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : await defaultOllamaModel());
       return describe(await propose(db, a.projectId, provider, { instruction: a.instruction, model, selection: a.selection ?? [], requestedBy: "mcp" }));
     }),
   );
@@ -298,7 +309,9 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     tool(async ({ proposalId }: { proposalId: string }) => {
+      // get() records a proposal whose timeline moved on as stale, so the user is never asked to approve one that can't apply.
       const p = proposals.get(proposalId);
+      if (p.status === "stale") return { status: "stale", proposal: describe(p), next: "the timeline changed since this proposal was made; propose the edit again" };
       if (p.status !== "pending") return { status: p.status, proposal: describe(p) };
       if (!p.operations.length) return { status: "nothing_to_apply", warnings: p.warnings };
       const human = remote
@@ -452,7 +465,13 @@ export function createMcpServer(db: Database, opts: McpOptions) {
       } catch (e) {
         if (!isReelForgeError(e) || e.code !== "NOT_FOUND") throw e;
       }
-      const a = analyses.get(jobId);
+      let a;
+      try {
+        a = analyses.get(jobId);
+      } catch (e) {
+        if (isReelForgeError(e) && e.code === "NOT_FOUND") throw new ReelForgeError("NOT_FOUND", `job ${jobId} not found (no render, preview or analysis job has this id)`, { jobId });
+        throw e;
+      }
       return { type: `analysis:${a.kind}`, state: a.state, progress: a.progress, error: a.error };
     }),
   );
@@ -486,7 +505,7 @@ export function createMcpServer(db: Database, opts: McpOptions) {
         "Run a ReelForge workflow JSON (version 1: name, project {id}|{name}, steps of import/analyze/append/edit/captions/director/preview/render). " +
         "Runs to completion and returns the run record. Steps that change the timeline (append, edit, captions) and imports with glob patterns need the user's approval, which this tool asks for. " +
         "A render step's folder must already exist; " +
-        "AI Director steps stop with waiting_approval for the user.",
+        "an AI Director step stops the run with waiting_approval: the steps after it don't run (the user applies the proposal and runs the rest).",
       inputSchema: { workflow: z.record(z.string(), z.unknown()), baseDir: z.string().optional().describe("Folder relative paths resolve from") },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
@@ -551,6 +570,16 @@ export function createMcpServer(db: Database, opts: McpOptions) {
     await renderRunner.stop();
   };
   return { server, close };
+}
+
+/** A frame rate from a client: an unusable one is the client's mistake (VALIDATION_ERROR), not an internal error. */
+function fpsOf(fps: string) {
+  try {
+    return parseFps(fps);
+  } catch (e) {
+    if (isReelForgeError(e)) throw e;
+    throw new ReelForgeError("VALIDATION_ERROR", e instanceof Error ? e.message : `unsupported frame rate "${fps}"`);
+  }
 }
 
 function describe(p: AIProposal) {

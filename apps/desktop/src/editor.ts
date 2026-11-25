@@ -122,7 +122,9 @@ export type Editor = ReturnType<typeof useEditor>;
 
 /** Thumbnail URL for an asset (streamed directly; the token rides in the query). Null when offline. */
 export function useThumbnail(client: Client | null, projectId: string, asset: Asset | undefined): string | null {
-  if (!client || !asset || asset.status === "missing" || !projectId) return null;
+  // Right after a project switch the old project's assets are still on screen for a moment; asking
+  // for them under the new project id would 404, so wait until the assets belong to this project.
+  if (!client || !asset || asset.status === "missing" || !projectId || asset.projectId !== projectId) return null;
   // sizeBytes busts the browser cache when a file is relinked or changes.
   return `${client.thumbnailUrl(projectId, asset.id)}&v=${asset.sizeBytes}`;
 }

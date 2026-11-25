@@ -464,7 +464,11 @@ function useFxBakes(client: Client | null, projectId: string | null, plan: Rende
     const failed = bakes.find((b) => b.state === "failed");
     if (failed && failed.state === "failed") return { ...idle, note: "AI effect failed to bake", detail: failed.error, failed: true };
     const left = bakes.filter((b) => b.state !== "done");
-    if (!left.length) return idle;
+    if (!left.length) {
+      // Baked, but the engine had to guess where the face is (e.g. no face in the shot): say so, don't hide it.
+      const warned = bakes.find((b) => b.state === "done" && b.warning);
+      return warned && warned.state === "done" && warned.warning ? { ...idle, note: "AI effect placed without a face", detail: warned.warning } : idle;
+    }
     const running = left.find((b) => b.state === "running");
     const pct = running && running.state === "running" ? ` ${Math.round(running.progress * 100)}%` : "";
     const done = bakes.length - left.length;

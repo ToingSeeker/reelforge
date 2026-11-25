@@ -1,11 +1,13 @@
 import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
-import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   AnalysisStore,
-  ANALYSIS_KINDS,
+  applicableAnalysisKinds,
   AssetStore,
+  checkTranscriptLanguage,
+  engineWarnings,
   buildProjectContext,
   captionsToSrt,
   isReelForgeError,
@@ -29,12 +31,25 @@ import {
   type ErrorCode,
   type TimelineOp,
 } from "@reelforge/core";
-import { ANTHROPIC_DEFAULT_MODEL, consentRecipient, credentialSource, listAIProviders, listOllamaModels, OllamaProvider, propose, providerFor, providerReady, setCredential } from "@reelforge/ai";
-import { AnalysisRunner, createRenderJob, ensureFilmstrip, ensureThumbnail, importMedia, relinkMedia, RenderRunner, retryRenderJob, sourceStill } from "@reelforge/media";
+import { consentRecipient, defaultModelFor, listAIProviders, propose, providerFor, providerReady, setCredential } from "@reelforge/ai";
+import {
+  AnalysisRunner,
+  createRenderJob,
+  deleteProjectWithCache,
+  ensureFilmstrip,
+  ensureThumbnail,
+  expandFolders,
+  importMedia,
+  relinkMedia,
+  RenderRunner,
+  retryRenderJob,
+  sourceStill,
+  type ImportResult,
+} from "@reelforge/media";
 import { startApiServer } from "@reelforge/server";
 import { ConnectorAuth, ConnectorManager, createMcpServer } from "@reelforge/mcp";
 import { RemoteManager } from "@reelforge/remote";
-import { readWorkflowFile, runWorkflow } from "@reelforge/automation";
+import { readWorkflowFile, resumeWorkflow, runWorkflow } from "@reelforge/automation";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 // Every command prints exactly one JSON document to stdout (errors go to
@@ -60,9 +75,9 @@ Usage:
   reelforge project list | get <id> | history <id>
   reelforge project create --name <name> [--width 1080] [--height 1920] [--fps 30]
   reelforge project rename <id> --name <name> --base-revision <n>
-  reelforge project delete <id> --yes        (project data only; media files and exports stay)
+  reelforge project delete <id> --yes        (project data and its cached previews/proxies; media files and exports stay)
 
-  reelforge media import <project> <file>...
+  reelforge media import <project> <file|folder>...   (folders: the media files inside, subfolders too)
   reelforge media list <project>
   reelforge media relink <project> <asset> <file>
 
@@ -80,23 +95,28 @@ Usage:
                     blur sharpen vignette grayscale sepia grain aiEffects)
 
   reelforge media analyze <project> <asset> [--kinds scenes,beats,transcript] [--language auto|id|en…]
+                   (default kinds: the ones that apply: scenes for video, beats and transcript when there is sound)
   reelforge media analysis <project> <asset>
-  reelforge captions generate <project> [--track C1] [--source A1,A2] [--max-words 3] [--language auto]
+  reelforge captions generate <project> [--track C1] [--source A1,A2] [--max-words 1-12] [--language auto|id|en…]
+                   (transcribes what has no transcript yet; with --language, also media transcribed in another language)
   reelforge captions srt <project> [--track C1] [--out file.srt]
   reelforge project context <project>          (structured view for AI planners)
 
   reelforge ai providers
-  reelforge ai propose <project> "<instruction>" [--provider ollama|anthropic] [--model <id>] [--selection <clip>,…]
+  reelforge ai propose <project> "<instruction>" [--provider anthropic|claude-code|codex|ollama] [--model <id>] [--selection <clip>,…]
   reelforge ai proposals <project> | ai show <proposal>
   reelforge ai apply <proposal> --yes          (your approval; never automatic)
   reelforge ai reject <proposal>
-  reelforge ai consent <project> --grant|--revoke   (allow sending this project's context to an external provider)
+  reelforge ai consent <project> --grant|--revoke [--recipient anthropic|openai|ollama]
+                   (allow sending this project's context to an external provider; without --recipient: all of them)
 
   reelforge render <project> --out <file.mp4>      (H.264/AAC at project size; never overwrites)
-  reelforge preview <project>                      (low-res render of the same graph, from proxies)
+  reelforge preview <project>                      (low-res render of the same graph, from proxies; reused per revision)
   reelforge jobs list <project> | get <job> | cancel <job> | retry <job> [--wait]
 
-  reelforge workflow run <file.json> [--approve-ai]   (repeatable recipe; --approve-ai also applies AI Director steps)
+  reelforge workflow run <file.json> [--approve-ai]   (repeatable recipe; --approve-ai also applies AI Director steps,
+                                                    otherwise the run stops at a Director step with waiting_approval)
+  reelforge workflow run <file.json> --resume <run>   (after applying that proposal: run the remaining steps)
   reelforge workflow validate <file.json> | workflow runs [--project <id>]
   reelforge mcp                                (MCP server on stdio, for Claude, ChatGPT, Gemini CLI…)
   reelforge connector [--port 4410] [--tunnel ngrok [--domain <name>] | --public-url <https://…>] [--out <dir>]
@@ -115,7 +135,9 @@ Global options:
   --pretty       indent JSON output (default when stdout is a terminal)
   -h, --help     show this help
 
-Exit codes: 0 ok, 1 internal, 2 invalid input, 3 not found, 4 revision conflict, 6 dependency unavailable.
+Exit codes: 0 ok, 1 internal, 2 invalid input, 3 not found, 4 revision conflict, 5 unauthorized,
+            6 dependency unavailable, 7 AI consent required, 8 busy (a render or analysis is still running).
+            media import exits non-zero when no file could be imported.
 `;
 
 interface Io {
@@ -173,12 +195,14 @@ const OPTIONS = {
   yes: { type: "boolean" },
   grant: { type: "boolean" },
   "approve-ai": { type: "boolean" },
+  resume: { type: "string" },
   project: { type: "string" },
   revoke: { type: "boolean" },
   wait: { type: "boolean" },
   tunnel: { type: "string" },
   domain: { type: "string" },
   "public-url": { type: "string" },
+  recipient: { type: "string" },
 } as const;
 
 type Values = ReturnType<typeof parseArgs<{ options: typeof OPTIONS; allowPositionals: true }>>["values"];
@@ -235,7 +259,7 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
     }
     if (cmd === "connector" && sub === "revoke") {
       new ConnectorAuth(join(resolveHome(env), "connector", "auth.json")).revokeAll();
-      print({ revoked: true, note: "every app is disconnected and the access key is new; restart a running connector (or Stop/Start it in the app) for this to take effect" });
+      print({ revoked: true, note: "every app is disconnected and the access key is new; a running connector refuses the old tokens from their next request" });
       return 0;
     }
     if (cmd === "connector" && !sub) return await connector(env, values, io);
@@ -243,8 +267,10 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
     if (cmd === "render" || cmd === "preview") {
       const db = openDatabase(resolveDbPath(env));
       try {
-        const job = await runJob(db, env, io, (sub ? [sub, ...rest] : rest)[0], cmd === "render" ? "export" : "preview", values.out);
-        print({ job });
+        const projectId = need((sub ? [sub, ...rest] : rest)[0], "<project>");
+        const warnings = engineWarnings(new TimelineStore(db).get(projectId));
+        const job = await runJob(db, env, io, projectId, cmd === "render" ? "export" : "preview", values.out);
+        print({ job, ...(warnings.length ? { warnings } : {}) });
         return job.state === "completed" ? 0 : job.error?.code === "MEDIA_OFFLINE" || job.state === "cancelled" ? EXIT.VALIDATION_ERROR : EXIT.INTERNAL;
       } finally {
         db.close();
@@ -254,7 +280,8 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
       const db = openDatabase(resolveDbPath(env));
       try {
         const { spec, baseDir } = readWorkflowFile(resolve(io.cwd ?? process.cwd(), need(rest[0], "<file.json>")));
-        const run = await runWorkflow(db, spec, { cacheDir: resolveCacheDir(env), actor: "cli", baseDir, source: rest[0]!, approveAi: !!values["approve-ai"], createOutputDirs: true });
+        const runOpts = { cacheDir: resolveCacheDir(env), actor: "cli" as const, baseDir, source: rest[0]!, approveAi: !!values["approve-ai"], createOutputDirs: true };
+        const run = values.resume ? await resumeWorkflow(db, values.resume, spec, runOpts) : await runWorkflow(db, spec, runOpts);
         print({ run });
         return run.status === "completed" ? 0 : run.status === "waiting_approval" ? 0 : EXIT.INTERNAL;
       } finally {
@@ -296,7 +323,13 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
 
     const db = openDatabase(resolveDbPath(env));
     try {
-      print(await handler({ db, values, args: rest, io }));
+      const result = await handler({ db, values, args: rest, io, env });
+      print(result);
+      if (cmd === "media" && sub === "import") {
+        // Nothing imported (and nothing already there): the command failed, even though it printed the reasons.
+        const r = result as ImportResult;
+        if (!r.imported.length && !r.existing.length) return EXIT[r.failed.find((f) => f.error.code in EXIT)?.error.code ?? "VALIDATION_ERROR"];
+      }
       return 0;
     } finally {
       db.close();
@@ -317,6 +350,7 @@ interface Ctx {
   values: Values;
   args: string[];
   io: Io;
+  env: NodeJS.ProcessEnv;
 }
 
 /** Apply ops at --base-revision, or at the current revision when none is given. */
@@ -368,10 +402,10 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
       "cli",
     ),
   }),
-  "project delete": ({ db, args, values }) => {
+  "project delete": ({ db, args, values, env }) => {
     const id = need(args[0], "<project>");
     if (!values.yes) invalid("deleting a project can't be undone: pass --yes to confirm");
-    return { deleted: new ProjectStore(db).delete(id) };
+    return { deleted: deleteProjectWithCache(db, resolveCacheDir(env), id) };
   },
   "project history": ({ db, args }) => ({ operations: new ProjectStore(db).history(need(args[0], "<project>")) }),
 
@@ -379,7 +413,10 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
     const [projectId, ...files] = args;
     if (!files.length) invalid("missing <file>...");
     const cwd = io.cwd ?? process.cwd();
-    return importMedia(db, need(projectId, "<project>"), files.map((f) => resolve(cwd, f)), "cli");
+    // Folders open to the media files inside them, like a folder dropped on the editor.
+    const { paths, skipped } = expandFolders(files.map((f) => resolve(cwd, f)));
+    if (!paths.length) invalid(`no media files there (${skipped} other item${skipped === 1 ? "" : "s"} skipped)`);
+    return { ...(await importMedia(db, need(projectId, "<project>"), paths, "cli")), ...(skipped ? { skipped } : {}) };
   },
   "media list": ({ db, args }) => ({ assets: new AssetStore(db).list(need(args[0], "<project>")) }),
   "media relink": async ({ db, args, io }) => ({
@@ -389,9 +426,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
   "timeline get": ({ db, args }) => ({ timeline: new TimelineStore(db).get(need(args[0], "<project>")) }),
   "timeline apply": (ctx) => {
     const { values, io } = ctx;
-    const raw =
-      values.ops ??
-      (values["ops-file"] === "-" ? io.stdin?.() : values["ops-file"] ? readFileSync(resolve(io.cwd ?? process.cwd(), values["ops-file"]), "utf8") : undefined);
+    const raw = values.ops ?? (values["ops-file"] === "-" ? io.stdin?.() : values["ops-file"] ? readOpsFile(resolve(io.cwd ?? process.cwd(), values["ops-file"])) : undefined);
     if (raw === undefined) invalid("provide --ops '<json>' or --ops-file <file|->");
     let ops: unknown;
     try {
@@ -483,7 +518,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
   "ai reject": ({ db, args }) => ({ proposal: new ProposalStore(db).reject(need(args[0], "<proposal>"), "cli") }),
   "ai consent": ({ db, args, values }) => {
     if (values.grant === values.revoke) invalid("use exactly one of --grant or --revoke");
-    return { consent: new ProposalStore(db).setConsent(need(args[0], "<project>"), !!values.grant, "cli") };
+    return { consent: new ProposalStore(db).setConsent(need(args[0], "<project>"), !!values.grant, "cli", values.recipient === undefined ? "*" : recipientFlag(values.recipient)) };
   },
   "jobs list": ({ db, args }) => ({ jobs: new JobStore(db).list(need(args[0], "<project>")) }),
   "jobs get": ({ db, args }) => ({ job: new JobStore(db).get(need(args[0], "<job>")) }),
@@ -496,14 +531,30 @@ const COMMANDS: Record<string, (ctx: Ctx) => unknown> = {
   },
 };
 
+/** Every provider `ai propose --provider` accepts, as the API lists them. */
 async function providersInfo() {
-  const ollama = await listOllamaModels();
-  return {
-    providers: [
-      { id: "anthropic", external: true, credential: credentialSource("anthropic"), defaultModel: ANTHROPIC_DEFAULT_MODEL },
-      { id: "ollama", external: new OllamaProvider().external, available: ollama.available, models: ollama.models },
-    ],
-  };
+  return { providers: (await listAIProviders()).map((p) => ({ ...p, ready: providerReady(p), recipient: consentRecipient(p.id) })) };
+}
+
+const PROVIDER_IDS = ["anthropic", "claude-code", "codex", "ollama"];
+
+/** --recipient: who may receive the context (anthropic, openai, ollama), or a provider id standing for its recipient. */
+function recipientFlag(v: string): string {
+  if (PROVIDER_IDS.includes(v)) return consentRecipient(v);
+  const known = [...new Set(PROVIDER_IDS.map(consentRecipient))];
+  if (!known.includes(v)) invalid(`--recipient must be one of ${known.join(", ")}`);
+  return v;
+}
+
+function readOpsFile(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new ReelForgeError("NOT_FOUND", `ops file not found: ${path}`, { path });
+    if (code === "EISDIR") invalid(`--ops-file is a folder, not a file: ${path}`);
+    throw new ReelForgeError("VALIDATION_ERROR", `can't read the ops file ${path} (${code ?? "error"})`, { path });
+  }
 }
 
 async function proposeInline(db: Database, args: string[], values: Values) {
@@ -511,8 +562,8 @@ async function proposeInline(db: Database, args: string[], values: Values) {
   const instruction = words.join(" ");
   if (!instruction) invalid('missing "<instruction>"');
   const provider = providerFor(values.provider ?? "anthropic");
-  const model = values.model ?? (provider.id === "anthropic" ? ANTHROPIC_DEFAULT_MODEL : (await listOllamaModels()).models[0]);
-  if (!model) throw new ReelForgeError("UNAVAILABLE", "no local model available in Ollama");
+  const model = values.model ?? (await defaultModelFor(provider.id));
+  if (!model) throw new ReelForgeError("UNAVAILABLE", provider.id === "ollama" ? "no local model available in Ollama" : `no model available for ${provider.id}`);
   const proposal = await propose(db, need(projectId, "<project>"), provider, { instruction, model, selection: values.selection?.split(",").map((x) => x.trim()).filter(Boolean) ?? [] });
   return { proposal, next: proposal.operations.length ? `review it, then: reelforge ai apply ${proposal.id} --yes` : "nothing to apply" };
 }
@@ -537,8 +588,12 @@ async function runAnalyses(db: Database, env: NodeJS.ProcessEnv, io: Io, ids: st
 
 async function analyzeInline(db: Database, env: NodeJS.ProcessEnv, io: Io, args: string[], values: Values) {
   const [projectId, assetId] = args;
-  const kinds = (values.kinds?.split(",").map((k) => k.trim()) ?? [...ANALYSIS_KINDS]) as AnalysisKind[];
-  const queued = new AnalysisStore(db).enqueue(need(projectId, "<project>"), need(assetId, "<asset>"), kinds, values.language ? { language: values.language } : {});
+  const pid = need(projectId, "<project>");
+  const aid = need(assetId, "<asset>");
+  // Without --kinds, only what applies: no scenes in a sound file, no beats or transcript in a silent video.
+  const kinds = (values.kinds?.split(",").map((k) => k.trim()) ?? applicableAnalysisKinds(new AssetStore(db).get(pid, aid))) as AnalysisKind[];
+  if (!kinds.length) invalid("nothing to analyse: this asset has no moving picture and no sound");
+  const queued = new AnalysisStore(db).enqueue(pid, aid, kinds, values.language !== undefined ? { language: values.language } : {});
   const done = await runAnalyses(db, env, io, queued.map((a) => a.id));
   const failed = done.filter((a) => a.state === "failed");
   if (failed.length === done.length) throw new ReelForgeError("INTERNAL", failed.map((a) => `${a.kind}: ${a.error}`).join("; "));
@@ -548,15 +603,17 @@ async function analyzeInline(db: Database, env: NodeJS.ProcessEnv, io: Io, args:
 async function captionsInline(db: Database, env: NodeJS.ProcessEnv, io: Io, args: string[], values: Values) {
   const projectId = need(args[0], "<project>");
   const opts = {
-    ...(values.track ? { trackId: trackId({ db, values, args, io }, projectId, values.track) } : {}),
-    ...(values.source ? { sourceTrackIds: values.source.split(",").map((t) => trackId({ db, values, args, io }, projectId, t.trim())) } : {}),
-    ...(values["max-words"] ? { maxWords: need(int("max-words", values["max-words"]), "--max-words") } : {}),
+    ...(values.track ? { trackId: trackId({ db, values, args, io, env }, projectId, values.track) } : {}),
+    ...(values.source ? { sourceTrackIds: values.source.split(",").map((t) => trackId({ db, values, args, io, env }, projectId, t.trim())) } : {}),
+    ...(values["max-words"] !== undefined ? { maxWords: maxWordsFlag(values["max-words"]) } : {}),
+    // A transcript in another language than --language counts as missing, so it is transcribed again.
+    ...(values.language !== undefined ? { language: checkTranscriptLanguage(values.language) } : {}),
   };
   let plan = planCaptions(db, projectId, opts);
   if (plan.missing.length) {
     // Transcribe what's missing here, then plan again.
     const store = new AnalysisStore(db);
-    const ids = plan.missing.flatMap((m) => store.enqueue(projectId, m.assetId, ["transcript"], values.language ? { language: values.language } : {}).map((a) => a.id));
+    const ids = plan.missing.flatMap((m) => store.enqueue(projectId, m.assetId, ["transcript"], values.language !== undefined ? { language: values.language } : {}).map((a) => a.id));
     const done = await runAnalyses(db, env, io, ids);
     const failed = done.find((a) => a.state === "failed");
     if (failed) throw new ReelForgeError("INTERNAL", `transcription failed: ${failed.error}`);
@@ -568,12 +625,32 @@ async function captionsInline(db: Database, env: NodeJS.ProcessEnv, io: Io, args
   return { count: plan.captions.length, captions: tl.captions.filter((c) => c.trackId === plan.trackId) };
 }
 
+function maxWordsFlag(v: string): number {
+  const n = int("max-words", v)!;
+  if (n < 1 || n > 12) invalid("--max-words must be between 1 and 12");
+  return n;
+}
+
 /** Render in this process, reporting progress on stderr. Ctrl+C cancels the job. */
-async function runJob(db: Database, env: NodeJS.ProcessEnv, io: Io, projectId: string | undefined, kind: "export" | "preview", out: string | undefined) {
+async function runJob(db: Database, env: NodeJS.ProcessEnv, io: Io, projectId: string, kind: "export" | "preview", out: string | undefined) {
   if (kind === "export" && !out) invalid("missing --out <file.mp4>");
+  if (kind === "preview") {
+    // One preview per revision, like the API: a finished one for this exact timeline is reused.
+    const revision = new ProjectStore(db).get(projectId).revision;
+    const done = new JobStore(db).list(projectId, { kind: "preview", limit: 10 }).find((j) => j.revision === revision && j.state === "completed");
+    if (done?.outputPath && isFile(done.outputPath)) return done;
+  }
   const cwd = io.cwd ?? process.cwd();
-  const job = createRenderJob(db, need(projectId, "<project>"), kind, out ? resolve(cwd, out) : undefined);
+  const job = createRenderJob(db, projectId, kind, out ? resolve(cwd, out) : undefined);
   return runQueued(db, env, io, job.id);
+}
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 async function runQueued(db: Database, env: NodeJS.ProcessEnv, io: Io, jobId: string) {
@@ -660,7 +737,7 @@ async function connector(env: NodeJS.ProcessEnv, values: Values, io: Io): Promis
     db.close();
     throw e;
   }
-  io.out(JSON.stringify({ event: "ready", mcpUrl: st.mcpUrl, localUrl: st.localUrl, pairingCode: st.accessKey }) + "\n");
+  io.out(JSON.stringify({ event: "ready", mcpUrl: st.mcpUrl, localUrl: st.localUrl, accessKey: st.accessKey }) + "\n");
   io.err(
     `\nReelForge connector is running.\n\n  Connector URL:  ${st.mcpUrl}\n  Access key:     ${st.accessKey}\n\n` +
       (st.public
@@ -780,7 +857,9 @@ async function serve(env: NodeJS.ProcessEnv, values: Values, io: Io): Promise<nu
     if (editor.state === "closed") return "closed";
     return Date.now() - editor.at < 45_000 ? "open" : "unknown";
   };
-  const engineInfo = () => ({ background, startedAt, version: VERSION });
+  // The desktop shell always starts its engine with --token-stdin; anything else in the foreground was started by hand.
+  const mode: "editor" | "background" | "standalone" = background ? "background" : values["token-stdin"] ? "editor" : "standalone";
+  const engineInfo = () => ({ background, mode, startedAt, version: VERSION });
   const db = openDatabase(resolveDbPath(env));
   const connectorManager = new ConnectorManager({
     db,

@@ -1,1 +1,1 @@
-export { runWorkflow, parseWorkflow, readWorkflowFile, timelineSteps, globImportSteps, TIMELINE_STEPS, quoteUntrusted, describeTimelineStep, resolveOperations, WorkflowSpecSchema, type WorkflowSpec, type WorkflowStep, type RunOptions } from "./workflow.ts";
+export { runWorkflow, resumeWorkflow, parseWorkflow, readWorkflowFile, timelineSteps, globImportSteps, TIMELINE_STEPS, quoteUntrusted, describeTimelineStep, resolveOperations, WorkflowSpecSchema, type WorkflowSpec, type WorkflowStep, type RunOptions } from "./workflow.ts";

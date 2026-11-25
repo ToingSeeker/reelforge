@@ -65,6 +65,21 @@ export class WorkflowRunStore {
     return rows.map(toRun);
   }
 
+  /** The workflow the run was started with. */
+  spec(id: string): unknown {
+    const row = this.#db.prepare("SELECT spec FROM workflow_runs WHERE id = ?").get(parse(ProjectIdSchema, id)) as { spec: string } | undefined;
+    if (!row) throw new ReelForgeError("NOT_FOUND", `workflow run ${id} not found`);
+    return JSON.parse(row.spec);
+  }
+
+  /** A run that stopped for approval continues (resume) in this process. False if it isn't waiting (any more). */
+  reopen(id: string): boolean {
+    const r = this.#db
+      .prepare("UPDATE workflow_runs SET status = 'running', error = NULL, finished_at = NULL, runner_pid = ? WHERE id = ? AND status = 'waiting_approval'")
+      .run(process.pid, parse(ProjectIdSchema, id));
+    return Number(r.changes) === 1;
+  }
+
   setProject(id: string, projectId: string): void {
     this.#db.prepare("UPDATE workflow_runs SET project_id = ? WHERE id = ?").run(projectId, id);
   }

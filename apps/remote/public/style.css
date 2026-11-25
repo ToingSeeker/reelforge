@@ -344,8 +344,9 @@ body.kb-open .sheet-body { padding-bottom: 12px; }
 }
 .toast.error { border-color: rgba(240, 122, 112, 0.4); }
 #toast[hidden] { display: none; }
-/* In the editor the top is header, status and picture: notices come up above the tool dock instead. */
-body[data-screen='edit'] #toast { top: auto; bottom: calc(env(safe-area-inset-bottom) + 96px); }
+/* In the editor, notices come up over the top of the picture: below it are the transport, the timeline and the
+   tool dock, which a notice must not cover while you edit. */
+body[data-screen='edit'] #toast { top: calc(env(safe-area-inset-top) + 64px); }
 
 /* ── pairing ────────────────────────────────────────────────────────────── */
 .onboard-steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 4px 0 0; padding: 0; list-style: none; font-size: 11.5px; color: var(--text-3); }
@@ -516,6 +517,8 @@ body[data-screen='session'] { overflow: hidden; overscroll-behavior: none; }
 /* Body: one scrolling column (preview + activity) above the composer, which sits on the safe area. */
 .s-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .s-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; display: flex; flex-direction: column; gap: 18px; padding: 12px var(--pad) 18px; }
+.s-lock { flex: none; display: flex; align-items: flex-start; gap: 8px; margin: 8px var(--pad) 0; padding: 10px 12px; border-radius: 12px; background: var(--warn-soft); color: var(--warn); font-size: 14px; line-height: 1.35; }
+.s-lock svg { flex: none; margin-top: 1px; }
 
 /* preview card */
 .pv-card { --arw: 9; --arh: 16; flex: none; overflow: hidden; border: 1px solid var(--border-strong); border-radius: var(--r-card); background: linear-gradient(180deg, rgba(27, 48, 41, 0.62), rgba(16, 29, 25, 0.9)); box-shadow: var(--shadow); }
@@ -572,6 +575,9 @@ body[data-screen='session'] { overflow: hidden; overscroll-behavior: none; }
 .agent .hd > .ic { flex: none; margin-top: 1px; color: var(--mint); }
 .agent.warn { border-color: rgba(240, 184, 96, 0.32); background: linear-gradient(var(--warn-soft), var(--warn-soft)), var(--surface); }
 .agent.warn .hd > .ic { color: var(--warn); }
+.agent.replaced { padding: 10px 14px; background: none; border-style: dashed; }
+.agent.replaced .hd { font-weight: 500; font-size: 14px; color: var(--text-2); }
+.agent.replaced .hd > .ic { color: var(--text-3); }
 .agent > p { margin-top: 4px; padding-left: 30px; color: var(--text-2); font-size: 14.5px; overflow-wrap: anywhere; }
 .agent > .res-note { color: var(--text-3); font-size: 13px; }
 .agent .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
@@ -1134,6 +1140,8 @@ body.kb-open .editor .ed-panel { max-height: none; flex: 1 1 auto; }
    Same grid as the Mac app with the library closed: tool rail · preview · inspector, the timeline across the
    bottom, each a glass panel. Must match WIDE_MQ in edit.js (the timeline draws track heads from it). */
 @media (min-width: 700px) and (min-height: 520px) {
+  /* iPad: the top is the preview's own bar (Live/Rendered, Full screen); notices sit at the foot of the timeline. */
+  body[data-screen='edit'] #toast { top: auto; bottom: calc(env(safe-area-inset-bottom) + 20px); }
   .editor {
     --gap: 10px;
     --panel: linear-gradient(180deg, rgba(36, 66, 57, 0.42), transparent 180px), rgba(17, 38, 32, 0.6);
@@ -1181,7 +1189,10 @@ body.kb-open .editor .ed-panel { max-height: none; flex: 1 1 auto; }
   .ed-pvbar { display: flex; flex: none; align-items: center; gap: 8px; min-height: 54px; padding: 10px 10px 6px 12px; }
   .ed-chip { display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 13px; border: 1px solid var(--pill-border); border-radius: 999px; background: var(--pill-fill); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09), 0 1px 2px rgba(0, 0, 0, 0.28); font-size: 12.5px; white-space: nowrap; }
   .ed-chip .ic { color: var(--text-2); }
-  .ed-chip-meta { color: var(--text-3); }
+  .ed-chip-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-3); }
+  /* A narrow iPad: the format chip gives way (its size first), never the Full screen button at the end. */
+  .ed-pvbar > .ed-chip { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+  .ed-pvbar > .ed-ic { flex: none; }
   .ed-pvseg { display: grid; grid-auto-flow: column; gap: 2px; padding: 3px; border: 1px solid var(--pill-border); border-radius: 999px; background: var(--field); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25); }
   .ed-pvseg-btn { height: 28px; padding: 0 13px; border: 0; border-radius: 999px; background: none; color: var(--text-2); font-size: 12.5px; font-weight: 500; cursor: pointer; }
   .ed-pvseg-btn[aria-pressed='true'] { background: linear-gradient(180deg, rgba(56, 96, 84, 0.9), rgba(36, 66, 57, 0.9)); color: var(--text); box-shadow: inset 0 0 0 1px rgba(168, 220, 200, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.1); }
@@ -1271,7 +1282,9 @@ body.kb-open .editor .ed-panel { max-height: none; flex: 1 1 auto; }
   .ed-cap { gap: 6px; border-color: rgba(214, 205, 160, 0.2); background: #34352a; color: var(--text); }
   .ed-cap.sel { border-color: var(--mint); background: rgba(168, 220, 200, 0.16); }
   .ed-playhead { top: 0; }
-  .ed-ph-label { top: 4px; }
+  /* Ruler labels sit right of their tick; the badge does too, so it covers the label under it whole (and
+     never slides under the sticky track heads at 00:00). */
+  .ed-ph-label { top: 4px; left: 0; transform: none; box-shadow: 0 0 0 3px #11251f; }
   .ed-snap { top: 30px; }
 
   /* typing on iPad: the rail stays, the timeline and transport step aside */

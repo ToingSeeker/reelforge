@@ -44,6 +44,17 @@ function fileStatus(r: AssetRow): Asset["status"] {
   }
 }
 
+/**
+ * Whole frames in a probed media duration. Containers often report a hair less than
+ * frames × frame time (a 4-frame MP4 says 0.133008 s, not 0.133333 s), so a shortfall
+ * under a tenth of a frame still counts as the frame: flooring it would lose the last
+ * frame, and leave a 1-frame file with no usable length.
+ */
+export function mediaFrames(durationUs: number, fps: Rational): number {
+  const tenthOfFrame = (100_000 * fps.den) / fps.num;
+  return microsToFrames(durationUs + tenthOfFrame, fps, "floor");
+}
+
 export function toAsset(r: AssetRow, projectFps: Rational, checkFile = true): Asset {
   return {
     id: r.id,
@@ -53,7 +64,7 @@ export function toAsset(r: AssetRow, projectFps: Rational, checkFile = true): As
     sourcePath: r.source_path,
     sizeBytes: r.size_bytes,
     durationUs: r.duration_us,
-    durationFrames: r.duration_us === null ? null : microsToFrames(r.duration_us, projectFps, "floor"),
+    durationFrames: r.duration_us === null ? null : mediaFrames(r.duration_us, projectFps),
     width: r.width,
     height: r.height,
     fps: r.fps_num && r.fps_den ? { num: r.fps_num, den: r.fps_den } : null,
@@ -162,7 +173,7 @@ export class AssetStore {
       mismatches.push(`frame rate ${probe.fps.num}/${probe.fps.den} ≠ ${current.fps.num}/${current.fps.den}`);
     }
     if (current.durationFrames !== null && probe.durationUs !== null) {
-      const frames = microsToFrames(probe.durationUs, fps, "floor");
+      const frames = mediaFrames(probe.durationUs, fps);
       if (Math.abs(frames - current.durationFrames) > 1) mismatches.push(`duration ${frames} ≠ ${current.durationFrames} frames`);
     }
     if (mismatches.length) {

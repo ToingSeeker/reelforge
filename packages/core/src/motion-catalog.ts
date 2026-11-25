@@ -5,12 +5,24 @@
 import { z } from "zod";
 import { MAX_FRAME } from "./schema.ts";
 import { stableHash } from "./fx-bake.ts";
+import { ReelForgeError } from "./errors.ts";
 
 /** Bump when a template's look or how we render changes: same props then make a new file. */
 export const MOTION_VERSION = "motion@1";
 
 /** Longest graphic we render (seconds). They're overlays; long ones are better as real video. */
 export const MOTION_MAX_SECONDS = 60;
+
+/** The most frames a graphic may have at a frame rate (MOTION_MAX_SECONDS of it). */
+export function motionMaxFrames(fps: { num: number; den: number }): number {
+  return Math.floor((MOTION_MAX_SECONDS * fps.num) / fps.den);
+}
+
+/** Why a length can't be rendered at this frame rate, or null. Every caller (engine, renderer, panel) uses it. */
+export function motionLengthIssue(durationFrames: number, fps: { num: number; den: number }): string | null {
+  const max = motionMaxFrames(fps);
+  return durationFrames > max ? `a motion graphic can be at most ${MOTION_MAX_SECONDS} seconds (${max} frames at this frame rate)` : null;
+}
 
 const Hex = z.string().regex(/^#[0-9a-fA-F]{6}$/, "colour must be #rrggbb");
 const line = (max: number) => z.string().trim().max(max);
@@ -114,6 +126,23 @@ export function motionRenderSpec(
   input: { template: MotionTemplateId; props: MotionProps; durationFrames: number },
   settings: { width: number; height: number; fps: { num: number; den: number } },
 ): MotionRenderSpec {
+  const issue = motionLengthIssue(input.durationFrames, settings.fps);
+  if (issue) throw new ReelForgeError("VALIDATION_ERROR", issue, { issues: [{ path: "durationFrames", message: issue }] });
   const body = { template: input.template, props: input.props, width: settings.width, height: settings.height, fps: settings.fps, frames: input.durationFrames + 1 };
   return { key: stableHash(JSON.stringify({ v: MOTION_VERSION, ...body })), ...body };
+}
+
+/**
+ * A readable file name for a rendered graphic ("Title card - Your headline"): the asset is named after
+ * its file, and the render key means nothing to people. Safe as one path segment on every platform.
+ */
+export function motionFileName(template: MotionTemplateId, props: MotionProps): string {
+  const p = props as Partial<Record<"title" | "name" | "text", string>>;
+  const words = (p.title ?? p.name ?? p.text ?? "")
+    .replace(/[\u0000-\u001f\u007f/\\:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60)
+    .replace(/^[.\s]+|[.\s]+$/g, "");
+  return words ? `${MOTION_TEMPLATES[template].label} - ${words}` : MOTION_TEMPLATES[template].label;
 }

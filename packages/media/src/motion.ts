@@ -3,10 +3,10 @@
 // it brings a bundler, a headless Chrome and a native compositor that the engine shouldn't load.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ReelForgeError, type MotionRenderSpec } from "@reelforge/core";
+import { motionFileName, ReelForgeError, type MotionRenderSpec } from "@reelforge/core";
 
 /**
  * Where the renderer lives: REELFORGE_MOTION_DIR (the desktop app points it at its bundle, which
@@ -43,6 +43,28 @@ export function motionOutputPath(generatedDir: string, key: string): string {
   return join(generatedDir, "motion", `${key}.mov`);
 }
 
+/**
+ * The same file under a readable name, for import (assets are named after their file):
+ * motion/<key>/Title card - Your headline.mov. The render stays at motionOutputPath (the cache).
+ */
+export function motionImportPath(generatedDir: string, spec: MotionRenderSpec): string {
+  return join(dirname(motionOutputPath(generatedDir, spec.key)), spec.key, `${motionFileName(spec.template, spec.props)}.mov`);
+}
+
+/** Give a finished render its readable name (a hard link, a copy where links don't work). Returns that path. */
+function readableCopy(generatedDir: string, spec: MotionRenderSpec): string {
+  const named = motionImportPath(generatedDir, spec);
+  if (existsSync(named)) return named;
+  const output = motionOutputPath(generatedDir, spec.key);
+  mkdirSync(dirname(named), { recursive: true });
+  try {
+    linkSync(output, named);
+  } catch {
+    copyFileSync(output, named);
+  }
+  return named;
+}
+
 export interface MotionRenderOptions {
   generatedDir: string;
   cacheDir: string;
@@ -50,10 +72,10 @@ export interface MotionRenderOptions {
   onProgress?: (p: number) => void;
 }
 
-/** Render one graphic (no-op when its file exists). Returns the file. */
+/** Render one graphic (no-op when its file exists). Returns the file under its readable name (motionImportPath). */
 export async function renderMotion(spec: MotionRenderSpec, opts: MotionRenderOptions): Promise<string> {
   const output = motionOutputPath(opts.generatedDir, spec.key);
-  if (existsSync(output)) return output;
+  if (existsSync(output)) return readableCopy(opts.generatedDir, spec);
   const l = layout();
   if (!l) throw new ReelForgeError("UNAVAILABLE", (motionAvailable() as { reason: string }).reason);
   const request = { spec, output, cacheDir: opts.cacheDir, ...(l.bundleDir ? { bundleDir: l.bundleDir } : {}), ...(l.browserExecutable ? { browserExecutable: l.browserExecutable } : {}) };
@@ -95,7 +117,7 @@ export async function renderMotion(spec: MotionRenderSpec, opts: MotionRenderOpt
     });
     child.stdin!.end(`${JSON.stringify(request)}\n`);
   });
-  return output;
+  return readableCopy(opts.generatedDir, spec);
 }
 
 export type MotionState =
@@ -125,7 +147,13 @@ export class MotionRenderer {
 
   ensure(spec: MotionRenderSpec): Promise<string> {
     const done = this.state(spec.key);
-    if (done?.state === "done") return Promise.resolve(done.path);
+    if (done?.state === "done") {
+      try {
+        return Promise.resolve(readableCopy(this.#opts.generatedDir, spec));
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    }
     const inflight = this.#pending.get(spec.key);
     if (inflight) return inflight;
     if (this.#ctl.signal.aborted) return Promise.reject(new Error("stopped"));

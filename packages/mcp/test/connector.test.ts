@@ -223,3 +223,26 @@ test("connector: open registration never evicts an app that finished authorizing
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("connector: `connector revoke` from another process cuts off a running connector's tokens at once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rf-auth-"));
+  try {
+    const running = new ConnectorAuth(join(dir, "auth.json"));
+    const c = running.register({ redirect_uris: ["https://claude.ai/cb"], client_name: "Claude" });
+    const verifier = randomBytes(32).toString("base64url");
+    const code = running.issueCode(c.clientId, "https://claude.ai/cb", createHash("sha256").update(verifier).digest("base64url"));
+    const tok = running.exchange(new URLSearchParams({ grant_type: "authorization_code", client_id: c.clientId, code, code_verifier: verifier }));
+    assert.ok(running.verifyAccessToken(tok.access_token));
+    const key = running.pairingCode;
+    // What the CLI does: its own instance on the same file.
+    new ConnectorAuth(join(dir, "auth.json")).revokeAll();
+    assert.equal(running.verifyAccessToken(tok.access_token), undefined, "the old bearer is refused without a restart");
+    assert.throws(() => running.exchange(new URLSearchParams({ grant_type: "refresh_token", client_id: c.clientId, refresh_token: tok.refresh_token })), OAuthError);
+    assert.notEqual(running.pairingCode, key, "the running connector shows the new access key");
+    // And the running connector's next write doesn't bring the revoked client back.
+    running.register({ redirect_uris: ["https://claude.ai/cb"], client_name: "New" });
+    assert.deepEqual(new ConnectorAuth(join(dir, "auth.json")).connections().map((x) => x.clientName), ["New"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

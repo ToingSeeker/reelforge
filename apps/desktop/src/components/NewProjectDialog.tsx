@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CreateProjectInput } from "@reelforge/core/schema";
 import { parseFps } from "@reelforge/core/timebase";
-import { ApiError } from "../api.ts";
+import { errorMessage } from "../api.ts";
 import { Icon } from "../icons.tsx";
 
 export const FORMATS = [
@@ -42,12 +42,18 @@ export function NewProjectDialog({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const f = FORMATS.find((x) => x.id === format)!;
+    // `required` lets a name of only spaces through; the engine would answer a bare "invalid input".
+    if (!name.trim()) {
+      setError("Give the project a name.");
+      nameRef.current?.focus();
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      await onCreate({ name, settings: { width: f.width, height: f.height, fps: parseFps(fps) } });
+      await onCreate({ name: name.trim(), settings: { width: f.width, height: f.height, fps: parseFps(fps) } });
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : String(err));
+      setError(errorMessage(err));
       setBusy(false);
     }
   };

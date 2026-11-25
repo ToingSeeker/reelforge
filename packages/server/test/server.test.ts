@@ -231,6 +231,35 @@ test("media streaming: ?token= only on media GETs; proxies for video/image, orig
   assert.equal(thumb.status, 200);
 });
 
+test("sound served to the preview has its real type: AAC .mp4 as audio/mp4, AIFF as an AAC proxy; a proxy failure is a 400", async (t) => {
+  const srv = await boot(t);
+  const f = fixtures();
+  const { execFileSync } = await import("node:child_process");
+  const { copyFileSync, writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "reelforge-sound-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=1", join(dir, "vo.aiff")]);
+  copyFileSync(f.portrait, join(dir, "broken.mp4"));
+  const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Sound" } })).json()) as any;
+  const r = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [f.audioOnlyMp4, join(dir, "vo.aiff"), join(dir, "broken.mp4")] } })).json()) as any;
+  const [mp4, aiff, broken] = r.imported;
+  assert.equal(mp4.kind, "audio");
+  const media = (id: string) => call(srv, "GET", `/v1/projects/${project.id}/assets/${id}/media`);
+  const a = await media(mp4.id);
+  assert.equal(a.headers.get("content-type"), "audio/mp4");
+  assert.equal((await a.arrayBuffer()).byteLength, (await import("node:fs")).statSync(f.audioOnlyMp4).size, "AAC in MP4 plays as it is");
+  const b = await media(aiff.id);
+  assert.equal(b.status, 200);
+  assert.equal(b.headers.get("content-type"), "audio/mp4");
+  assert.match(Buffer.from(await b.arrayBuffer()).subarray(4, 8).toString(), /ftyp/, "an MP4 (AAC) proxy, not the AIFF");
+
+  // The file is replaced by garbage of the same size after import: the proxy can't be made.
+  writeFileSync(join(dir, "broken.mp4"), Buffer.alloc((await import("node:fs")).statSync(join(dir, "broken.mp4")).size, 7));
+  const c = await media(broken.id);
+  assert.equal(c.status, 400);
+  assert.match(((await c.json()) as any).error.message, /could not create a preview proxy/);
+});
+
 test("M3 over REST: analyze → poll, context, captions generate asks for transcripts, SRT, fonts", async (t) => {
   const srv = await boot(t);
   const f = fixtures();
@@ -360,8 +389,10 @@ test("a dropped folder imports the media files inside it, only when the desktop 
   copyFileSync(f.mp3, join(dir, "a.mp3"));
   writeFileSync(join(dir, "notes.txt"), "x");
   writeFileSync(join(dir, ".hidden.mp4"), "x");
-  mkdirSync(join(dir, "sub"));
-  copyFileSync(f.portrait, join(dir, "sub", "deeper.mp4"));
+  mkdirSync(join(dir, "sub", "deeper"), { recursive: true });
+  copyFileSync(f.portrait, join(dir, "sub", "deeper", "c.mp4"));
+  mkdirSync(join(dir, ".git"));
+  copyFileSync(f.portrait, join(dir, ".git", "hidden-folder.mp4"));
   const { project } = (await (await call(srv, "POST", "/v1/projects", { body: { name: "Drop" } })).json()) as any;
 
   const plain = (await (await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [dir] } })).json()) as any;
@@ -370,8 +401,8 @@ test("a dropped folder imports the media files inside it, only when the desktop 
   const res = await call(srv, "POST", `/v1/projects/${project.id}/assets`, { body: { paths: [dir], folders: true } });
   assert.equal(res.status, 201);
   const r = (await res.json()) as any;
-  assert.deepEqual(r.imported.map((a: any) => a.filename).sort(), ["a.mp3", "b.mp4"]);
-  assert.equal(r.skipped, 3, "notes.txt, the hidden file and the subfolder");
+  assert.deepEqual(r.imported.map((a: any) => a.filename).sort(), ["a.mp3", "b.mp4", "c.mp4"], "subfolders are searched too");
+  assert.equal(r.skipped, 3, "notes.txt, the hidden file and the hidden folder");
 
   const empty = mkdtempSync(join(tmpdir(), "reelforge-drop-empty-"));
   t.after(() => rmSync(empty, { recursive: true, force: true }));

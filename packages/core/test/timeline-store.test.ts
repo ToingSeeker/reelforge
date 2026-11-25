@@ -122,11 +122,11 @@ test("assets from another project cannot be referenced", (t) => {
   const otherVideo = s.timeline.get(other.id).tracks.find((x) => x.kind === "video")!;
   assert.equal(
     code(() => s.timeline.apply(other.id, { baseRevision: 1, operations: [{ type: "clip.add", trackId: otherVideo.id, assetId: s.asset.id, start: 0 }] }, "cli")),
-    "VALIDATION_ERROR",
+    "NOT_FOUND",
   );
   assert.equal(
     code(() => s.timeline.apply(other.id, { baseRevision: 1, operations: [{ type: "clip.add", trackId: s.video.id, assetId: s.asset.id, start: 0 }] }, "cli")),
-    "VALIDATION_ERROR",
+    "NOT_FOUND",
   );
 });
 

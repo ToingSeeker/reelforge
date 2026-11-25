@@ -114,10 +114,18 @@ const fail = (message) => {
   throw new EditRejected(message);
 };
 
+/** core fitProps: fades shrink with the clip; when both no longer fit they share it in proportion. */
 function fitProps(p, duration) {
   const out = { ...p };
-  if (out.fadeIn !== undefined) out.fadeIn = Math.min(out.fadeIn, duration);
-  if (out.fadeOut !== undefined) out.fadeOut = Math.min(out.fadeOut, duration - (out.fadeIn ?? 0));
+  const fadeIn = out.fadeIn ?? 0;
+  const fadeOut = out.fadeOut ?? 0;
+  if (fadeIn + fadeOut > duration) {
+    if (fadeIn > 0 && fadeOut > 0) {
+      out.fadeIn = Math.floor((fadeIn * duration) / (fadeIn + fadeOut));
+      out.fadeOut = duration - out.fadeIn;
+    } else if (fadeIn > 0) out.fadeIn = duration;
+    else out.fadeOut = duration;
+  }
   if (out.transitionIn !== undefined) out.transitionIn = Math.min(out.transitionIn, duration);
   return out;
 }
@@ -221,7 +229,9 @@ export function applyOps(model, ops) {
         if (op.edge === 'start') {
           if (op.frame >= clipEnd(c)) fail('The start must stay before the end.');
           const d = op.frame - c.start;
-          put({ ...c, start: op.frame, sourceIn: c.sourceIn + d, duration: c.duration - d });
+          // A still has no source start (core clip.trim).
+          const still = assetOf(m, c.assetId)?.kind === 'image';
+          put({ ...c, start: op.frame, sourceIn: still ? Math.max(0, c.sourceIn + d) : c.sourceIn + d, duration: c.duration - d });
         } else {
           if (op.frame <= c.start) fail('The end must stay after the start.');
           put({ ...c, duration: op.frame - c.start });

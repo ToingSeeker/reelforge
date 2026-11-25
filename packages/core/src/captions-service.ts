@@ -1,6 +1,6 @@
 import type { Database } from "./db.ts";
 import { ReelForgeError } from "./errors.ts";
-import { AnalysisStore } from "./analyses.ts";
+import { AnalysisStore, checkTranscriptLanguage } from "./analyses.ts";
 import { generateCaptions, soundTracks, type CaptionGenOptions, type CaptionPlan } from "./captions.ts";
 import { TimelineStore } from "./timeline.ts";
 import { CAPTION_PRESETS, type TimelineOp, type TranscriptResult } from "./schema.ts";
@@ -10,7 +10,9 @@ import { CAPTION_PRESETS, type TimelineOp, type TranscriptResult } from "./schem
  * asset has no fresh transcript, it is reported in `missing` (the caller
  * transcribes and asks again) instead of silently captioning half the speech.
  */
-export function planCaptions(db: Database, projectId: string, opts: CaptionGenOptions & { trackId?: string } = {}): CaptionPlan {
+export function planCaptions(db: Database, projectId: string, opts: CaptionGenOptions & { trackId?: string; language?: string } = {}): CaptionPlan {
+  // A transcript in another language than the one asked for doesn't count: it is transcribed again.
+  const language = opts.language === undefined ? undefined : checkTranscriptLanguage(opts.language);
   const tl = new TimelineStore(db).get(projectId);
   const track = opts.trackId ? tl.tracks.find((t) => t.id === opts.trackId) : tl.tracks.find((t) => t.kind === "caption");
   if (!track || track.kind !== "caption") throw new ReelForgeError("VALIDATION_ERROR", "no caption track to write to", { trackId: opts.trackId });
@@ -28,7 +30,9 @@ export function planCaptions(db: Database, projectId: string, opts: CaptionGenOp
   const missing: CaptionPlan["missing"] = [];
   for (const id of assetIds) {
     const a = store.latest(projectId, id, "transcript");
-    if (a?.state === "completed" && a.result && !a.stale) transcripts.set(id, a.result);
+    const otherLanguage =
+      !!language && language !== "auto" && !!a?.result && a.params.language !== language && a.result.language !== language;
+    if (a?.state === "completed" && a.result && !a.stale && !otherLanguage) transcripts.set(id, a.result);
     else missing.push({ assetId: id, filename: tl.assets.find((x) => x.id === id)?.filename ?? id, state: a?.state ?? null });
   }
   return { trackId: track.id, missing, captions: missing.length ? [] : generateCaptions(tl, transcripts, { ...opts, sourceTrackIds: [...sources] }) };

@@ -61,3 +61,11 @@ export async function listOllamaModels(): Promise<{ available: boolean; models: 
     return { available: false, models: [] };
   }
 }
+
+/** The first installed model, for a request that names none; says whether Ollama is down or just has no models. */
+export async function defaultOllamaModel(): Promise<string> {
+  const { available, models } = await listOllamaModels();
+  if (!available) throw new ReelForgeError("UNAVAILABLE", `Ollama is not reachable at ${ollamaUrl()} (is it running?)`);
+  if (!models[0]) throw new ReelForgeError("UNAVAILABLE", "Ollama has no models installed (install one with `ollama pull <model>`)");
+  return models[0];
+}

@@ -157,7 +157,15 @@ export class TimelineStore {
     const pid = parse(ProjectIdSchema, projectId);
     const ops = parse(ApplyOperationsInputSchema.shape.operations, operations);
     const loaded = this.#load(pid, true);
-    const next = applyOperations(loaded.state, ops);
+    let next: EditState;
+    try {
+      next = applyOperations(loaded.state, ops);
+    } catch (e) {
+      // A dry run checks proposed operations: one naming a clip that isn't there is an invalid proposal
+      // (and the AI planner's repair round handles it), not a missing resource of the request.
+      if (e instanceof ReelForgeError && e.code === "NOT_FOUND") throw new ReelForgeError("VALIDATION_ERROR", e.message, e.details);
+      throw e;
+    }
     const end = (m: ReadonlyMap<string, { start: number; duration: number }>) => [...m.values()].reduce((x, c) => Math.max(x, c.start + c.duration), 0);
     const before = this.#view(loaded.project.id, loaded.project, loaded.tracks, loaded.clips, loaded.captions, loaded.assets);
     return {

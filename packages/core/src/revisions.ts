@@ -22,7 +22,9 @@ export function assertRevision(db: Database, projectId: string, baseRevision: nu
   if (baseRevision !== undefined && row.revision !== baseRevision) {
     throw new ReelForgeError(
       "REVISION_CONFLICT",
-      `project changed since revision ${baseRevision} (now ${row.revision}); reload and retry`,
+      baseRevision > row.revision
+        ? `revision ${baseRevision} doesn't exist yet (the project is at revision ${row.revision}); reload and retry`
+        : `project changed since revision ${baseRevision} (now ${row.revision}); reload and retry`,
       { projectId, baseRevision, currentRevision: row.revision },
     );
   }

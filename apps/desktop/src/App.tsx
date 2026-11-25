@@ -3,7 +3,7 @@ import type { AIProposal, Asset, CaptionStylePatch, ClipPropsPatch, Project, Tim
 import { applyOperations, canPlace, clipEnd } from "@reelforge/core/timeline-ops";
 import { SettingsDialog } from "./components/SettingsDialog.tsx";
 import { AutomationLab } from "./components/AutomationLab.tsx";
-import { ApiError, createClient, resolveApiInfo, type Client } from "./api.ts";
+import { ApiError, createClient, errorMessage, resolveApiInfo, type Client } from "./api.ts";
 import { useEditor } from "./editor.ts";
 import { backgroundEngine, onFileDrop, pickExportPath, pickMediaFiles } from "./native.ts";
 import { useExports, usePreview } from "./render.ts";
@@ -314,7 +314,7 @@ export function App() {
     try {
       await client.renameProject(current.id, name, current.revision);
     } catch (e) {
-      notify("error", e instanceof Error ? e.message : String(e));
+      notify("error", errorMessage(e));
     }
     await refresh();
   };
@@ -538,13 +538,8 @@ export function App() {
         onCancelExport={() => void exports.cancel()}
       />
 
-      {projects !== null && !current ? (
-        <Welcome onCreate={() => setDialogOpen(true)} />
-      ) : workspace === "review" && current ? (
-        <main className="rf-page">
-          <RenderQueue client={client} projectId={current.id} notify={notify} onExport={() => void doExport()} />
-        </main>
-      ) : workspace === "automate" ? (
+      {/* Automate works without a project (a workflow run creates its own), so it comes before Welcome. */}
+      {workspace === "automate" ? (
         <main className="rf-page">
           <AutomationLab
             client={client}
@@ -555,6 +550,20 @@ export function App() {
               void refresh();
             }}
           />
+        </main>
+      ) : workspace === "review" && projects !== null && !current ? (
+        <main className="rf-center-state">
+          <h1>Nothing to review yet</h1>
+          <p>Exports of a project show up here. Create a project, or run a workflow in Automate to make one.</p>
+          <button className="rf-btn rf-btn-primary rf-btn-lg" onClick={() => setDialogOpen(true)}>
+            <Icon name="plus" size={16} /> New project
+          </button>
+        </main>
+      ) : projects !== null && !current ? (
+        <Welcome onCreate={() => setDialogOpen(true)} />
+      ) : workspace === "review" && current ? (
+        <main className="rf-page">
+          <RenderQueue client={client} projectId={current.id} notify={notify} onExport={() => void doExport()} />
         </main>
       ) : (
         <div

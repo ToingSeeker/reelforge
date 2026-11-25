@@ -48,10 +48,10 @@ export function run(bin: string, args: string[], opts: { timeoutMs?: number; max
   });
 }
 
-/** First meaningful line of FFmpeg's stderr, without the input path echoed back. */
+/** First meaningful line of FFmpeg's stderr, without the input path echoed back or FFmpeg's memory addresses ("[png @ 0x7f…]"). */
 export function ffmpegReason(e: unknown, path?: string): string {
   const stderr = (e as { stderr?: string }).stderr ?? "";
-  const line = stderr.split("\n").map((l) => l.trim()).find(Boolean) ?? (e instanceof Error ? e.message : String(e));
+  const line = (stderr.split("\n").map((l) => l.trim()).find(Boolean) ?? (e instanceof Error ? e.message : String(e))).replace(/ @ 0x[0-9a-fA-F]+\]/g, "]");
   return path ? line.replaceAll(`file:${path}`, "<file>").replaceAll(path, "<file>") : line;
 }
 

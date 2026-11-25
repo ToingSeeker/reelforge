@@ -100,6 +100,11 @@ export interface RemoteAsk {
 export interface RemoteEngineInfo {
   /** Running under launchd, independent of the editor window. */
   background: boolean;
+  /**
+   * How it was started: by the editor app (stops when the editor quits), under launchd in the background, or
+   * by hand (`reelforge serve` in a terminal or script). Older engines leave it out.
+   */
+  mode?: "editor" | "background" | "standalone";
   startedAt: string;
   version: string;
 }
@@ -679,7 +684,7 @@ export class RemoteManager {
     const devices = this.#readDevices();
     const device: StoredDevice = {
       id: randomBytes(12).toString("base64url"),
-      name: cleanName(verified.name) || "Phone",
+      name: uniqueName(cleanName(verified.name) || "Phone", devices.devices.map((d) => d.name)),
       secret: newSecret(),
       createdAt: new Date().toISOString(),
       lastSeenAt: null,
@@ -694,6 +699,7 @@ export class RemoteManager {
       deviceId: device.id,
       deviceSecret: device.secret,
       broadcastKey: devices.broadcastKey,
+      deviceName: device.name,
     });
     p.state = "answered";
     p.deviceId = device.id;
@@ -1931,6 +1937,13 @@ function clip(text: string, max = 60): string {
 
 function cleanName(text: string): string {
   return text.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 40);
+}
+
+/** Two phones of the same kind ("iPhone · Safari") are told apart on the Mac's list: the second is "… 2". */
+export function uniqueName(name: string, taken: string[]): string {
+  const used = new Set(taken);
+  if (!used.has(name)) return name;
+  for (let n = 2; ; n++) if (!used.has(`${name} ${n}`)) return `${name} ${n}`;
 }
 
 function formatSize(bytes: number): string {

@@ -167,6 +167,7 @@ export function strictSchema(s: unknown): unknown {
 
 function nullable(v: unknown): unknown {
   const s = v as Record<string, unknown>;
+  if (Array.isArray(s.type) && s.type.includes("null")) return s;
   if (typeof s.type === "string" && !s.enum) return { ...s, type: [s.type, "null"] };
   return { anyOf: [s, { type: "null" }] };
 }

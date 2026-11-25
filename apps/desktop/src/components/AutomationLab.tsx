@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { WorkflowRun } from "@reelforge/core/schema";
-import type { Client } from "../api.ts";
+import { errorMessage, type Client } from "../api.ts";
 import type { Notify } from "../editor.ts";
 import { pickWorkflowFile } from "../native.ts";
 import { Icon } from "../icons.tsx";
@@ -40,7 +40,7 @@ export function AutomationLab({ client, notify, onOpenProject }: { client: Clien
       setRuns((list) => [r, ...(list ?? [])]);
       notify("info", `Running “${r.name}”.`);
     } catch (e) {
-      notify("error", e instanceof Error ? e.message : String(e));
+      notify("error", `Couldn't run ${path.split("/").pop()}: ${errorMessage(e)}`);
     }
   };
 
@@ -95,7 +95,7 @@ export function AutomationLab({ client, notify, onOpenProject }: { client: Clien
                 ))}
               </ol>
               {r.error && <p className="rf-job-error">{r.error}</p>}
-              {r.status === "waiting_approval" && <p className="rf-hint">An AI Director proposal is waiting: open the project and review it in the AI Director panel.</p>}
+              {r.status === "waiting_approval" && <p className="rf-hint">An AI Director proposal is waiting: open the project and review it in the AI Director panel. After you apply it, continue the remaining steps with <code>reelforge workflow run &lt;file&gt; --resume {r.id}</code>.</p>}
             </li>
           ))}
         </ul>

@@ -2,6 +2,13 @@
 // Frame rates are exact rationals (30000/1001, not 29.97) so conversions never
 // drift. Rescaling between rates uses BigInt so long timelines stay exact.
 
+import { ReelForgeError } from "./errors.ts";
+
+/** Bad user-facing input (a rate, a time): a validation error at every boundary, not an internal one. */
+function invalid(message: string): never {
+  throw new ReelForgeError("VALIDATION_ERROR", message);
+}
+
 export interface Rational {
   num: number;
   den: number;
@@ -17,12 +24,8 @@ function gcd(a: number, b: number): number {
 }
 
 export function rational(num: number, den = 1): Rational {
-  if (!Number.isSafeInteger(num) || !Number.isSafeInteger(den)) {
-    throw new RangeError(`rational parts must be integers, got ${num}/${den}`);
-  }
-  if (den <= 0 || num <= 0) {
-    throw new RangeError(`frame rate must be positive, got ${num}/${den}`);
-  }
+  if (!Number.isSafeInteger(num) || !Number.isSafeInteger(den)) invalid(`rational parts must be integers, got ${num}/${den}`);
+  if (den <= 0 || num <= 0) invalid(`frame rate must be positive, got ${num}/${den}`);
   const g = gcd(num, den);
   return { num: num / g, den: den / g };
 }
@@ -41,9 +44,7 @@ export function parseFps(input: string): Rational {
   const frac = /^(\d+)\/(\d+)$/.exec(s);
   if (frac) return rational(Number(frac[1]), Number(frac[2]));
   if (/^\d+$/.test(s)) return rational(Number(s), 1);
-  throw new RangeError(
-    `unsupported frame rate "${input}" (use an integer, num/den, or 23.976/29.97/59.94)`,
-  );
+  invalid(`unsupported frame rate "${input}" (use an integer, num/den, or 23.976/29.97/59.94)`);
 }
 
 export function fpsToString(fps: Rational): string {
@@ -139,9 +140,18 @@ export function microsToFrames(micros: number, fps: Rational, rounding: Rounding
   return Number(signedDivRound(n, d, rounding));
 }
 
+/** Frame numbers skipped each minute (except every tenth) by SMPTE drop-frame timecode, or 0 if the rate has none. */
+function dropFramesPerMinute(fps: Rational): number {
+  if (fps.den !== 1001) return 0;
+  if (fps.num === 30000) return 2;
+  if (fps.num === 60000) return 4;
+  return 0;
+}
+
 /**
  * Parse a user-facing time into project frames:
- *   "90" (frames) · "3s" / "2.5s" (seconds) · "00:00:03:00" (timecode) · "00:03.10" (MM:SS.FF)
+ *   "90" (frames) · "3s" / "2.5s" (seconds) · "00:00:03:00" (timecode) · "00:00:03;00" (drop-frame
+ *   timecode, 29.97/59.94 only) · "00:03.10" or "75:03.10" (MM:SS.FF, minutes may pass 59)
  */
 export function parseTime(input: string, fps: Rational): number {
   const s = input.trim();
@@ -149,13 +159,26 @@ export function parseTime(input: string, fps: Rational): number {
   const sec = /^(\d+(?:\.\d+)?)s$/.exec(s);
   if (sec) return secondsToFrames(Number(sec[1]), fps);
   const base = nominalFps(fps);
-  const tc = /^(\d+):(\d{2}):(\d{2})[:;](\d{2})$/.exec(s);
-  const clock = /^(\d+):(\d{2})\.(\d{2})$/.exec(s);
-  const parts = tc ? tc.slice(1).map(Number) : clock ? [0, ...clock.slice(1).map(Number)] : null;
-  if (parts) {
-    const [hh, mm, ss, ff] = parts as [number, number, number, number];
-    if (mm > 59 || ss > 59 || ff >= base) throw new RangeError(`invalid time "${input}"`);
-    return ((hh * 60 + mm) * 60 + ss) * base + ff;
+  const tc = /^(\d+):(\d{2}):(\d{2})([:;])(\d{2})$/.exec(s);
+  if (tc) {
+    const [hh, mm, ss, ff] = [tc[1], tc[2], tc[3], tc[5]].map(Number) as [number, number, number, number];
+    if (mm > 59 || ss > 59 || ff >= base) invalid(`invalid time "${input}" (minutes and seconds go up to 59, frames up to ${base - 1})`);
+    const nominal = ((hh * 60 + mm) * 60 + ss) * base + ff;
+    if (tc[4] === ":") return nominal;
+    const drop = dropFramesPerMinute(fps);
+    if (!drop) invalid(`"${input}" is drop-frame timecode (";"), which only exists at 29.97 and 59.94 fps; use ":" at this frame rate`);
+    if (ss === 0 && mm % 10 !== 0 && ff < drop) {
+      invalid(`"${input}" doesn't exist in drop-frame timecode (frames 00–${String(drop - 1).padStart(2, "0")} are skipped at the start of each minute except every tenth)`);
+    }
+    const minutes = hh * 60 + mm;
+    return nominal - drop * (minutes - Math.floor(minutes / 10));
   }
-  throw new RangeError(`invalid time "${input}" (use frames, 2.5s, HH:MM:SS:FF or MM:SS.FF)`);
+  const clock = /^(\d+):(\d{2})\.(\d{2})$/.exec(s);
+  if (clock) {
+    // The editor's MM:SS.FF: minutes keep counting past 59 (formatClock writes 75:03.10).
+    const [mm, ss, ff] = clock.slice(1).map(Number) as [number, number, number];
+    if (ss > 59 || ff >= base) invalid(`invalid time "${input}" (seconds go up to 59, frames up to ${base - 1})`);
+    return (mm * 60 + ss) * base + ff;
+  }
+  invalid(`invalid time "${input}" (use frames, 2.5s, HH:MM:SS:FF or MM:SS.FF)`);
 }

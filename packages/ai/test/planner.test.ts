@@ -135,7 +135,7 @@ test("selection context: changes outside the selection are flagged", async (t) =
   const second = s.timeline.apply(s.p.id, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: s.v1, assetId: s.asset.id, start: 100, duration: 30 }] }, "cli").clips.find((c) => c.start === 100)!;
   const provider = new FakeProvider([plan([{ type: "clip.update", why: "x", clipId: second.id, props: { scale: 1.1 } }])]);
   const p = await propose(s.db, s.p.id, provider, { instruction: "zoom", model: "m", selection: [s.clip.id] });
-  assert.match(p.warnings.join(" "), /outside your selection/);
+  assert.ok(p.warnings.includes("Also changes 1 clip outside your selection."), p.warnings.join(" "));
   assert.match(provider.requests[0]!.turns[0]!.content, new RegExp(s.clip.id));
 });
 
@@ -226,4 +226,94 @@ test("model output: new clip props and AI effects survive parsing; opts pairs be
   const props = ops.items.anyOf[1]!.properties.props!.properties;
   const { DEFAULT_CLIP_PROPS } = await import("@reelforge/core");
   assert.deepEqual(Object.keys(props).sort(), Object.keys(DEFAULT_CLIP_PROPS).sort());
+});
+
+test("an unknown field in an operation is rejected (not dropped) and goes back to the model", async (t) => {
+  const s = setup(t);
+  const other = s.timeline.get(s.p.id).tracks.find((x) => x.kind === "overlay")!.id;
+  const provider = new FakeProvider([
+    // "track" is not a clip.move field: before, it was stripped and the clip moved in time only.
+    plan([{ type: "clip.move", why: "up", clipId: s.clip.id, start: 30, track: other }]),
+    plan([{ type: "clip.move", why: "up", clipId: s.clip.id, start: 30, trackId: other }]),
+  ]);
+  const p = await propose(s.db, s.p.id, provider, { instruction: "move it to V2", model: "m" });
+  assert.equal(provider.requests.length, 2);
+  assert.match(provider.requests[1]!.turns.at(-1)!.content, /operation 1 \(clip\.move\).*track/);
+  assert.deepEqual(p.operations[0], { type: "clip.move", clipId: s.clip.id, start: 30, trackId: other });
+  // The engine's own entry points refuse them too.
+  assert.throws(
+    () => s.timeline.apply(s.p.id, { baseRevision: s.timeline.get(s.p.id).project.revision, operations: [{ type: "clip.add", trackId: s.v1, assetId: s.asset.id, start: 200, speed: 2 } as never] }, "cli"),
+    (e: unknown) => e instanceof ReelForgeError && e.code === "VALIDATION_ERROR" && /speed/.test(JSON.stringify(e.toJSON())),
+  );
+});
+
+test("AI effects: unknown options, bad choices, text on effects without text and times past the media trigger the repair round", async (t) => {
+  const s = setup(t);
+  const fx = (e: object) => plan([{ type: "clip.update", why: "fx", clipId: s.clip.id, props: { aiEffects: [e] } }]);
+  const cases: [object, RegExp][] = [
+    [{ fx: "lean-in", start: 0, end: 60, opts: [{ key: "colour", value: "red" }] }, /lean-in has no option "colour"/],
+    [{ fx: "moody", start: 0, end: 60, opts: [{ key: "grade", value: "sepia" }] }, /grade.*must be one of moody, bw/],
+    [{ fx: "lean-in", start: 0, end: 60, text: "WOW" }, /lean-in takes no text/],
+    // The media is 300 frames long (10 s at 30 fps): an effect after its end never plays.
+    [{ fx: "lean-in", start: 400, end: 460 }, /runs to source frame 460 but the media is only 300 frames long/],
+  ];
+  for (const [bad, why] of cases) {
+    const provider = new FakeProvider([fx(bad), fx({ fx: "lean-in", start: 0, end: 60 })]);
+    const p = await propose(s.db, s.p.id, provider, { instruction: "add an effect", model: "m" });
+    assert.equal(provider.requests.length, 2, JSON.stringify(bad));
+    assert.match(provider.requests[1]!.turns.at(-1)!.content, why);
+    assert.equal(p.status, "pending");
+  }
+});
+
+test("the approval diff shows AI effects readably, not [object Object]", async (t) => {
+  const s = setup(t);
+  const provider = new FakeProvider([plan([{ type: "clip.update", why: "fx", clipId: s.clip.id, props: { aiEffects: [{ fx: "backdrop-word", start: 30, end: 90, text: "SECRET" }] } }])]);
+  const p = await propose(s.db, s.p.id, provider, { instruction: "word behind me", model: "m" });
+  assert.doesNotMatch(p.changes[0]!.after!, /object Object/);
+  assert.match(p.changes[0]!.after!, /aiEffects backdrop-word 1\.00s–3\.00s of source “SECRET”/);
+});
+
+test("stale proposals: honest error, listed as stale, and they can be dismissed", async (t) => {
+  const s = setup(t);
+  const p = await propose(s.db, s.p.id, new FakeProvider([plan([{ type: "clip.update", why: "x", clipId: s.clip.id, props: { opacity: 0.5 } }])]), { instruction: "half", model: "m" });
+  const tl = s.timeline.get(s.p.id);
+  s.timeline.apply(s.p.id, { baseRevision: tl.project.revision, operations: [{ type: "clip.move", clipId: s.clip.id, start: 10 }] }, "cli");
+  // Without anyone trying to apply it, it already shows as stale.
+  assert.equal(s.proposals.list(s.p.id)[0]!.status, "stale");
+  for (let i = 0; i < 2; i++) {
+    assert.throws(
+      () => s.proposals.apply(p.id, { by: "desktop", channel: "x" }),
+      (e: unknown) => e instanceof ReelForgeError && e.code === "REVISION_CONFLICT" && /can no longer be applied; ask for a new proposal/.test(e.message) && !/retry/.test(e.message),
+    );
+  }
+  assert.equal(s.proposals.reject(p.id, "desktop").status, "rejected");
+});
+
+test("engine warnings name only what the proposal causes, not problems the timeline already had", async (t) => {
+  const s = setup(t);
+  const tl = s.timeline.get(s.p.id);
+  // Already on the timeline: a dissolve with no handles (its warning is not this proposal's).
+  s.timeline.apply(s.p.id, { baseRevision: tl.project.revision, operations: [{ type: "clip.add", trackId: s.v1, assetId: s.asset.id, start: 90, sourceIn: 0, duration: 60, props: { transitionIn: 20 } }] }, "cli");
+  const p = await propose(s.db, s.p.id, new FakeProvider([plan([{ type: "clip.update", why: "x", clipId: s.clip.id, props: { opacity: 0.8 } }])]), { instruction: "dim", model: "m" });
+  assert.deepEqual(p.warnings, []);
+});
+
+test("operations that change nothing make a no-changes proposal that can't be 'applied'", async (t) => {
+  const s = setup(t);
+  const p = await propose(s.db, s.p.id, new FakeProvider([plan([{ type: "clip.move", why: "x", clipId: s.clip.id, start: 0 }])]), { instruction: "keep it", model: "m" });
+  assert.deepEqual([p.operations.length, p.changes.length], [0, 0]);
+  assert.match(p.warnings.join(" "), /would not change anything/);
+  assert.throws(() => s.proposals.apply(p.id, { by: "desktop", channel: "x" }), /no changes to apply/);
+});
+
+test("the model schema lets scaleEnd / xEnd / yEnd be null (stop the animation), as the engine does", async () => {
+  const { parseModelOutput, MODEL_OUTPUT_SCHEMA, strictSchema } = await import("../src/index.ts");
+  const ops = (MODEL_OUTPUT_SCHEMA.properties as { operations: { items: { anyOf: { properties: { props?: { properties: Record<string, { type: unknown }> } } }[] } } }).operations;
+  const props = ops.items.anyOf[1]!.properties.props!.properties;
+  for (const k of ["scaleEnd", "xEnd", "yEnd"]) assert.deepEqual(props[k]!.type, ["number", "null"], k);
+  const strict = JSON.stringify(strictSchema(MODEL_OUTPUT_SCHEMA));
+  assert.match(strict, /"scaleEnd":\{"type":\["number","null"\]\}/);
+  const r = parseModelOutput(JSON.stringify({ summary: "", warnings: [], operations: [{ type: "clip.update", why: "", clipId: "57f54d86-a887-43fb-8adc-dff5b5d1b95d", props: { scaleEnd: null, xEnd: null } }] }));
+  assert.deepEqual(r.errors, []);
 });

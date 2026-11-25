@@ -123,3 +123,52 @@ test("trackLabels: V counts up from the bottom, A down from the top", async () =
   const labels = trackLabels([mk("ov", "overlay", 0), mk("v", "video", 1), mk("m", "audio", 2), mk("vo", "audio", 3), mk("cc", "caption", 4)]);
   assert.deepEqual(Object.fromEntries(labels), { ov: "V2", v: "V1", m: "A1", vo: "A2", cc: "C1" });
 });
+
+test("a missing clip, caption, track or asset is NOT_FOUND, not invalid input", () => {
+  const notFound = (ops: Parameters<typeof applyOperations>[1], what: RegExp) =>
+    assert.throws(() => applyOperations(state(), ops, ids), (e: unknown) => e instanceof ReelForgeError && e.code === "NOT_FOUND" && what.test(e.message));
+  notFound([{ type: "clip.update", clipId: T(555), props: { opacity: 0.5 } }], /clip .* not found/);
+  notFound([{ type: "caption.delete", captionIds: [T(556)] }], /caption .* not found/);
+  notFound([{ type: "clip.add", trackId: T(557), assetId: VID, start: 0 }], /track .* not found/);
+  notFound([{ type: "clip.add", trackId: V1, assetId: T(558), start: 0 }], /asset .* not found/);
+});
+
+test("the start of a still can be trimmed earlier: it has no source start", () => {
+  const s = state([clip(1, 60, 90, { assetId: IMG })]);
+  const out = applyOperations(s, [{ type: "clip.trim", clipId: T(101), edge: "start", frame: 30 }], ids);
+  assert.deepEqual(out.clips.get(T(101)), { ...s.clips.get(T(101))!, start: 30, duration: 120, sourceIn: 0 });
+  // A video still can't reach before its first frame.
+  rejects(state([clip(1, 60, 90)]), [{ type: "clip.trim", clipId: T(101), edge: "start", frame: 30 }], /before the start of the source/);
+});
+
+test("fades longer than the clip share it instead of dropping the other fade", () => {
+  const s = state([clip(1, 0, 60)]);
+  const both = applyOperations(s, [{ type: "clip.update", clipId: T(101), props: { fadeIn: 90, fadeOut: 30 } }], ids);
+  assert.deepEqual(both.clips.get(T(101))!.props, { fadeIn: 45, fadeOut: 15 }, "3:1, filling the clip");
+  const longIn = applyOperations(state([clip(1, 0, 60, { props: { fadeOut: 20 } })]), [{ type: "clip.update", clipId: T(101), props: { fadeIn: 100 } }], ids);
+  const p = longIn.clips.get(T(101))!.props;
+  assert.ok(p.fadeOut! > 0, "the fade out survives a too-long fade in");
+  assert.equal(p.fadeIn! + p.fadeOut!, 60);
+  // Fades that fit are untouched; a lone fade is clamped to the clip.
+  assert.deepEqual(applyOperations(s, [{ type: "clip.update", clipId: T(101), props: { fadeIn: 20, fadeOut: 40 } }], ids).clips.get(T(101))!.props, { fadeIn: 20, fadeOut: 40 });
+  assert.deepEqual(applyOperations(s, [{ type: "clip.update", clipId: T(101), props: { fadeIn: 200 } }], ids).clips.get(T(101))!.props, { fadeIn: 60 });
+  // Trimming shrinks both in proportion too.
+  const trimmed = applyOperations(both, [{ type: "clip.trim", clipId: T(101), edge: "end", frame: 30 }], ids);
+  assert.deepEqual(trimmed.clips.get(T(101))!.props, { fadeIn: 22, fadeOut: 8 });
+});
+
+test("props a clip can't show are refused: picture on sound-only clips, AI effects off video", () => {
+  const s = state([clip(1, 0, 60, { trackId: A1, assetId: AUD }), clip(2, 0, 60, { assetId: IMG }), clip(3, 100, 60)]);
+  rejects(s, [{ type: "clip.update", clipId: T(101), props: { opacity: 0.5 } }], /opacity only applies to picture clips/);
+  rejects(s, [{ type: "clip.update", clipId: T(101), props: { blur: 0.3, grayscale: 1 } }], /blur, grayscale only apply/);
+  rejects(s, [{ type: "clip.add", trackId: A1, assetId: AUD, start: 100, props: { scale: 2 } }], /scale only applies/);
+  rejects(s, [{ type: "clip.update", clipId: T(102), props: { aiEffects: [{ fx: "zoom-punch" } as never] } }], /AI effects work on video clips only, not on an image/);
+  // What does apply still goes through, and so do resets to the default.
+  applyOperations(s, [{ type: "clip.update", clipId: T(101), props: { gainDb: -6, fadeIn: 10, opacity: 1, aiEffects: [] } }], ids);
+  applyOperations(s, [{ type: "clip.update", clipId: T(102), props: { opacity: 0.5, blur: 0.2 } }], ids);
+});
+
+test("messages: 'an audio asset', and an in point past the end says so", () => {
+  rejects(state(), [{ type: "clip.add", trackId: V1, assetId: AUD, start: 0 }], /^operation 1 \(clip\.add\): an audio asset cannot go on/);
+  rejects(state(), [{ type: "clip.add", trackId: V1, assetId: VID, start: 0, sourceIn: 300 }], /in point 300 is past the end of the source media \(300 frames\)/);
+});

@@ -4,8 +4,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildRenderPlan, JobStore, openDatabase, ProjectStore, TimelineStore, type Database, type TimelineOp } from "@reelforge/core";
-import { bakePath, createRenderJob, fxAvailable, importMedia, publishRender, RenderRunner, retryRenderJob, validateExportPath } from "../src/index.ts";
+import { AssetStore, buildRenderPlan, JobStore, openDatabase, ProjectStore, TimelineStore, type Database, type TimelineOp } from "@reelforge/core";
+import { bakePath, createRenderJob, deleteProjectWithCache, ensureProxy, ensureThumbnail, fxAvailable, importMedia, publishRender, RenderRunner, retryRenderJob, validateExportPath } from "../src/index.ts";
 
 const ff = (args: string[]) => execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args]);
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "reelforge-render-")));
@@ -422,4 +422,67 @@ test("AI effects: the real engine bakes a stretch and the export uses it", { ski
   const [r, g, b] = rgbAt(out, 30);
   assert.ok(Math.abs(r - g) < 25 && Math.abs(g - b) < 25, `black & white grade inside the effect: rgb(${r},${g},${b})`);
   assert.equal(colour(out, 55), "red");
+});
+
+/** Per-channel RMS level (dB) of a file's audio, from astats. */
+function channelRms(file: string, from: number, dur: number): number[] {
+  const out = spawnSync("ffmpeg", ["-hide_banner", "-nostats", "-ss", String(from), "-t", String(dur), "-i", file, "-af", "astats=measure_overall=none:measure_perchannel=RMS_level", "-vn", "-f", "null", "-"]).stderr.toString();
+  return [...out.matchAll(/RMS level dB: (-?[\d.]+|-inf)/g)].map((m) => Number(m[1]));
+}
+
+test("a mono source plays at full level on both channels, as in the live preview (no -3 dB)", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  s.edit([{ type: "clip.add", trackId: s.track("Music"), assetId: s.ids.tone, start: 0, duration: 60 }]);
+  const out = join(s.home, "mono.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  const [source] = channelRms(src("tone.wav"), 0.2, 1.5);
+  const [left, right] = channelRms(out, 0.2, 1.5);
+  assert.ok(Math.abs(left! - source!) < 0.5 && Math.abs(right! - source!) < 0.5, `source ${source} dB, export L ${left} R ${right} dB`);
+});
+
+test("AIFF, M4A, MKV and WebM sources render", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  const pic = (c: string) => ["-f", "lavfi", "-i", `color=c=${c}:s=160x288:r=30:d=1`];
+  const snd = ["-f", "lavfi", "-i", "sine=frequency=500:duration=1:sample_rate=48000"];
+  ff([...pic("red"), ...snd, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", src("red.mkv")]);
+  ff([...pic("blue"), ...snd, "-c:v", "libvpx-vp9", "-b:v", "200k", "-c:a", "libopus", "-shortest", src("blue.webm")]);
+  ff([...snd, src("tone.aiff")]);
+  ff([...snd, "-c:a", "aac", src("tone.m4a")]);
+  const { imported, failed } = await importMedia(s.db, s.projectId, ["red.mkv", "blue.webm", "tone.aiff", "tone.m4a"].map(src), "cli");
+  assert.deepEqual(failed, []);
+  const [mkv, webm, aiff, m4a] = imported.map((a) => a.id);
+  s.edit([
+    { type: "clip.add", trackId: s.track("Video"), assetId: mkv!, start: 0, duration: 15 },
+    { type: "clip.add", trackId: s.track("Video"), assetId: webm!, start: 15, duration: 15 },
+    { type: "clip.add", trackId: s.track("Music"), assetId: aiff!, start: 0, duration: 15 },
+    { type: "clip.add", trackId: s.track("Voice"), assetId: m4a!, start: 15, duration: 15 },
+  ]);
+  const out = join(s.home, "formats.mp4");
+  await render(s.db, s.runner, s.projectId, "export", out);
+  assert.deepEqual([5, 20].map((f) => colour(out, f)), ["red", "blue"]);
+  assert.ok(meanVolume(out, 0.1, 0.3) > -40 && meanVolume(out, 0.6, 0.3) > -40, "both sounds play");
+  await render(s.db, s.runner, s.projectId, "preview");
+});
+
+test("deleting a project removes its previews, proxies and thumbnails, not other projects'", async (t) => {
+  const s = await project(t, { width: 160, height: 288 });
+  s.edit([{ type: "clip.add", trackId: s.track("Video"), assetId: s.ids.red, start: 0, duration: 20 }]);
+  const cache = join(s.home, "cache");
+  await render(s.db, s.runner, s.projectId, "preview");
+  const assets = new AssetStore(s.db);
+  await ensureThumbnail(cache, assets.get(s.projectId, s.ids.red));
+  // Another project importing the same file has its own asset, proxy and thumbnail.
+  const other = new ProjectStore(s.db).create({ name: "Other" }, "cli");
+  const [otherRed] = (await importMedia(s.db, other.id, [src("red.mp4")], "cli")).imported;
+  await ensureProxy(s.db, cache, otherRed!.id, otherRed!.sourcePath);
+  await ensureThumbnail(cache, otherRed!);
+  const files = (sub: string) => (existsSync(join(cache, sub)) ? readdirSync(join(cache, sub)) : []);
+  assert.equal(files(join("previews", s.projectId)).length, 1);
+  assert.equal(files("proxies").length, 2);
+
+  deleteProjectWithCache(s.db, cache, s.projectId);
+  assert.equal(existsSync(join(cache, "previews", s.projectId)), false);
+  assert.deepEqual(files("proxies").map((n) => n.slice(0, 36)), [otherRed!.id]);
+  assert.deepEqual(files("thumbs").map((n) => n.slice(0, 36)), [otherRed!.id]);
+  assert.equal(existsSync(src("red.mp4")), true, "source media stays");
 });
